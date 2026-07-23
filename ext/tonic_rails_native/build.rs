@@ -64,7 +64,12 @@ struct ProtoService {
 fn parse_services(proto_files: &[PathBuf]) -> Vec<ProtoService> {
     let mut services = Vec::new();
 
-    for proto_file in proto_files {
+    // Sort proto files for deterministic generation order
+    // (read_dir order is filesystem-dependent and nondeterministic).
+    let mut sorted_files: Vec<&PathBuf> = proto_files.iter().collect();
+    sorted_files.sort();
+
+    for proto_file in sorted_files {
         let content = std::fs::read_to_string(proto_file)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", proto_file.display()));
 
@@ -85,6 +90,24 @@ fn parse_services(proto_files: &[PathBuf]) -> Vec<ProtoService> {
 
     if services.is_empty() {
         panic!("No service declarations found in proto files");
+    }
+
+    // Sort by full_name for stable generated output.
+    services.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+
+    // Dedup type names: PascalCasing + underscore stripping can still
+    // collide (e.g. "My_Service" vs "MyService" in the same package).
+    // Append a numeric suffix to any duplicates.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for svc in &mut services {
+        let mut name = svc.type_name.clone();
+        let mut suffix = 2;
+        while seen.contains(&name) {
+            name = format!("{}{}", svc.type_name, suffix);
+            suffix += 1;
+        }
+        seen.insert(name.clone());
+        svc.type_name = name;
     }
 
     services
