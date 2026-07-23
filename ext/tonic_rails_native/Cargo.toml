@@ -1,0 +1,52 @@
+[package]
+name = "tonic_rails_native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Magnus bridges Rust ↔ Ruby.  rb-sys provides the raw Ruby FFI
+# (including the GVL coordination functions).  tonic supplies the
+# gRPC transport layer (HTTP/2, TLS, keepalive, compression, graceful
+# shutdown).  tonic-reflection and tonic-health provide built-in
+# gRPC reflection (v1) and health-check services as sibling routes.
+#
+# The dispatch model is raw-byte passthrough: tonic's transport delivers
+# `http::Request<hyper::body::Incoming>` to a generic tower Service that
+# unframes the gRPC message, sends raw bytes to Ruby via the GVL bridge,
+# and frames the response.  No prost decode/encode on the hot path.
+#
+# socket2 enables SO_REUSEPORT for multi-process (Puma worker) scaling.
+[dependencies]
+magnus = "0.8"
+rb-sys = "0.9"
+tonic = { version = "0.12", features = ["tls", "gzip"] }
+tonic-reflection = { version = "0.12", features = ["server"] }
+tonic-health = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+prost = "0.13"
+prost-types = "0.13"
+socket2 = "0.6"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+# For the generic Service impl (raw-byte dispatch via tower::Service)
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+hyper = { version = "1", features = ["http2"] }
+tower = "0.4"
+# tonic 0.12 uses async-trait internally; already in the dep tree transitively
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
