@@ -846,6 +846,7 @@ macro_rules! named_dispatch_service {
         /// NamedService wrapper for a gRPC service.  Delegates to the
         /// shared `GrpcDispatchInner` for raw-byte dispatch.
         #[derive(Clone)]
+        #[allow(non_camel_case_types)]
         pub struct $wrapper(Arc<GrpcDispatchInner>);
 
         impl NamedService for $wrapper {

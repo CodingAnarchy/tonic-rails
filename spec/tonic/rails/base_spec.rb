@@ -32,6 +32,21 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
+    it "allows the Ruby class name to differ from the proto service name" do
+      # Routing is by the `service` declaration, not the class name.
+      # A handler class named "BarController" can serve "foo.FooService".
+      bar_controller = Class.new do
+        include Tonic::Rails::Base
+        service "foo.FooService"
+        rpc :DoThing, String, String
+        def do_thing(request)
+          {"result" => "done"}
+        end
+      end
+      expect(bar_controller.grpc_service_name).to eq("foo.FooService")
+      expect(bar_controller.name).to be_nil # anonymous class — name irrelevant
+    end
+
   describe ".register_on" do
     it "raises if no service name is set" do
       klass = Class.new { include Tonic::Rails::Base }
