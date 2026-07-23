@@ -32,19 +32,36 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
-    it "allows the Ruby class name to differ from the proto service name" do
-      # Routing is by the `service` declaration, not the class name.
-      # A handler class named "BarController" can serve "foo.FooService".
-      bar_controller = Class.new do
+    it "routes by service declaration, not Ruby class name" do
+      # A handler class named "BarController" serves "foo.FooService".
+      # Routing is by the `service` declaration + router path, not by
+      # the Ruby class name. End-to-end proof also exists in the
+      # integration test for the underscore-named service (UnderscoreService
+      # serving test.My_Service via grpcurl).
+      BarController = Class.new do
         include Tonic::Rails::Base
         service "foo.FooService"
         rpc :DoThing, String, String
         def do_thing(request)
-          {"result" => "done"}
+          {"result" => "done by BarController"}
         end
       end
-      expect(bar_controller.grpc_service_name).to eq("foo.FooService")
-      expect(bar_controller.name).to be_nil # anonymous class — name irrelevant
+
+      router = Tonic::Rails::Router.new
+      BarController.register_on(router)
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); m; end
+      end
+      BarController.grpc_rpcs["DoThing"][:request] = request_class
+      BarController.grpc_rpcs["DoThing"][:response] = response_class
+
+      result = router.dispatch("/foo.FooService/DoThing", "")
+      expect(result).to eq({"result" => "done by BarController"})
+    ensure
+      Object.send(:remove_const, :BarController) if defined?(BarController)
     end
 
   describe ".register_on" do
