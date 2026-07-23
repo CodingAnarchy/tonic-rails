@@ -75,7 +75,7 @@ fn parse_services(proto_files: &[PathBuf]) -> Vec<ProtoService> {
         // Extract service names.
         for service_name in extract_service_names(&content) {
             let full_name = format!("{package}.{service_name}");
-            let type_name = sanitize_type_name(&service_name);
+            let type_name = sanitize_type_name(&full_name);
             services.push(ProtoService {
                 full_name,
                 type_name,
@@ -110,6 +110,9 @@ fn extract_service_names(content: &str) -> Vec<String> {
     let mut services = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
         if let Some(rest) = trimmed.strip_prefix("service ") {
             // Take the identifier up to whitespace, '{', or ';'
             let name: String = rest
@@ -123,11 +126,24 @@ fn extract_service_names(content: &str) -> Vec<String> {
     }
     services
 }
-
-/// Convert a proto service name into a Rust-safe type identifier.
-/// E.g. "ProductService" → "ProductService", "My_Service" → "MyService".
-fn sanitize_type_name(name: &str) -> String {
-    name.replace('_', "")
+/// Convert a fully-qualified proto service name into a unique Rust-safe
+/// type identifier.  Derives from package + service to avoid collisions
+/// between same-named services in different packages.
+/// E.g. "shop.ProductService" → "ShopProductService"
+///      "catalog.ProductService" → "CatalogProductService"
+///      "shop.api.v1.OrderService" → "ShopApiV1OrderService"
+fn sanitize_type_name(full_name: &str) -> String {
+    full_name
+        .split('.')
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
+        .replace('_', "")
 }
 
 /// Generate the services.rs file with named_dispatch_service! invocations
