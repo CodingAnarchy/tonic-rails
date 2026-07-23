@@ -85,6 +85,10 @@ module Tonic
       # @return [Boolean]
       attr_accessor :reflection
 
+      # Directory containing .proto files. Used by rpc_service to
+      # auto-register RPCs from proto declarations. Default: "protos".
+      # @return [String]
+      attr_accessor :proto_dir
       def initialize
         @bind_address = "0.0.0.0:50051"
         @max_message_size = 4 * 1024 * 1024  # 4 MB
@@ -100,6 +104,7 @@ module Tonic
         @interceptors = []
         @compression = false
         @reflection = true
+        @proto_dir = "protos"
       end
     end
   end
