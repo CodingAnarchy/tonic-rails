@@ -55,18 +55,18 @@
 
 use std::convert::Infallible;
 use std::ffi::c_void;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::future::Future;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{HeaderValue, Request, Response};
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
@@ -74,7 +74,6 @@ use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, oneshot};
 use tonic::server::NamedService;
 use tonic::Status;
-use tonic::codec::CompressionEncoding;
 use tower::Service;
 
 /// The boxed body type that tonic's `add_service` expects for both
@@ -84,16 +83,12 @@ type TonicBody = UnsyncBoxBody<Bytes, Status>;
 // ─── Magnus / rb-sys imports ──────────────────────────────────────
 
 use magnus::{
-    function, method, prelude::*, wrap,
-    Error, Ruby, Value, RHash, RString, RArray,
+    function, gc, method, prelude::*, typed_data::DataTypeFunctions, Error, RArray, RHash, Ruby,
+    Value,
 };
 
 use rb_sys::{
-    rb_gc_mark,
-    rb_str_new,
-    rb_str_strlen,
-    rb_string_value_ptr,
-    rb_thread_call_with_gvl,
+    rb_str_new, rb_str_strlen, rb_string_value_ptr, rb_thread_call_with_gvl,
     rb_thread_call_without_gvl,
 };
 
@@ -203,9 +198,10 @@ unsafe extern "C" fn dispatch_with_gvl(data: *mut c_void) -> *mut c_void {
     match panic_result {
         Ok(ret) => ret,
         Err(panic_msg) => {
-            let msg = panic_msg.downcast_ref::<String>()
+            let msg = panic_msg
+                .downcast_ref::<String>()
                 .map(|s| s.as_str())
-                .or_else(|| panic_msg.downcast_ref::<&str>().map(|s| *s))
+                .or_else(|| panic_msg.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
             Box::into_raw(Box::new(DispatchResult {
                 response_bytes: vec![],
@@ -242,12 +238,10 @@ unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
 
     // Raw bytes path: pass binary protobuf String to Ruby handler.
     let bytes = unsafe {
-        std::mem::transmute::<rb_sys::VALUE, Value>(
-            rb_str_new(
-                ctx.request_bytes.as_ptr() as *const std::os::raw::c_char,
-                ctx.request_bytes.len() as std::os::raw::c_long,
-            ),
-        )
+        std::mem::transmute::<rb_sys::VALUE, Value>(rb_str_new(
+            ctx.request_bytes.as_ptr() as *const std::os::raw::c_char,
+            ctx.request_bytes.len() as std::os::raw::c_long,
+        ))
     };
 
     match callback.funcall::<_, _, Value>("call", (path, bytes, metadata)) {
@@ -355,9 +349,8 @@ unsafe extern "C" fn serve_blocking(data: *mut c_void) -> *mut c_void {
                 // the correct use of rb_thread_call_with_gvl: from
                 // inside a rb_thread_call_without_gvl callback.
                 let ctx_ptr = Box::into_raw(req.ctx) as *mut c_void;
-                let result_ptr = unsafe {
-                    rb_thread_call_with_gvl(Some(dispatch_with_gvl), ctx_ptr)
-                };
+                let result_ptr =
+                    unsafe { rb_thread_call_with_gvl(Some(dispatch_with_gvl), ctx_ptr) };
                 let result = if result_ptr.is_null() {
                     DispatchResult {
                         response_bytes: vec![],
@@ -399,7 +392,10 @@ impl GrpcBody {
     fn ok(data: Bytes) -> Self {
         let mut trailers = http::HeaderMap::new();
         trailers.insert("grpc-status", HeaderValue::from_static("0"));
-        Self { data: Some(data), trailers: Some(trailers) }
+        Self {
+            data: Some(data),
+            trailers: Some(trailers),
+        }
     }
 
     /// Error response: no data + grpc-status/grpc-message trailers.
@@ -414,7 +410,10 @@ impl GrpcBody {
                 trailers.insert("grpc-message", val);
             }
         }
-        Self { data: None, trailers: Some(trailers) }
+        Self {
+            data: None,
+            trailers: Some(trailers),
+        }
     }
 }
 
@@ -422,7 +421,10 @@ impl Body for GrpcBody {
     type Data = Bytes;
     type Error = Status;
 
-    fn poll_frame(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // Yield data first (if any), then trailers, then None.
         if let Some(data) = self.data.take() {
             return Poll::Ready(Some(Ok(Frame::data(data))));
@@ -576,16 +578,14 @@ impl GrpcDispatchInner {
     /// Handle a single gRPC request: extract path, read body, unframe,
     /// dispatch to Ruby, frame response.  This is the same logic as the
     /// previous `handle_grpc_request`, adapted for tonic's Service trait.
-    async fn handle_request(
-        self: Arc<Self>,
-        req: Request<TonicBody>,
-    ) -> Response<TonicBody> {
+    async fn handle_request(self: Arc<Self>, req: Request<TonicBody>) -> Response<TonicBody> {
         let path = req.uri().path().to_string();
         let start = Instant::now();
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
         // Content-type check — must be application/grpc.
-        let content_type = req.headers()
+        let content_type = req
+            .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -601,13 +601,19 @@ impl GrpcDispatchInner {
         }
 
         // Extract metadata (filter gRPC-specific headers).
-        let metadata: Vec<(String, String)> = req.headers()
+        let metadata: Vec<(String, String)> = req
+            .headers()
             .iter()
             .filter_map(|(k, v)| {
                 let name = k.as_str();
-                if matches!(name,
-                    "content-type" | "te" | "grpc-timeout" | "grpc-encoding" |
-                    "grpc-accept-encoding" | "user-agent"
+                if matches!(
+                    name,
+                    "content-type"
+                        | "te"
+                        | "grpc-timeout"
+                        | "grpc-encoding"
+                        | "grpc-accept-encoding"
+                        | "user-agent"
                 ) {
                     None
                 } else {
@@ -620,7 +626,9 @@ impl GrpcDispatchInner {
         let metadata_size: usize = metadata.iter().map(|(k, v)| k.len() + v.len() + 4).sum();
         if metadata_size > 8 * 1024 {
             self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-            self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .resource_exhausted
+                .fetch_add(1, Ordering::Relaxed);
             eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED msg=metadata_too_large({metadata_size})");
             return grpc_error_response(
                 tonic::Code::ResourceExhausted as u32,
@@ -629,13 +637,15 @@ impl GrpcDispatchInner {
         }
 
         // Extract grpc-timeout before consuming the request body.
-        let grpc_timeout_hdr = req.headers()
+        let grpc_timeout_hdr = req
+            .headers()
             .get("grpc-timeout")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
         // Check if client accepts gzip-compressed responses.
-        let client_accepts_gzip = req.headers()
+        let client_accepts_gzip = req
+            .headers()
             .get("grpc-accept-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.contains("gzip"))
@@ -657,7 +667,9 @@ impl GrpcDispatchInner {
         // Check message size.
         if body_bytes.len() > self.max_message_size {
             self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-            self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .resource_exhausted
+                .fetch_add(1, Ordering::Relaxed);
             eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED msg=request_too_large");
             return grpc_error_response(
                 tonic::Code::ResourceExhausted as u32,
@@ -673,7 +685,8 @@ impl GrpcDispatchInner {
         let mut metadata_with_deadline = metadata;
         if let Some(ref hdr) = grpc_timeout_hdr {
             if let Some(dur) = parse_grpc_timeout(hdr) {
-                metadata_with_deadline.push(("_timeout_ms".to_string(), dur.as_millis().to_string()));
+                metadata_with_deadline
+                    .push(("_timeout_ms".to_string(), dur.as_millis().to_string()));
             }
         }
 
@@ -681,7 +694,7 @@ impl GrpcDispatchInner {
         let (resp_tx, resp_rx) = oneshot::channel::<DispatchResult>();
         let dispatch_req = DispatchRequest {
             ctx: Box::new(DispatchContext {
-                callback: (*self.callback).clone(),
+                callback: (*self.callback),
                 path: path.clone(),
                 request_bytes,
                 metadata: metadata_with_deadline,
@@ -693,7 +706,9 @@ impl GrpcDispatchInner {
             Ok(_) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .resource_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
                 eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED msg=queue_full");
                 return grpc_error_response(
                     tonic::Code::ResourceExhausted as u32,
@@ -711,9 +726,7 @@ impl GrpcDispatchInner {
         }
 
         // Parse grpc-timeout header for deadline enforcement.
-        let timeout_dur = grpc_timeout_hdr
-            .as_deref()
-            .and_then(parse_grpc_timeout);
+        let timeout_dur = grpc_timeout_hdr.as_deref().and_then(parse_grpc_timeout);
 
         // Await the response directly — no spawn_blocking needed.
         // The tokio worker thread is free to handle other connections
@@ -726,13 +739,19 @@ impl GrpcDispatchInner {
                     response_bytes: vec![],
                     streaming_responses: vec![],
                     streaming: false,
-                    error: Some((tonic::Code::Internal as u32, "dispatch channel closed".into())),
+                    error: Some((
+                        tonic::Code::Internal as u32,
+                        "dispatch channel closed".into(),
+                    )),
                 },
                 Err(_) => DispatchResult {
                     response_bytes: vec![],
                     streaming_responses: vec![],
                     streaming: false,
-                    error: Some((tonic::Code::DeadlineExceeded as u32, "deadline exceeded".into())),
+                    error: Some((
+                        tonic::Code::DeadlineExceeded as u32,
+                        "deadline exceeded".into(),
+                    )),
                 },
             }
         } else {
@@ -742,7 +761,10 @@ impl GrpcDispatchInner {
                     response_bytes: vec![],
                     streaming_responses: vec![],
                     streaming: false,
-                    error: Some((tonic::Code::Internal as u32, "dispatch channel closed".into())),
+                    error: Some((
+                        tonic::Code::Internal as u32,
+                        "dispatch channel closed".into(),
+                    )),
                 },
             }
         };
@@ -756,28 +778,39 @@ impl GrpcDispatchInner {
                 if *code == tonic::Code::DeadlineExceeded as u32 {
                     self.stats.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
                 } else if *code == tonic::Code::ResourceExhausted as u32 {
-                    self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .resource_exhausted
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 eprintln!("tonic-rails: req path={path} status=ERROR code={code} dur={dur_ms}ms msg={msg}");
                 grpc_error_response(*code, msg)
             }
             None => {
-                let should_compress = self.compression_enabled.load(Ordering::Relaxed)
-                    && client_accepts_gzip;
+                let should_compress =
+                    self.compression_enabled.load(Ordering::Relaxed) && client_accepts_gzip;
 
                 if result.streaming {
                     // Server-streaming: frame each response as a separate gRPC message.
-                    let total_size: usize = result.streaming_responses.iter().map(|r| r.len()).sum();
-                    if total_size > self.max_message_size {
+                    // Check each message individually against max_message_size
+                    // (gRPC limit is per-message, not per-stream).
+                    if let Some(oversized_idx) = result
+                        .streaming_responses
+                        .iter()
+                        .position(|r| r.len() > self.max_message_size)
+                    {
                         self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                        self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=stream_response_too_large");
+                        self.stats
+                            .resource_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=stream_message_{}_too_large", oversized_idx);
                         return grpc_error_response(
                             tonic::Code::ResourceExhausted as u32,
-                            "streaming response exceeds max_message_size",
+                            "streaming message exceeds max_message_size",
                         );
                     }
-                    self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .successful_requests
+                        .fetch_add(1, Ordering::Relaxed);
                     if self.stats.log_requests.load(Ordering::Relaxed) {
                         eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms stream={}messages", result.streaming_responses.len());
                     }
@@ -787,18 +820,25 @@ impl GrpcDispatchInner {
                     let response_bytes = &result.response_bytes;
                     if response_bytes.len() > self.max_message_size {
                         self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                        self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .resource_exhausted
+                            .fetch_add(1, Ordering::Relaxed);
                         eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=response_too_large");
                         return grpc_error_response(
                             tonic::Code::ResourceExhausted as u32,
                             "response exceeds max_message_size",
                         );
                     }
-                    self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .successful_requests
+                        .fetch_add(1, Ordering::Relaxed);
                     if self.stats.log_requests.load(Ordering::Relaxed) {
                         eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms");
                     }
-                    grpc_ok_response(response_bytes, should_compress && response_bytes.len() > 1024)
+                    grpc_ok_response(
+                        response_bytes,
+                        should_compress && response_bytes.len() > 1024,
+                    )
                 }
             }
         }
@@ -826,7 +866,8 @@ macro_rules! named_dispatch_service {
         impl Service<Request<TonicBody>> for $wrapper {
             type Response = Response<TonicBody>;
             type Error = Infallible;
-            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
             fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
@@ -834,9 +875,7 @@ macro_rules! named_dispatch_service {
 
             fn call(&mut self, req: Request<TonicBody>) -> Self::Future {
                 let inner = self.0.clone();
-                Box::pin(async move {
-                    Ok(inner.handle_request(req).await)
-                })
+                Box::pin(async move { Ok(inner.handle_request(req).await) })
             }
         }
     };
@@ -865,7 +904,8 @@ named_dispatch_service!(ShopProductService, "shop.ProductService");
 /// released).  If the handler does blocking I/O (sleep, DB, HTTP — which
 /// releases the GVL internally), another worker can acquire the GVL and
 /// run its handler concurrently.
-#[wrap(class = "TonicRails::Native::Server", mark)]
+#[derive(magnus::TypedData)]
+#[magnus(class = "TonicRails::Native::Server", mark)]
 struct NativeServer {
     bind_address: String,
     max_message_size: usize,
@@ -889,7 +929,6 @@ struct NativeServer {
     compression_enabled: Arc<AtomicBool>,
 }
 
-
 impl NativeServer {
     fn new(bind_address: String, max_message_size: usize) -> Result<Self, Error> {
         Ok(Self {
@@ -906,14 +945,6 @@ impl NativeServer {
             compression_enabled: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(ServerStats::new()),
         })
-    }
-
-    /// GC mark — prevents GC from freeing the stored dispatch callback Proc
-    /// while the Rust server holds a reference.
-    fn mark(&self) {
-        if let Some(cb) = &*self.callback.lock() {
-            unsafe { rb_gc_mark(cb.0) };
-        }
     }
 
     /// Store the Ruby dispatch callback (a Proc or any object responding to #call).
@@ -936,16 +967,16 @@ impl NativeServer {
         let ruby = Ruby::get().expect("Ruby VM must be available for set_tls");
 
         if !std::path::Path::new(&cert_path).exists() {
-            return Err(Error::from(magnus::error::Error::new(
+            return Err(magnus::error::Error::new(
                 ruby.exception_runtime_error(),
                 format!("cert file not found: {cert_path}"),
-            )));
+            ));
         }
         if !std::path::Path::new(&key_path).exists() {
-            return Err(Error::from(magnus::error::Error::new(
+            return Err(magnus::error::Error::new(
                 ruby.exception_runtime_error(),
                 format!("key file not found: {key_path}"),
-            )));
+            ));
         }
 
         *self.tls_config.lock() = Some((cert_path, key_path));
@@ -1000,28 +1031,28 @@ impl NativeServer {
     fn start_server(&self) -> Result<(), Error> {
         let ruby = Ruby::get().expect("Ruby VM must be available when #start_server is called");
 
-        let callback = self.callback.lock().clone().ok_or_else(|| {
-            Error::from(magnus::error::Error::new(
+        let callback = (*self.callback.lock()).ok_or_else(|| {
+            magnus::error::Error::new(
                 ruby.exception_runtime_error(),
                 "no dispatch callback set — call #on_request first",
-            ))
+            )
         })?;
 
         let addr: SocketAddr = self.bind_address.parse().map_err(|e| {
-            Error::from(magnus::error::Error::new(
+            magnus::error::Error::new(
                 ruby.exception_arg_error(),
                 format!("invalid bind address '{}': {e}", self.bind_address),
-            ))
+            )
         })?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| {
-                Error::from(magnus::error::Error::new(
+                magnus::error::Error::new(
                     ruby.exception_runtime_error(),
                     format!("failed to create tokio runtime: {e}"),
-                ))
+                )
             })?;
 
         // Dispatch channel: tokio sends requests, Ruby worker threads
@@ -1051,26 +1082,37 @@ impl NativeServer {
         });
         let listener = {
             let _enter = runtime.enter();
-            let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-                .map_err(|e| Error::from(magnus::error::Error::new(
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+                magnus::error::Error::new(
                     ruby.exception_runtime_error(),
                     format!("failed to create socket: {e}"),
-                )))?;
+                )
+            })?;
             let _ = socket.set_reuse_port(true);
             let _ = socket.set_nonblocking(true);
-            socket.bind(&addr.into()).map_err(|e| Error::from(magnus::error::Error::new(
-                ruby.exception_runtime_error(),
-                format!("failed to bind {addr}: {e}"),
-            )))?;
-            socket.listen(1024).map_err(|e| Error::from(magnus::error::Error::new(
-                ruby.exception_runtime_error(),
-                format!("failed to listen on {addr}: {e}"),
-            )))?;
-            TcpListener::from_std(std::net::TcpListener::from(socket)).map_err(|e| Error::from(magnus::error::Error::new(
-                ruby.exception_runtime_error(),
-                format!("failed to create tokio listener: {e}"),
-            )))?
+            socket.bind(&addr.into()).map_err(|e| {
+                magnus::error::Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("failed to bind {addr}: {e}"),
+                )
+            })?;
+            socket.listen(1024).map_err(|e| {
+                magnus::error::Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("failed to listen on {addr}: {e}"),
+                )
+            })?;
+            TcpListener::from_std(std::net::TcpListener::from(socket)).map_err(|e| {
+                magnus::error::Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("failed to create tokio listener: {e}"),
+                )
+            })?
         };
 
         // Capture config for the async block.
@@ -1082,11 +1124,8 @@ impl NativeServer {
         // Spawn the tonic server on the tokio runtime.
         runtime.spawn(async move {
             // ── Build tonic-health service ──────────────────────────
-            let (mut health_reporter, health_service) =
-                tonic_health::server::health_reporter();
-            health_reporter
-                .set_serving::<ShopProductService>()
-                .await;
+            let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+            health_reporter.set_serving::<ShopProductService>().await;
 
             // ── Build tonic-reflection service ──────────────────────
             // Uses the generated FILE_DESCRIPTOR_SET from tonic-build.
@@ -1136,7 +1175,9 @@ impl NativeServer {
                 match server.tls_config(config) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("tonic-rails: TLS config failed: {e} — falling back to plaintext");
+                        eprintln!(
+                            "tonic-rails: TLS config failed: {e} — falling back to plaintext"
+                        );
                         // Cannot recover server after tls_config consumes it,
                         // but this is extremely unlikely after file validation
                         // in set_tls.  Rebuild from scratch.
@@ -1166,12 +1207,9 @@ impl NativeServer {
 
             // serve_with_incoming_shutdown: stops accepting when signal fires,
             // then drains in-flight connections (sends GOAWAY + waits).
-            let serve_future = routes.serve_with_incoming_shutdown(
-                incoming,
-                async move {
-                    let _ = shutdown_rx1.recv().await;
-                },
-            );
+            let serve_future = routes.serve_with_incoming_shutdown(incoming, async move {
+                let _ = shutdown_rx1.recv().await;
+            });
 
             // Drain timer: starts when shutdown signal fires, counts
             // drain_timeout + 2s.  If serve_future completes first
@@ -1214,20 +1252,23 @@ impl NativeServer {
     fn serve_worker(&self) -> Result<(), Error> {
         let request_rx = self.request_rx.lock().clone().ok_or_else(|| {
             let ruby = Ruby::get().expect("Ruby VM must be available");
-            Error::from(magnus::error::Error::new(
+            magnus::error::Error::new(
                 ruby.exception_runtime_error(),
                 "server not started — call #start_server first",
-            ))
+            )
         })?;
         let shutdown = self.shutdown_flag.lock().clone().ok_or_else(|| {
             let ruby = Ruby::get().expect("Ruby VM must be available");
-            Error::from(magnus::error::Error::new(
+            magnus::error::Error::new(
                 ruby.exception_runtime_error(),
                 "server not started — call #start_server first",
-            ))
+            )
         })?;
 
-        let serve_ctx = ServeContext { shutdown: shutdown.clone(), request_rx };
+        let serve_ctx = ServeContext {
+            shutdown: shutdown.clone(),
+            request_rx,
+        };
         let unblock_ctx = UnblockContext { shutdown };
 
         unsafe {
@@ -1289,12 +1330,41 @@ impl NativeServer {
     fn stats(&self) -> Result<RHash, Error> {
         let ruby = Ruby::get().expect("Ruby VM must be available for stats");
         let hash = ruby.hash_new();
-        let _ = hash.aset(ruby.to_symbol("total"), self.stats.total_requests.load(Ordering::Relaxed));
-        let _ = hash.aset(ruby.to_symbol("successful"), self.stats.successful_requests.load(Ordering::Relaxed));
-        let _ = hash.aset(ruby.to_symbol("errors"), self.stats.error_requests.load(Ordering::Relaxed));
-        let _ = hash.aset(ruby.to_symbol("deadline_exceeded"), self.stats.deadline_exceeded.load(Ordering::Relaxed));
-        let _ = hash.aset(ruby.to_symbol("resource_exhausted"), self.stats.resource_exhausted.load(Ordering::Relaxed));
+        let _ = hash.aset(
+            ruby.to_symbol("total"),
+            self.stats.total_requests.load(Ordering::Relaxed),
+        );
+        let _ = hash.aset(
+            ruby.to_symbol("successful"),
+            self.stats.successful_requests.load(Ordering::Relaxed),
+        );
+        let _ = hash.aset(
+            ruby.to_symbol("errors"),
+            self.stats.error_requests.load(Ordering::Relaxed),
+        );
+        let _ = hash.aset(
+            ruby.to_symbol("deadline_exceeded"),
+            self.stats.deadline_exceeded.load(Ordering::Relaxed),
+        );
+        let _ = hash.aset(
+            ruby.to_symbol("resource_exhausted"),
+            self.stats.resource_exhausted.load(Ordering::Relaxed),
+        );
         Ok(hash)
+    }
+}
+
+// GC mark: prevents Ruby from collecting the stored dispatch callback
+// Proc while the Rust server holds a reference.  Wired via the `mark`
+// flag on #[magnus(...)] above — Ruby's GC calls extern_mark which
+// dispatches to this method.
+impl DataTypeFunctions for NativeServer {
+    fn mark(&self, marker: &gc::Marker) {
+        if let Some(cb) = *self.callback.lock() {
+            // RubyValue is a raw VALUE; transmute to Value for Marker::mark.
+            let value: Value = unsafe { std::mem::transmute(cb.0) };
+            marker.mark(value);
+        }
     }
 }
 
@@ -1310,9 +1380,18 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("on_request", method!(NativeServer::on_request, 1))?;
     class.define_method("stats", method!(NativeServer::stats, 0))?;
     class.define_method("set_tls", method!(NativeServer::set_tls, 2))?;
-    class.define_method("set_drain_timeout", method!(NativeServer::set_drain_timeout, 1))?;
-    class.define_method("set_max_connections", method!(NativeServer::set_max_connections, 1))?;
-    class.define_method("set_log_requests", method!(NativeServer::set_log_requests, 1))?;
+    class.define_method(
+        "set_drain_timeout",
+        method!(NativeServer::set_drain_timeout, 1),
+    )?;
+    class.define_method(
+        "set_max_connections",
+        method!(NativeServer::set_max_connections, 1),
+    )?;
+    class.define_method(
+        "set_log_requests",
+        method!(NativeServer::set_log_requests, 1),
+    )?;
     class.define_method("set_compression", method!(NativeServer::set_compression, 1))?;
     class.define_method("start_server", method!(NativeServer::start_server, 0))?;
     class.define_method("serve_worker", method!(NativeServer::serve_worker, 0))?;
