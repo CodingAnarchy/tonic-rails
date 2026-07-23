@@ -1,0 +1,19 @@
+.bundle/
+vendor/bundle/
+*.gem
+coverage/
+tmp/
+# Rust build artifacts
+target/
+# Compiled native extension
+*.bundle
+*.dylib
+# Compiled Go binaries
+bench/go_bench/bench_client
+bench/go_bench/tonic-bench
+# Generated proto descriptors
+*.desc
+bench/rust_bench/src/shop_descriptor.bin
+**/*.rbc
+.ruby-version
+.ruby-gemset

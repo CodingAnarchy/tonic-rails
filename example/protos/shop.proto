@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package shop;
+
+// Realistic e-commerce product service for benchmarking.
+// Exercises: scalar fields, enums, repeated fields, nested messages,
+// batch patterns, and validation-style error paths.
+service ProductService {
+  rpc GetProduct(GetProductRequest) returns (Product);
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  rpc CreateProduct(CreateProductRequest) returns (Product);
+  rpc BatchGetProducts(BatchGetProductsRequest) returns (BatchGetProductsResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message Product {
+  int64 id = 1;
+  string title = 2;
+  string description = 3;
+  int64 price_cents = 4;
+  string currency = 5;
+  repeated string tags = 6;
+  ProductStatus status = 7;
+  int64 created_at_unix = 8;
+  int64 updated_at_unix = 9;
+}
+
+enum ProductStatus {
+  PRODUCT_STATUS_UNSPECIFIED = 0;
+  PRODUCT_STATUS_DRAFT = 1;
+  PRODUCT_STATUS_ACTIVE = 2;
+  PRODUCT_STATUS_ARCHIVED = 3;
+}
+
+message GetProductRequest {
+  int64 id = 1;
+}
+
+message ListProductsRequest {
+  int32 limit = 1;
+  int32 offset = 2;
+  string tag_filter = 3;
+}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+  int32 total = 2;
+}
+
+message CreateProductRequest {
+  string title = 1;
+  string description = 2;
+  int64 price_cents = 3;
+  string currency = 4;
+  repeated string tags = 5;
+}
+
+message BatchGetProductsRequest {
+  repeated int64 ids = 1;
+}
+
+message BatchGetProductsResponse {
+  repeated Product products = 1;
+  repeated int64 not_found_ids = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string service = 2;
+}
