@@ -32,6 +32,7 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
+  describe "class name independence" do
     it "routes by service declaration, not Ruby class name" do
       # A handler class named "BarController" serves "foo.FooService".
       # Routing is by the `service` declaration + router path, not by
@@ -63,12 +64,57 @@ RSpec.describe Tonic::Rails::Base do
     ensure
       Object.send(:remove_const, :BarController) if defined?(BarController)
     end
-
+  end
   describe ".register_on" do
     it "raises if no service name is set" do
       klass = Class.new { include Tonic::Rails::Base }
       expect { klass.register_on(Tonic::Rails::Router.new) }
         .to raise_error(Tonic::Rails::NotConfiguredError)
+    end
+  end
+
+  describe ".rpc_service" do
+    let(:proto_path) { File.expand_path("../../../bench/shop.proto", __dir__) }
+
+    it "auto-registers all RPCs from the proto file" do
+      require_relative "../../../bench/shop_pb"
+      file = proto_path
+
+      svc = Class.new do
+        include Tonic::Rails::Base
+        rpc_service "shop.ProductService", proto_file: file
+      end
+
+      expect(svc.grpc_service_name).to eq("shop.ProductService")
+      expect(svc.grpc_rpcs.keys).to include("GetProduct", "ListProducts", "HealthCheck")
+      expect(svc.grpc_rpcs["GetProduct"][:request]).to eq(Shop::GetProductRequest)
+      expect(svc.grpc_rpcs["GetProduct"][:response]).to eq(Shop::Product)
+    end
+
+    it "detects server-streaming RPCs from the proto" do
+      require_relative "../../../bench/shop_pb"
+      file = proto_path
+
+      svc = Class.new do
+        include Tonic::Rails::Base
+        rpc_service "shop.ProductService", proto_file: file
+      end
+
+      # shop.proto has no streaming RPCs, so all should be unary
+      svc.grpc_rpcs.each_value do |spec|
+        expect(spec[:stream]).to be(false)
+      end
+    end
+
+    it "raises when the service is not found in the proto file" do
+      file = proto_path
+
+      expect {
+        Class.new do
+          include Tonic::Rails::Base
+          rpc_service "shop.Nonexistent", proto_file: file
+        end
+      }.to raise_error(Tonic::Rails::Error, /not found/)
     end
   end
 

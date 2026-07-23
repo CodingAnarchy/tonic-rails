@@ -3,6 +3,7 @@
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/hash/keys"
 require "active_support/core_ext/string/inflections"
+require_relative "proto_parser"
 
 module Tonic
   module Rails
@@ -51,6 +52,50 @@ module Tonic
               stream: stream == :server,
             },
           )
+        end
+
+        # Auto-register all RPCs for a service by parsing the .proto file.
+        # Eliminates the need to declare each `rpc :Method, Req, Resp` individually.
+        #
+        #   class ProductService
+        #     include Tonic::Rails::Base
+        #     rpc_service "shop.ProductService"  # scans config.proto_dir
+        #
+        #     def get_product(request); ... end
+        #     def list_products(request); ... end
+        #   end
+        #
+        # @param full_name [String] fully-qualified service name (package.Service)
+        # @param proto_file [String, nil] explicit .proto path; if nil, scans
+        #   Tonic::Rails.configuration.proto_dir
+        def rpc_service(full_name, proto_file: nil)
+          # Set the service name (replaces `service` declaration).
+          self.grpc_service_name = full_name
+
+          info = if proto_file
+            package, service_name = full_name.split(".")
+            ProtoParser.parse_service(proto_file, service_name)
+          else
+            proto_dir = Tonic::Rails.configuration.proto_dir
+            ProtoParser.find_service(proto_dir, full_name)
+          end
+
+          unless info
+            location = proto_file || "#{Tonic::Rails.configuration.proto_dir}/"
+            raise Error, "rpc_service: service #{full_name} not found in #{location}"
+          end
+
+          info.rpcs.each do |rpc_info|
+            request_class = ProtoParser.resolve_type(rpc_info.request_type, info.package)
+            response_class = ProtoParser.resolve_type(rpc_info.response_type, info.package)
+
+            rpc(
+              rpc_info.name,
+              request_class,
+              response_class,
+              stream: rpc_info.stream ? :server : nil,
+            )
+          end
         end
 
         # Register all declared RPCs with the given router.
