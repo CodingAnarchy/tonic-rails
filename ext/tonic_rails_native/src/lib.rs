@@ -74,6 +74,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, oneshot};
 use tonic::server::NamedService;
 use tonic::Status;
+use tonic::codec::CompressionEncoding;
 use tower::Service;
 
 /// The boxed body type that tonic's `add_service` expects for both
@@ -84,7 +85,7 @@ type TonicBody = UnsyncBoxBody<Bytes, Status>;
 
 use magnus::{
     function, method, prelude::*, wrap,
-    Error, Ruby, Value, RHash, RString,
+    Error, Ruby, Value, RHash, RString, RArray,
 };
 
 use rb_sys::{
@@ -161,6 +162,12 @@ struct DispatchContext {
 /// Result returned from the Ruby callback through the GVL bridge.
 struct DispatchResult {
     response_bytes: Vec<u8>,
+    /// Multiple encoded responses for server-streaming RPCs.
+    /// Empty for unary RPCs.
+    streaming_responses: Vec<Vec<u8>>,
+    /// True when the RPC is declared as server-streaming.
+    /// Disambiguates empty streams from empty unary responses.
+    streaming: bool,
     /// (grpc_status_code, message) on error
     error: Option<(u32, String)>,
 }
@@ -202,6 +209,8 @@ unsafe extern "C" fn dispatch_with_gvl(data: *mut c_void) -> *mut c_void {
                 .unwrap_or("unknown panic");
             Box::into_raw(Box::new(DispatchResult {
                 response_bytes: vec![],
+                streaming_responses: vec![],
+                streaming: false,
                 error: Some((13, format!("internal panic: {msg}"))),
             })) as *mut c_void
         }
@@ -216,6 +225,8 @@ unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
         Err(_) => {
             return Box::into_raw(Box::new(DispatchResult {
                 response_bytes: vec![],
+                streaming_responses: vec![],
+                streaming: false,
                 error: Some((2, "Ruby VM unavailable".into())),
             })) as *mut c_void;
         }
@@ -239,28 +250,57 @@ unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
         )
     };
 
-    match callback.funcall::<_, _, RString>("call", (path, bytes, metadata)) {
+    match callback.funcall::<_, _, Value>("call", (path, bytes, metadata)) {
         Ok(result) => {
-            let response_bytes = unsafe {
-                let raw: rb_sys::VALUE = std::mem::transmute(result);
-                let mut raw_mut = raw;
-                let ptr = rb_string_value_ptr(&mut raw_mut) as *const u8;
-                let len = rb_str_strlen(raw) as usize;
-                if ptr.is_null() || len == 0 {
-                    Vec::new()
-                } else {
-                    std::slice::from_raw_parts(ptr, len).to_vec()
+            // Helper to extract bytes from a Ruby String value.
+            let extract_bytes = |val: Value| -> Vec<u8> {
+                unsafe {
+                    let raw: rb_sys::VALUE = std::mem::transmute(val);
+                    let mut raw_mut = raw;
+                    let ptr = rb_string_value_ptr(&mut raw_mut) as *const u8;
+                    let len = rb_str_strlen(raw) as usize;
+                    if ptr.is_null() || len == 0 {
+                        Vec::new()
+                    } else {
+                        std::slice::from_raw_parts(ptr, len).to_vec()
+                    }
                 }
             };
-            Box::into_raw(Box::new(DispatchResult {
-                response_bytes,
-                error: None,
-            })) as *mut c_void
+
+            // Detect return type via Magnus: Array → server-streaming,
+            // String → unary.  The RPC DSL guarantees consistency: streaming
+            // RPCs always return an Array (even empty), unary always a String.
+            let is_array = result.is_kind_of(ruby.class_array());
+
+            if is_array {
+                // Server-streaming: extract each element's bytes.
+                let arr = RArray::from_value(result).unwrap();
+                let streaming_responses: Vec<Vec<u8>> = (0..arr.len() as isize)
+                    .map(|i| extract_bytes(arr.entry(i).unwrap()))
+                    .collect();
+                Box::into_raw(Box::new(DispatchResult {
+                    response_bytes: vec![],
+                    streaming_responses,
+                    streaming: true,
+                    error: None,
+                })) as *mut c_void
+            } else {
+                // Unary: single encoded protobuf String.
+                let response_bytes = extract_bytes(result);
+                Box::into_raw(Box::new(DispatchResult {
+                    response_bytes,
+                    streaming_responses: vec![],
+                    streaming: false,
+                    error: None,
+                })) as *mut c_void
+            }
         }
         Err(e) => {
             let (code, msg) = extract_error_code(&e);
             Box::into_raw(Box::new(DispatchResult {
                 response_bytes: vec![],
+                streaming_responses: vec![],
+                streaming: false,
                 error: Some((code, msg)),
             })) as *mut c_void
         }
@@ -321,6 +361,8 @@ unsafe extern "C" fn serve_blocking(data: *mut c_void) -> *mut c_void {
                 let result = if result_ptr.is_null() {
                     DispatchResult {
                         response_bytes: vec![],
+                        streaming_responses: vec![],
+                        streaming: false,
                         error: Some((13, "dispatch returned null".into())),
                     }
                 } else {
@@ -396,20 +438,53 @@ impl Body for GrpcBody {
 fn box_body(body: GrpcBody) -> TonicBody {
     UnsyncBoxBody::new(body)
 }
-
-fn unframe(data: &[u8]) -> &[u8] {
+fn unframe(data: &[u8]) -> Vec<u8> {
     if data.len() < 5 {
-        return data;
+        return data.to_vec();
     }
-    &data[5..]
+    let compressed = data[0] != 0;
+    let payload = &data[5..];
+    if compressed {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(payload);
+        let mut out = Vec::with_capacity(payload.len() * 2);
+        if decoder.read_to_end(&mut out).is_err() {
+            eprintln!("tonic-rails: gzip decompress failed — falling back to raw payload");
+            return payload.to_vec();
+        }
+        out
+    } else {
+        payload.to_vec()
+    }
 }
 
-fn frame(message: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + message.len());
-    buf.put_u8(0);
-    buf.put_u32(message.len() as u32);
-    buf.put_slice(message);
-    buf.freeze()
+/// Frame a protobuf message as a gRPC message.
+/// If `compress` is true, gzip-compress the payload and set the
+/// compressed-flag byte to 1.
+fn frame(message: &[u8], compress: bool) -> Bytes {
+    if compress {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(
+            Vec::with_capacity(message.len()),
+            flate2::Compression::fast(),
+        );
+        let _ = encoder.write_all(message);
+        let compressed = encoder.finish().unwrap_or_else(|e| {
+            eprintln!("tonic-rails: gzip compress failed: {e}");
+            message.to_vec()
+        });
+        let mut buf = BytesMut::with_capacity(5 + compressed.len());
+        buf.put_u8(1); // compressed flag
+        buf.put_u32(compressed.len() as u32);
+        buf.put_slice(&compressed);
+        buf.freeze()
+    } else {
+        let mut buf = BytesMut::with_capacity(5 + message.len());
+        buf.put_u8(0);
+        buf.put_u32(message.len() as u32);
+        buf.put_slice(message);
+        buf.freeze()
+    }
 }
 
 fn grpc_error_response(code: u32, message: &str) -> Response<TonicBody> {
@@ -421,13 +496,40 @@ fn grpc_error_response(code: u32, message: &str) -> Response<TonicBody> {
     resp
 }
 
-fn grpc_ok_response(response_bytes: &[u8]) -> Response<TonicBody> {
-    let framed = frame(response_bytes);
+fn grpc_ok_response(response_bytes: &[u8], compress: bool) -> Response<TonicBody> {
+    let framed = frame(response_bytes, compress);
     let mut resp = Response::new(box_body(GrpcBody::ok(framed)));
     resp.headers_mut().insert(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/grpc"),
     );
+    if compress {
+        resp.headers_mut().insert(
+            http::HeaderName::from_static("grpc-encoding"),
+            HeaderValue::from_static("gzip"),
+        );
+    }
+    resp
+}
+
+/// Build a streaming gRPC response with multiple framed messages.
+fn grpc_ok_streaming_response(responses: &[Vec<u8>], compress: bool) -> Response<TonicBody> {
+    let mut buf = BytesMut::new();
+    for resp in responses {
+        let framed = frame(resp, compress);
+        buf.extend_from_slice(&framed);
+    }
+    let mut resp = Response::new(box_body(GrpcBody::ok(buf.freeze())));
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    if compress {
+        resp.headers_mut().insert(
+            http::HeaderName::from_static("grpc-encoding"),
+            HeaderValue::from_static("gzip"),
+        );
+    }
     resp
 }
 
@@ -467,6 +569,7 @@ struct GrpcDispatchInner {
     request_tx: crossbeam_channel::Sender<DispatchRequest>,
     stats: Arc<ServerStats>,
     max_message_size: usize,
+    compression_enabled: Arc<AtomicBool>,
 }
 
 impl GrpcDispatchInner {
@@ -531,6 +634,13 @@ impl GrpcDispatchInner {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
+        // Check if client accepts gzip-compressed responses.
+        let client_accepts_gzip = req.headers()
+            .get("grpc-accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("gzip"))
+            .unwrap_or(false);
+
         // Read request body.
         let body_bytes = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -555,7 +665,17 @@ impl GrpcDispatchInner {
             );
         }
 
-        let request_bytes = unframe(&body_bytes).to_vec();
+        let request_bytes = unframe(&body_bytes);
+
+        // Propagate deadline to Ruby handler via metadata.
+        // _timeout_ms gives the handler the remaining time budget so it
+        // can cooperatively cancel slow work (e.g. set a DB query timeout).
+        let mut metadata_with_deadline = metadata;
+        if let Some(ref hdr) = grpc_timeout_hdr {
+            if let Some(dur) = parse_grpc_timeout(hdr) {
+                metadata_with_deadline.push(("_timeout_ms".to_string(), dur.as_millis().to_string()));
+            }
+        }
 
         // ── Channel dispatch: send to Ruby serve thread ────────────
         let (resp_tx, resp_rx) = oneshot::channel::<DispatchResult>();
@@ -564,7 +684,7 @@ impl GrpcDispatchInner {
                 callback: (*self.callback).clone(),
                 path: path.clone(),
                 request_bytes,
-                metadata,
+                metadata: metadata_with_deadline,
             }),
             response_tx: resp_tx,
         };
@@ -604,10 +724,14 @@ impl GrpcDispatchInner {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => DispatchResult {
                     response_bytes: vec![],
+                    streaming_responses: vec![],
+                    streaming: false,
                     error: Some((tonic::Code::Internal as u32, "dispatch channel closed".into())),
                 },
                 Err(_) => DispatchResult {
                     response_bytes: vec![],
+                    streaming_responses: vec![],
+                    streaming: false,
                     error: Some((tonic::Code::DeadlineExceeded as u32, "deadline exceeded".into())),
                 },
             }
@@ -616,6 +740,8 @@ impl GrpcDispatchInner {
                 Ok(r) => r,
                 Err(_) => DispatchResult {
                     response_bytes: vec![],
+                    streaming_responses: vec![],
+                    streaming: false,
                     error: Some((tonic::Code::Internal as u32, "dispatch channel closed".into())),
                 },
             }
@@ -636,21 +762,44 @@ impl GrpcDispatchInner {
                 grpc_error_response(*code, msg)
             }
             None => {
-                let response_bytes = &result.response_bytes;
-                if response_bytes.len() > self.max_message_size {
-                    self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                    self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=response_too_large");
-                    return grpc_error_response(
-                        tonic::Code::ResourceExhausted as u32,
-                        "response exceeds max_message_size",
-                    );
+                let should_compress = self.compression_enabled.load(Ordering::Relaxed)
+                    && client_accepts_gzip;
+
+                if result.streaming {
+                    // Server-streaming: frame each response as a separate gRPC message.
+                    let total_size: usize = result.streaming_responses.iter().map(|r| r.len()).sum();
+                    if total_size > self.max_message_size {
+                        self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+                        self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=stream_response_too_large");
+                        return grpc_error_response(
+                            tonic::Code::ResourceExhausted as u32,
+                            "streaming response exceeds max_message_size",
+                        );
+                    }
+                    self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
+                    if self.stats.log_requests.load(Ordering::Relaxed) {
+                        eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms stream={}messages", result.streaming_responses.len());
+                    }
+                    grpc_ok_streaming_response(&result.streaming_responses, should_compress)
+                } else {
+                    // Unary: single response.
+                    let response_bytes = &result.response_bytes;
+                    if response_bytes.len() > self.max_message_size {
+                        self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+                        self.stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=response_too_large");
+                        return grpc_error_response(
+                            tonic::Code::ResourceExhausted as u32,
+                            "response exceeds max_message_size",
+                        );
+                    }
+                    self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
+                    if self.stats.log_requests.load(Ordering::Relaxed) {
+                        eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms");
+                    }
+                    grpc_ok_response(response_bytes, should_compress && response_bytes.len() > 1024)
                 }
-                self.stats.successful_requests.fetch_add(1, Ordering::Relaxed);
-                if self.stats.log_requests.load(Ordering::Relaxed) {
-                    eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms");
-                }
-                grpc_ok_response(response_bytes)
             }
         }
     }
@@ -736,6 +885,8 @@ struct NativeServer {
     max_connections: AtomicUsize,
     /// Atomic request counters for observability.
     stats: Arc<ServerStats>,
+    /// Enable gzip compression for responses, accept compressed requests.
+    compression_enabled: Arc<AtomicBool>,
 }
 
 
@@ -752,6 +903,7 @@ impl NativeServer {
             tls_config: Mutex::new(None),
             drain_timeout: Mutex::new(Duration::from_secs(10)),
             max_connections: AtomicUsize::new(10_000),
+            compression_enabled: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(ServerStats::new()),
         })
     }
@@ -823,11 +975,20 @@ impl NativeServer {
 
     /// Enable or disable per-request logging (including OK responses).
     /// Errors are always logged regardless.  Default: false.
-    ///
-    /// Called from Ruby as:
     ///   server.set_log_requests(true)
     fn set_log_requests(&self, enabled: bool) -> Result<(), Error> {
         self.stats.log_requests.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Enable or disable gzip compression for gRPC responses.
+    /// When enabled, the server accepts gzip-compressed requests and
+    /// sends gzip-compressed responses.
+    ///
+    /// Called from Ruby as:
+    ///   server.set_compression(true)
+    fn set_compression(&self, enabled: bool) -> Result<(), Error> {
+        self.compression_enabled.store(enabled, Ordering::Relaxed);
         Ok(())
     }
 
@@ -886,9 +1047,8 @@ impl NativeServer {
             request_tx,
             stats: self.stats.clone(),
             max_message_size: self.max_message_size,
+            compression_enabled: self.compression_enabled.clone(),
         });
-
-        // Create the SO_REUSEPORT listener.
         let listener = {
             let _enter = runtime.enter();
             let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
@@ -1153,6 +1313,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("set_drain_timeout", method!(NativeServer::set_drain_timeout, 1))?;
     class.define_method("set_max_connections", method!(NativeServer::set_max_connections, 1))?;
     class.define_method("set_log_requests", method!(NativeServer::set_log_requests, 1))?;
+    class.define_method("set_compression", method!(NativeServer::set_compression, 1))?;
     class.define_method("start_server", method!(NativeServer::start_server, 0))?;
     class.define_method("serve_worker", method!(NativeServer::serve_worker, 0))?;
     class.define_method("stop_server", method!(NativeServer::stop_server, 0))?;

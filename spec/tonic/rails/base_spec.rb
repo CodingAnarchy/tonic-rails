@@ -67,6 +67,194 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
+  describe "server-streaming RPCs" do
+    let(:streaming_service) do
+      Class.new do
+        include Tonic::Rails::Base
+
+        service "test.Stream"
+
+        rpc :ListItems, String, String, stream: :server
+
+        def list_items(request)
+          [
+            {"id" => "1", "name" => request["name"]},
+            {"id" => "2", "name" => request["name"]},
+            {"id" => "3", "name" => request["name"]},
+          ]
+        end
+      end
+    end
+
+    it "registers stream: true in the RPC spec when stream: :server" do
+      spec = streaming_service.grpc_rpcs["ListItems"]
+      expect(spec[:stream]).to be(true)
+    end
+
+    it "registers stream: false by default (unary)" do
+      spec = service_class.grpc_rpcs["SayHello"]
+      expect(spec[:stream]).to be(false)
+    end
+
+    it "returns an Array of encoded responses for streaming RPCs" do
+      request_class = Class.new do
+        def self.decode(bytes); {name: bytes}; end
+      end
+      response_class = Class.new do
+        def self.new(hash); hash; end
+        def self.encode(msg); "encoded:#{msg['id']}"; end
+      end
+
+      streaming_service.grpc_rpcs["ListItems"][:request] = request_class
+      streaming_service.grpc_rpcs["ListItems"][:response] = response_class
+
+      instance = streaming_service.new
+      result = instance.call_rpc("ListItems", "Widget")
+      expect(result).to be_an(Array)
+      expect(result.length).to eq(3)
+      expect(result).to eq(["encoded:1", "encoded:2", "encoded:3"])
+    end
+
+    it "returns an empty Array for a streaming handler that yields nothing" do
+      empty_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.EmptyStream"
+        rpc :Empty, String, String, stream: :server
+        def empty(request); []; end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); "x"; end
+      end
+
+      empty_service.grpc_rpcs["Empty"][:request] = request_class
+      empty_service.grpc_rpcs["Empty"][:response] = response_class
+
+      result = empty_service.new.call_rpc("Empty", "")
+      expect(result).to eq([])
+    end
+
+    it "raises RpcError when a streaming handler returns a non-Enumerable" do
+      bad_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.BadStream"
+        rpc :Bad, String, String, stream: :server
+        def bad(request); "not an array"; end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); m; end
+      end
+
+      bad_service.grpc_rpcs["Bad"][:request] = request_class
+      bad_service.grpc_rpcs["Bad"][:response] = response_class
+
+      expect { bad_service.new.call_rpc("Bad", "") }
+        .to raise_error(Tonic::Rails::RpcError, /streaming handler must return an Enumerable/)
+    end
+
+    it "raises RpcError when a unary handler returns a non-Hash" do
+      bad_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.BadUnary"
+        rpc :Bad, String, String
+        def bad(request); ["not", "a", "hash"]; end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); m; end
+      end
+
+      bad_service.grpc_rpcs["Bad"][:request] = request_class
+      bad_service.grpc_rpcs["Bad"][:response] = response_class
+
+      expect { bad_service.new.call_rpc("Bad", "") }
+        .to raise_error(Tonic::Rails::RpcError, /unary handler must return a Hash/)
+    end
+
+    it "supports Enumerator return for lazy streaming" do
+      enum_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.EnumStream"
+        rpc :Gen, String, String, stream: :server
+        def gen(request)
+          Enumerator.new do |y|
+            3.times { |i| y << {"id" => i.to_s} }
+          end
+        end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); "enc:#{m['id']}"; end
+      end
+
+      enum_service.grpc_rpcs["Gen"][:request] = request_class
+      enum_service.grpc_rpcs["Gen"][:response] = response_class
+
+      result = enum_service.new.call_rpc("Gen", "")
+      expect(result).to eq(["enc:0", "enc:1", "enc:2"])
+    end
+  end
+
+  describe "#deadline_ms" do
+    it "returns nil when no deadline is set" do
+      instance = service_class.new
+      instance.instance_variable_set(:@grpc_deadline_at, nil)
+      expect(instance.deadline_ms).to be_nil
+    end
+
+    it "returns remaining milliseconds when a deadline is set" do
+      instance = service_class.new
+      future = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0
+      instance.instance_variable_set(:@grpc_deadline_at, future)
+      remaining = instance.deadline_ms
+      expect(remaining).to be_between(4500, 5000).inclusive
+    end
+
+    it "returns 0 when the deadline has passed" do
+      instance = service_class.new
+      past = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1.0
+      instance.instance_variable_set(:@grpc_deadline_at, past)
+      expect(instance.deadline_ms).to eq(0)
+    end
+
+    it "counts down as time elapses" do
+      instance = service_class.new
+      future = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.1
+      instance.instance_variable_set(:@grpc_deadline_at, future)
+      first = instance.deadline_ms
+      sleep 0.05
+      second = instance.deadline_ms
+      expect(second).to be < first
+    end
+  end
+
+  describe "#cancelled?" do
+    it "returns false when server is not shutting down" do
+      Tonic::Rails._clear_shutting_down
+      instance = service_class.new
+      expect(instance.cancelled?).to be(false)
+    end
+
+    it "returns true after _set_shutting_down is called" do
+      Tonic::Rails._set_shutting_down
+      instance = service_class.new
+      expect(instance.cancelled?).to be(true)
+    end
+
+    after do
+      Tonic::Rails._clear_shutting_down
+    end
+  end
+
 end
 
 RSpec.describe Tonic::Rails::RpcError do

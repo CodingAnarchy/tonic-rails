@@ -47,6 +47,31 @@ RSpec.describe Tonic::Rails::Router do
         router.dispatch("/unknown.Service/Unknown", "")
       }.to raise_error(Tonic::Rails::Error, /No handler registered/)
     end
+
+    it "dispatches streaming RPCs and returns an Array" do
+      streaming_class = Class.new do
+        include Tonic::Rails::Base
+        service "test.Stream"
+        rpc :ListItems, String, String, stream: :server
+        def list_items(request)
+          [{"id" => "1"}, {"id" => "2"}]
+        end
+      end
+      streaming_class.register_on(router)
+
+      request_class = Class.new { def self.decode(b); {name: b}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); "enc:#{m['id']}"; end
+      end
+
+      streaming_class.grpc_rpcs["ListItems"][:request] = request_class
+      streaming_class.grpc_rpcs["ListItems"][:response] = response_class
+
+      result = router.dispatch("/test.Stream/ListItems", "Widget")
+      expect(result).to be_an(Array)
+      expect(result).to eq(["enc:1", "enc:2"])
+    end
   end
 
 

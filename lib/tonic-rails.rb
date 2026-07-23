@@ -27,6 +27,10 @@ end
 module Tonic
   module Rails
     @configuration = Configuration.new
+    # Async-safe shutdown flag — set by Server#stop (called from signal
+    # trap), checked by handlers via Tonic::Rails.cancelled? or
+    # Base#cancelled?. Plain boolean assignment is atomic in CRuby.
+    @shutting_down = false
 
     class << self
       attr_reader :configuration
@@ -37,6 +41,22 @@ module Tonic
 
       def server
         @server ||= Server.new
+      end
+
+      # @return [Boolean] true if the server is shutting down — handlers
+      #   should abort in-progress work and return quickly.
+      def cancelled?
+        @shutting_down
+      end
+
+      # @api private  Called by Server#stop (async-safe, no I/O).
+      def _set_shutting_down
+        @shutting_down = true
+      end
+
+      # @api private  Called by Server#start before serving.
+      def _clear_shutting_down
+        @shutting_down = false
       end
     end
   end

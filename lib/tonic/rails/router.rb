@@ -36,6 +36,10 @@ module Tonic
         handler = @routes[path]
         raise Error, "No handler registered for #{path}" unless handler
 
+        # Fresh instance per request — handler @ivars must not bleed
+        # across requests on reused dispatch threads. The Rails executor
+        # resets CurrentAttributes and AR connections, but cannot reset
+        # arbitrary instance variables on cached handler objects.
         instance = handler.service_class.new
         instance.call_rpc(handler.method_name, request_bytes, metadata: metadata)
       end

@@ -71,6 +71,13 @@ module Tonic
       # @return [Array[Proc]]
       attr_accessor :interceptors
 
+      # Enable gzip compression for gRPC responses. When true, the server
+      # compresses responses larger than 1KB if the client indicates gzip
+      # support via the grpc-accept-encoding header. Inbound compressed
+      # requests are always decompressed regardless of this setting.
+      # @return [Boolean]
+      attr_accessor :compression
+
       def initialize
         @bind_address = "0.0.0.0:50051"
         @max_message_size = 4 * 1024 * 1024  # 4 MB
@@ -84,6 +91,7 @@ module Tonic
         @max_connections = 10_000
         @log_requests = false
         @interceptors = []
+        @compression = false
       end
     end
   end
