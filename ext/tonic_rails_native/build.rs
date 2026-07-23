@@ -128,7 +128,7 @@ fn extract_package(content: &str) -> Option<String> {
 }
 
 /// Extract service names from a .proto file using simple line-based parsing.
-/// Handles `service Foo {` and `service Foo {` (with optional whitespace).
+/// Skips //-commented lines.
 fn extract_service_names(content: &str) -> Vec<String> {
     let mut services = Vec::new();
     for line in content.lines() {
@@ -137,7 +137,6 @@ fn extract_service_names(content: &str) -> Vec<String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("service ") {
-            // Take the identifier up to whitespace, '{', or ';'
             let name: String = rest
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -149,6 +148,7 @@ fn extract_service_names(content: &str) -> Vec<String> {
     }
     services
 }
+
 /// Convert a fully-qualified proto service name into a unique Rust-safe
 /// type identifier.  Derives from package + service to avoid collisions
 /// between same-named services in different packages.
@@ -166,7 +166,6 @@ fn sanitize_type_name(full_name: &str) -> String {
             }
         })
         .collect::<String>()
-        .replace('_', "")
 }
 
 /// Generate the services.rs file with named_dispatch_service! invocations

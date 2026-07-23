@@ -25,6 +25,19 @@ RSpec.describe "gRPC integration", :integration do
 
     require_relative "../../bench/shop_pb"
     require_relative "../../bench/bench_service"
+    require_relative "../../bench/test_service_pb"
+
+    # Handler for an underscore-named service — verifies that the
+    # generated wrapper type (TestMy_Service) and the Ruby DSL
+    # service "test.My_Service" work end-to-end.
+    class UnderscoreService
+      include Tonic::Rails::Base
+      service "test.My_Service"
+      rpc :Ping, Test::PingRequest, Test::PingResponse
+      def ping(request)
+        {"msg" => "pong: #{request['msg']}"}
+      end
+    end
 
     @port = 50552 + rand(100)
     @server = Tonic::Rails::Server.new(configuration: Tonic::Rails::Configuration.new.tap do |c|
@@ -34,6 +47,7 @@ RSpec.describe "gRPC integration", :integration do
       c.logger = Logger.new(IO::NULL)
     end)
     @server.register(ProductService)
+    @server.register(UnderscoreService)
     @server_thread = Thread.new { @server.start }
     @server_thread.abort_on_exception = true
 
@@ -109,6 +123,28 @@ RSpec.describe "gRPC integration", :integration do
       expect(status).to be_success
       expect(output).to include("shop.ProductService")
       expect(output).to include("grpc.health.v1.Health")
+    end
+  end
+
+  describe "underscore-named service" do
+    it "routes to a Ruby handler despite underscore in service name" do
+      output, status = Open3.capture2e(
+        "grpcurl", "-plaintext", "-import-path", PROTO_DIR,
+        "-proto", "test_service.proto", "-d", '{"msg":"hello"}',
+        "#{ADDR}:#{@port}",
+        "test.My_Service/Ping"
+      )
+      expect(status).to be_success
+      result = JSON.parse(output)
+      expect(result["msg"]).to eq("pong: hello")
+    end
+
+    it "appears in reflection list" do
+      output, status = Open3.capture2e(
+        "grpcurl", "-plaintext", "#{ADDR}:#{@port}", "list"
+      )
+      expect(status).to be_success
+      expect(output).to include("test.My_Service")
     end
   end
 end
