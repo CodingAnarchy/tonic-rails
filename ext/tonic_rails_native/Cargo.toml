@@ -42,6 +42,7 @@ hyper = { version = "1", features = ["http2"] }
 tower = "0.4"
 # tonic 0.12 uses async-trait internally; already in the dep tree transitively
 async-trait = "0.1"
+flate2 = { version = "1", features = ["rust_backend"] }
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1265,6 +1265,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crossbeam-channel",
+ "flate2",
  "http",
  "http-body",
  "http-body-util",

@@ -115,6 +115,39 @@ Handlers receive a decoded Hash (via `google-protobuf`) and return a Hash
 that gets encoded back to protobuf. Raise `Tonic::Rails::RpcError` for
 gRPC error codes.
 
+### Server-streaming RPCs
+
+Declare a server-streaming RPC with `stream: :server`:
+
+```ruby
+class ProductService
+  include Tonic::Rails::Base
+  service "shop.ProductService"
+
+  rpc :ListProducts, Shop::ListProductsRequest, Shop::Product, stream: :server
+
+  def list_products(request)
+    Product.where("price_cents <= ?", request["max_price_cents"]).map do |p|
+      {
+        "id" => p.id,
+        "title" => p.title,
+        "price_cents" => p.price_cents,
+      }
+    end
+  end
+end
+```
+
+Streaming handlers return an Enumerable (Array, Enumerator, etc.) of
+response Hashes. Each element is encoded as a separate gRPC message.
+
+> **Buffered streaming**: The full Enumerable is materialized in Ruby
+> before any bytes are sent on the wire. This is suitable for finite
+> result sets (queries, listings, exports) but not for infinite/tail
+> streams. True incremental streaming (flush per chunk) would require
+> an mpsc channel from Ruby→Rust and a streaming HTTP/2 body — a
+> future enhancement.
+
 ### 3. Configure and start
 
 ```ruby
@@ -132,7 +165,6 @@ Tonic::Rails.server.register(ProductService)
 Or start manually:
 
 ```ruby
-Tonic::Rails.server.register(ProductService)
 Tonic::Rails.server.start
 ```
 
@@ -151,6 +183,7 @@ Tonic::Rails.server.start
 | `auto_start` | false | Start alongside Rails server |
 | `log_requests` | false | Log every request (not just errors) |
 | `interceptors` | `[]` | Array of interceptor procs |
+| `compression` | false | Enable gRPC gzip compression (responses >1KB) |
 
 ### Dispatch threads
 
@@ -171,9 +204,40 @@ throughput.
 - **Graceful shutdown**: drain timeout with in-flight request tracking
 - **Interceptors**: request middleware chain (auth, logging, tracing)
 - **Metadata**: gRPC metadata headers passed to handlers
-- **Deadlines**: per-request deadline enforcement
+- **Deadlines**: per-request deadline propagation and enforcement
+- **Cancellation**: `Tonic::Rails.cancelled?` for graceful shutdown
+- **Compression**: gRPC frame-level gzip (responses >1KB when enabled)
+- **Server streaming**: buffered server-streaming RPCs via `stream: :server`
 - **Message size limits**: configurable max message size
 - **Stats**: connection count, request count, latency tracking
+
+### Proto compilation
+
+Generate Ruby protobuf classes from `.proto` files:
+
+```sh
+rake tonic_rails:compile_protos          # uses app/protos → app/grpc
+PROTO_DIR=protos RUBY_OUT=app/grpc \
+  rake tonic_rails:compile_protos        # custom paths
+```
+
+Requires `protoc` (`brew install protobuf`).
+
+### Deadline propagation
+
+When a client sends a `grpc-timeout` header, the Rust layer injects
+`_timeout_ms` (remaining milliseconds) into the handler metadata.
+Check the remaining budget in your handler:
+
+```ruby
+def get_product(request)
+  return if cancelled?  # server shutting down
+  remaining = deadline_ms  # nil if no deadline set
+  # abort if deadline is close
+  raise Tonic::Rails::RpcError.new("deadline too tight", code: :deadline_exceeded) if remaining && remaining < 10
+  # ...
+end
+```
 
 ## Error handling
 

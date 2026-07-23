@@ -34,6 +34,7 @@ module Tonic
         raise Error, "No services registered" if @router.empty?
         raise Error, "dispatch_threads must be >= 1" if @configuration.dispatch_threads < 1
 
+        Tonic::Rails._clear_shutting_down
         ensure_native_server
 
         @configuration.logger.info("tonic-rails: raw-bytes mode (Ruby decode/encode via Google::Protobuf)")
@@ -54,6 +55,21 @@ module Tonic
           }
         end
 
+        # Wrap the entire callback in the Rails executor when available.
+        # This handles ActiveRecord connection checkout/return,
+        # CurrentAttributes reset, query cache, and reloading — the same
+        # per-request isolation that Rack middleware and Sidekiq use.
+        # Without this, thread-local state bleeds across requests on
+        # reused dispatch threads.
+        if defined?(::Rails.application) && ::Rails.application.respond_to?(:executor)
+          raw_callback = callback
+          callback = proc { |path, request, metadata|
+            ::Rails.application.executor.wrap do
+              raw_callback.call(path, request, metadata)
+            end
+          }
+        end
+
         @native_server.on_request(callback)
 
         # Enable TLS if cert and key paths are configured.
@@ -70,6 +86,12 @@ module Tonic
 
         # Enable per-request logging if configured.
         @native_server.set_log_requests(@configuration.log_requests)
+
+        # Enable gzip compression if configured.
+        if @configuration.compression
+          @native_server.set_compression(true)
+          @configuration.logger.info("tonic-rails: gzip compression enabled")
+        end
 
         # Start the tokio runtime and dispatch channel (non-blocking).
         @native_server.start_server
@@ -112,7 +134,9 @@ module Tonic
       def stop
         return unless @running
         # Called from a signal trap — must be async-safe.
-        # No logging, no I/O — just set the shutdown flag.
+        # No logging, no I/O — just set flags. The shutdown flag lets
+        # in-flight Ruby handlers check cancelled? and abort gracefully.
+        Tonic::Rails._set_shutting_down
         @native_server&.shutdown
         @running = false
       end

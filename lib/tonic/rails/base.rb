@@ -42,11 +42,13 @@ module Tonic
         # @param method_name [Symbol] RPC method name as defined in the .proto
         # @param request_class [Class] protobuf request class (responds to .decode)
         # @param response_class [Class] protobuf response class (responds to .encode)
-        def rpc(method_name, request_class, response_class)
+        # @param stream [Symbol] pass `stream: :server` for server-streaming RPCs
+        def rpc(method_name, request_class, response_class, stream: nil)
           self.grpc_rpcs = grpc_rpcs.merge(
             method_name.to_s => {
               request: request_class,
               response: response_class,
+              stream: stream == :server,
             },
           )
         end
@@ -64,15 +66,18 @@ module Tonic
 
       # Dispatch entry point for raw-bytes mode.
       # Decodes protobuf bytes → object → Hash, calls the handler with
-      # a Hash (string keys), converts the response Hash → protobuf
-      # object → encoded bytes.
+      # a Hash (string keys), converts the response(s) → protobuf bytes.
       #
-      # The handler ALWAYS receives a Hash and returns a Hash.
+      # Unary handlers receive a Hash and return a Hash.
+      # Server-streaming handlers (declared with `stream: :server`) receive
+      # a Hash and return an Enumerable of Hashes (Array, Enumerator, etc.).
+      # Streaming is buffered: the full Enumerable is materialized before
+      # any bytes are sent on the wire.
       #
       # @param method_name [String] RPC method name
-      # @param request_bytes [String] raw protobuf bytes from the wire
+      # @return [String, Array<String>] encoded protobuf bytes (String for unary,
+      #   Array of Strings for server-streaming)
       # @param metadata [Hash] gRPC metadata headers
-      # @return [String] encoded protobuf response bytes
       def call_rpc(method_name, request_bytes, metadata: {})
         spec = self.class.grpc_rpcs[method_name.to_s]
         raise Error, "Unknown RPC: #{method_name}" unless spec
@@ -81,15 +86,67 @@ module Tonic
         request_obj = spec[:request].decode(request_bytes)
         request_hash = request_obj.to_h.deep_stringify_keys
 
-        # Handler receives a Hash and returns a Hash.
-        result_hash = send(method_name.to_s.underscore, request_hash)
+        # Store metadata so handler can access deadline, auth tokens, etc.
+        @grpc_metadata = metadata
 
-        # Hash → protobuf object → encoded bytes.
-        spec[:response].encode(spec[:response].new(result_hash))
+        # Capture absolute deadline at handler entry (post-dequeue) so
+        # deadline_ms counts down as time elapses. Uses CLOCK_MONOTONIC
+        # to avoid wall-clock jumps.
+        if metadata && metadata["_timeout_ms"]
+          @grpc_deadline_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) +
+            metadata["_timeout_ms"].to_f / 1000.0
+        else
+          @grpc_deadline_at = nil
+        end
+
+        # Dispatch based on RPC declaration, not payload shape.
+        # This disambiguates empty streams from empty unary responses.
+        result = send(method_name.to_s.underscore, request_hash)
+
+        if spec[:stream]
+          # Server-streaming: handler must return an Enumerable of Hashes.
+          unless result.respond_to?(:each)
+            raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
+          end
+          # Materialize and encode each response (buffered, not incremental).
+          result.map do |item|
+            spec[:response].encode(spec[:response].new(item))
+          end
+        else
+          # Unary: handler must return a Hash.
+          unless result.is_a?(Hash)
+            raise RpcError.new("unary handler must return a Hash, got #{result.class}", code: :internal)
+          end
+          spec[:response].encode(spec[:response].new(result))
+        end
       rescue RpcError
         raise  # re-raise RpcError with its original code
       rescue => e
         raise RpcError.new(e.message, code: :internal)
+      end
+
+      # gRPC metadata for the current request.
+      # Includes user-defined headers plus `_timeout_ms` (if the client
+      # set a grpc-timeout header, the Rust layer injects the remaining
+      # milliseconds here).
+      # @return [Hash{String=>String}]
+      attr_reader :grpc_metadata
+
+      # Remaining time budget in milliseconds before the gRPC deadline
+      # expires. Returns nil if no deadline was set by the client.
+      # Decrements as time elapses — safe to poll in a loop.
+      # @return [Integer, nil]
+      def deadline_ms
+        return nil unless @grpc_deadline_at
+        remaining = (@grpc_deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC)) * 1000
+        remaining < 0 ? 0 : remaining.to_i
+      end
+
+      # Check if the server is shutting down. Handlers should abort
+      # in-progress work and return quickly when this returns true.
+      # @return [Boolean]
+      def cancelled?
+        Tonic::Rails.cancelled?
       end
     end
 

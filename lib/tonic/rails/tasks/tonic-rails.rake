@@ -1,6 +1,7 @@
 # frozen_string_literal: true
+require "fileutils"
 
-namespace :grpc do
+namespace :tonic_rails do
   desc "Start the gRPC server (loads Rails environment + registered services)"
   task serve: :environment do
     Tonic::Rails.server.start
@@ -16,15 +17,19 @@ namespace :grpc do
     end
   end
 
-  desc "Generate FileDescriptorSet (.desc) from .proto files for prost-reflect"
-  task :generate_descriptors do
-    proto_dir = ENV["PROTO_DIR"] || "protos"
-    output = ENV["DESC_OUTPUT"] || "app.desc"
+  desc "Compile .proto files to Ruby protobuf classes (requires protoc)"
+  task :compile_protos do
+    proto_dir = ENV["PROTO_DIR"] || "app/protos"
+    ruby_out  = ENV["RUBY_OUT"]  || "app/grpc"
     protos = Dir.glob("#{proto_dir}/**/*.proto")
     if protos.empty?
       abort "No .proto files found in #{proto_dir}/"
     end
-    sh "protoc --descriptor_set_out=#{output} --include_imports -I#{proto_dir} #{protos.join(' ')}"
-    puts "Generated #{output}"
+    unless system("protoc --version > /dev/null 2>&1")
+      abort "protoc not found. Install it via: brew install protobuf"
+    end
+    FileUtils.mkdir_p(ruby_out)
+    sh "protoc --ruby_out=#{ruby_out} -I#{proto_dir} #{protos.join(' ')}"
+    puts "Compiled #{protos.size} proto file(s) to #{ruby_out}/"
   end
 end
