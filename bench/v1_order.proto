@@ -1,0 +1,12 @@
+syntax = "proto3";
+package shop.v1;
+
+service OrderService {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+}
+
+message GetOrderRequest { int64 id = 1; }
+message Order { int64 id = 1; string status = 2; }
+message ListOrdersRequest { int32 limit = 1; }
+message ListOrdersResponse { repeated Order orders = 1; }

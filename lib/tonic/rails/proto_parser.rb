@@ -37,8 +37,10 @@ module Tonic
       # @param full_name [String] fully-qualified service name (package.Service)
       # @return [ServiceInfo, nil]
       def self.find_service(proto_dir, full_name)
-        package, service_name = full_name.split(".")
+        *pkg, service_name = full_name.split(".")
         return nil unless service_name
+
+        package = pkg.join(".")
 
         Dir.glob("#{proto_dir}/**/*.proto").each do |file|
           info = parse_service(file, service_name)

@@ -85,14 +85,15 @@ protoc --ruby_out=app/grpc -Iprotos protos/shop.proto
 
 ### 2. Define a service handler
 
+#### Auto-registration from proto (recommended)
+
+Use `rpc_service` to auto-register all RPCs from the `.proto` file —
+no need to declare each `rpc :Method, Req, Resp` individually:
+
 ```ruby
 class ProductService
   include Tonic::Rails::Base
-
-  service "shop.ProductService"
-
-  rpc :GetProduct, Shop::GetProductRequest, Shop::Product
-  rpc :HealthCheck, Shop::HealthCheckRequest, Shop::HealthCheckResponse
+  rpc_service "shop.ProductService"  # scans config.proto_dir
 
   def get_product(request)
     product = Product.find(request["id"])
@@ -111,9 +112,39 @@ class ProductService
 end
 ```
 
+`rpc_service` sets the service name and registers all RPCs by parsing
+the `.proto` file. The proto directory defaults to `"protos"` and can
+be configured:
+
+```ruby
+Tonic::Rails.configure do |config|
+  config.proto_dir = "app/protos"
+end
+```
+
+Or specify the proto file explicitly:
+
+```ruby
+rpc_service "shop.v1.ProductService", proto_file: "protos/shop.proto"
+```
+
+#### Manual registration
+
+For finer control, declare each RPC individually:
+
+```ruby
+class ProductService
+  include Tonic::Rails::Base
+  service "shop.ProductService"
+  rpc :GetProduct, Shop::GetProductRequest, Shop::Product
+  rpc :HealthCheck, Shop::HealthCheckRequest, Shop::HealthCheckResponse
+end
+```
+
 Handlers receive a decoded Hash (via `google-protobuf`) and return a Hash
 that gets encoded back to protobuf. Raise `Tonic::Rails::RpcError` for
-gRPC error codes.
+gRPC error codes. The Ruby class name is irrelevant — routing is by the
+`service` declaration.
 
 ### Server-streaming RPCs
 
