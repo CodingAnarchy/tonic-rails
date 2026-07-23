@@ -116,6 +116,21 @@ RSpec.describe Tonic::Rails::Base do
         end
       }.to raise_error(Tonic::Rails::Error, /not found/)
     end
+
+    it "handles versioned packages like shop.v1.ProductService" do
+      require_relative "../../../bench/v1_order_pb"
+      file = File.expand_path("../../../bench/v1_order.proto", __dir__)
+
+      svc = Class.new do
+        include Tonic::Rails::Base
+        rpc_service "shop.v1.OrderService", proto_file: file
+      end
+
+      expect(svc.grpc_service_name).to eq("shop.v1.OrderService")
+      expect(svc.grpc_rpcs.keys).to include("GetOrder", "ListOrders")
+      expect(svc.grpc_rpcs["GetOrder"][:request]).to eq(Shop::V1::GetOrderRequest)
+      expect(svc.grpc_rpcs["GetOrder"][:response]).to eq(Shop::V1::Order)
+    end
   end
 
   describe "#call_rpc" do

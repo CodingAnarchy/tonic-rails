@@ -73,7 +73,7 @@ module Tonic
           self.grpc_service_name = full_name
 
           info = if proto_file
-            package, service_name = full_name.split(".")
+            *pkg, service_name = full_name.split(".")
             ProtoParser.parse_service(proto_file, service_name)
           else
             proto_dir = Tonic::Rails.configuration.proto_dir
