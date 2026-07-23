@@ -19,6 +19,7 @@ module Tonic
       # the ActiveRecord connection pool (which Rails sizes from the same env).
       config.tonic_rails.dispatch_threads = ENV.fetch("RAILS_MAX_THREADS", 4).to_i
       config.tonic_rails.compression = false
+      config.tonic_rails.reflection = true
 
       initializer "tonic_rails.configuration" do |app|
           config.logger ||= ::Rails.logger
@@ -29,6 +30,7 @@ module Tonic
           config.max_connections = app.config.tonic_rails.max_connections
           config.interceptors = app.config.tonic_rails.interceptors
           config.auto_start = app.config.tonic_rails.auto_start
+          config.reflection = app.config.tonic_rails.reflection
           config.compression = app.config.tonic_rails.compression
           config.dispatch_threads = app.config.tonic_rails.dispatch_threads
         end

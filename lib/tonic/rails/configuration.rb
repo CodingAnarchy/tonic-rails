@@ -78,6 +78,13 @@ module Tonic
       # @return [Boolean]
       attr_accessor :compression
 
+      # Enable gRPC reflection service (grpc.reflection.v1.ServerReflection).
+      # When enabled, clients like grpcurl can discover services without
+      # local .proto files.  Disable in production to avoid exposing API
+      # schema.  Default: true (enabled for development convenience).
+      # @return [Boolean]
+      attr_accessor :reflection
+
       def initialize
         @bind_address = "0.0.0.0:50051"
         @max_message_size = 4 * 1024 * 1024  # 4 MB
@@ -92,6 +99,7 @@ module Tonic
         @log_requests = false
         @interceptors = []
         @compression = false
+        @reflection = true
       end
     end
   end

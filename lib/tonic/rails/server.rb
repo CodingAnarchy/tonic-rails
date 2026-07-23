@@ -93,6 +93,9 @@ module Tonic
           @configuration.logger.info("tonic-rails: gzip compression enabled")
         end
 
+        # Configure reflection (disable in production to hide API schema).
+        @native_server.set_reflection(@configuration.reflection)
+
         # Start the tokio runtime and dispatch channel (non-blocking).
         @native_server.start_server
         @running = true
@@ -130,13 +133,14 @@ module Tonic
         Signal.trap(:TERM, old_term) if old_term
         Signal.trap(:INT, old_int) if old_int
       end
-
       def stop
         return unless @running
         # Called from a signal trap — must be async-safe.
         # No logging, no I/O — just set flags. The shutdown flag lets
         # in-flight Ruby handlers check cancelled? and abort gracefully.
+        # Flip health check to NOT_SERVING so LBs stop sending traffic.
         Tonic::Rails._set_shutting_down
+        @native_server&.set_not_serving
         @native_server&.shutdown
         @running = false
       end
