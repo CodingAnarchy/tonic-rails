@@ -73,6 +73,10 @@ module Tonic
           # Set the service name (replaces `service` declaration).
           self.grpc_service_name = full_name
 
+          unless proto_file || Tonic::Rails.configuration.proto_dir
+            raise Error, "rpc_service: proto_dir not configured in Tonic::Rails.configuration"
+          end
+
           info = if proto_file
             *pkg, service_name = full_name.split(".")
             ProtoParser.parse_service(proto_file, service_name)
@@ -166,15 +170,23 @@ module Tonic
           if request_reader
             # Real reader from Rust — yields raw bytes, we decode each.
             request_enum = Enumerator.new do |y|
-              while (bytes = request_reader.next)
-                begin
-                  obj = spec[:request].decode(bytes)
-                rescue => e
-                  logger = Tonic::Rails.configuration.logger
-                  logger&.warn("tonic-rails: invalid protobuf in stream for #{method_name}: #{e.class}: #{e.message}")
-                  raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+              begin
+                while (bytes = request_reader.next)
+                  begin
+                    obj = spec[:request].decode(bytes)
+                  rescue => e
+                    logger = Tonic::Rails.configuration.logger
+                    logger&.warn("tonic-rails: invalid protobuf in stream for #{method_name}: #{e.class}: #{e.message}")
+                    raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+                  end
+                  y << obj.to_h.deep_stringify_keys
                 end
-                y << obj.to_h.deep_stringify_keys
+              rescue RpcError => e
+                raise e
+              rescue => e
+                logger = Tonic::Rails.configuration.logger
+                logger&.warn("tonic-rails: error reading from stream for #{method_name}: #{e.class}: #{e.message}")
+                raise RpcError.new("stream read error", code: :unavailable)
               end
             end
           else
@@ -196,7 +208,13 @@ module Tonic
           # request_bytes argument is used directly.
           request_reader = metadata["_request_reader"]
           actual_bytes = if request_reader
-            bytes = request_reader.next
+            begin
+              bytes = request_reader.next
+            rescue => e
+              logger = Tonic::Rails.configuration.logger
+              logger&.warn("tonic-rails: error reading from request for #{method_name}: #{e.class}: #{e.message}")
+              raise RpcError.new("stream read error", code: :unavailable)
+            end
             if bytes.nil?
               raise RpcError.new("empty request stream", code: :invalid_argument)
             end
@@ -218,6 +236,9 @@ module Tonic
         # ── Response handling ───────────────────────────────────────
         if spec[:response_stream]
           # Server streaming or bidi: handler must return an Enumerable.
+          if result.nil?
+            raise RpcError.new("streaming handler must return an Enumerable, got nil", code: :internal)
+          end
           unless result.respond_to?(:each)
             raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
           end
@@ -244,6 +265,9 @@ module Tonic
           end
         else
           # Unary or client streaming: handler must return a Hash.
+          if result.nil?
+            raise RpcError.new("handler must return a Hash, got nil", code: :internal)
+          end
           unless result.is_a?(Hash)
             raise RpcError.new("handler must return a Hash, got #{result.class}", code: :internal)
           end

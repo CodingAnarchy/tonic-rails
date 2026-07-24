@@ -242,3 +242,39 @@ Initial release.
   (`if let X = a && let Y = b { ... }`): in `GrpcStreamingBody::poll_frame`
   (deadline check), `handle_request` (timeout header parsing), and
   `stop_server` (health reporter shutdown). Eliminates nested indentation.
+
+### Edge-case hardening pass
+
+- **Server double-start guard**: `start_server` now returns an error if
+  the runtime is already running, preventing resource leaks (orphaned
+  tokio threads, duplicate socket binds) from a second call without
+  `stop_server`.
+- **RequestReader EOS optimization**: after the request channel closes
+  (end-of-stream), the receiver is dropped instead of being put back
+  into the `Mutex`. Subsequent `.next` calls return nil immediately
+  without a blocking `try_recv` on a known-disconnected channel.
+- **Request stream error propagation**: when the body-reading tokio task
+  encounters an invalid frame, oversized message, or body-read failure,
+  it sets a shared `Arc<AtomicU8>` error flag (gRPC status code) before
+  closing the request channel. `RequestReader::next` checks this flag
+  when the channel closes — if set, it raises a Ruby exception instead
+  of returning nil (end-of-stream). The handler's Enumerator catches
+  the exception and propagates it as `RpcError` → error trailer →
+  `GrpcStreamingBody` records the error. Previously, an invalid request
+  stream was indistinguishable from legitimate EOS, so the handler
+  committed a partial/invalid request as a successful response.
+- **Streaming decode error → `:invalid_argument`**: decode errors in the
+  client-streaming/bidi Enumerator now raise `RpcError` with
+  `:invalid_argument` (matching the unary path), instead of falling
+  through to the generic `:internal` handler.
+- **RequestReader exception handling**: `request_reader.next` failures
+  in both the streaming and unary paths are now caught and mapped to
+  `RpcError` with `:unavailable` code, with a server-side warning log.
+- **Handler nil return validation**: explicit `nil` checks before type
+  validation give clearer error messages for handlers that return nil.
+- **ProtoParser qualified type support**: the RPC regex now accepts
+  qualified type names (e.g., `shop.v1.ProductMessage`) via `[\w.]+`
+  instead of `\w+`.
+- **`rpc_service` configuration guard**: raises a clear error when
+  neither `proto_file` nor `proto_dir` is configured, instead of
+  failing with a confusing `NoMethodError` inside `ProtoParser`.

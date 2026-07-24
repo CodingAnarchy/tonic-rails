@@ -115,7 +115,7 @@ module Tonic
             #   Server stream:  rpc Method(Req) returns (stream Resp);
             #   Client stream:  rpc Method(stream Req) returns (Resp);
             #   Bidi stream:    rpc Method(stream Req) returns (stream Resp);
-            if (match = trimmed.match(/^rpc\s+(\w+)\s*\(\s*(?:(stream)\s+)?(\w+)\s*\)\s*returns\s*\(\s*(?:(stream)\s+)?(\w+)\s*\)\s*;/))
+            if (match = trimmed.match(/^rpc\s+(\w+)\s*\(\s*(?:(stream)\s+)?([\w.]+)\s*\)\s*returns\s*\(\s*(?:(stream)\s+)?([\w.]+)\s*\)\s*;/))
               rpcs << RpcInfo.new(
                 name: match[1],
                 request_type: match[3],

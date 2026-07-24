@@ -59,7 +59,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -148,6 +148,12 @@ struct DispatchContext {
     /// Set for client-streaming RPCs (multiple request messages);
     /// None for unary (single message passed via `request_bytes`).
     request_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Set by the body-reading task if the request stream had an error
+    /// (invalid frame, oversized message, or body-read failure).
+    /// RequestReader checks this when the channel closes — if set,
+    /// it raises a Ruby exception instead of returning nil (EOS).
+    /// 0 = no error, non-zero = gRPC status code.
+    request_error_flag: Arc<AtomicU8>,
 }
 
 /// Extract gRPC error code from a Ruby exception.
@@ -252,7 +258,7 @@ fn dispatch_with_gvl_inner(ctx: &mut DispatchContext) {
     // iterates the reader for all messages. The reader is always set
     // because handle_request always creates a request channel.
     if let Some(rx) = ctx.request_rx.take() {
-        let reader = RequestReader::new(rx);
+        let reader = RequestReader::new(rx, ctx.request_error_flag.clone());
         let obj: Value = reader.into_value_with(&ruby);
         let _ = metadata.aset(ruby.str_new("_request_reader"), obj);
     }
@@ -816,12 +822,16 @@ unsafe extern "C" fn request_reader_next_blocking(data: *mut c_void) -> *mut c_v
 #[magnus(class = "TonicRails::Native::RequestReader")]
 struct RequestReader {
     rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Set by the body-reading task on error. Checked when the channel
+    /// closes — if non-zero, .next raises instead of returning nil.
+    error_flag: Arc<AtomicU8>,
 }
 
 impl RequestReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(rx: mpsc::Receiver<Vec<u8>>, error_flag: Arc<AtomicU8>) -> Self {
         Self {
             rx: Mutex::new(Some(rx)),
+            error_flag,
         }
     }
 
@@ -853,22 +863,40 @@ impl RequestReader {
             )
         };
 
-        // Put receiver back for the next call.
-        this.rx.lock().replace(rx);
-
+        // On success or cancel, put receiver back for the next call.
+        // On channel closed (result_code 2), drop the receiver — subsequent
+        // .next calls return nil immediately without blocking.
         match result_code as usize {
-            0 => match ctx.result.take() {
-                Some(bytes) => {
-                    let s = ruby.str_from_slice(&bytes).as_value();
-                    Ok(s)
+            0 => {
+                this.rx.lock().replace(rx);
+                match ctx.result.take() {
+                    Some(bytes) => {
+                        let s = ruby.str_from_slice(&bytes).as_value();
+                        Ok(s)
+                    }
+                    None => Ok(ruby.qnil().as_value()),
                 }
-                None => Ok(ruby.qnil().as_value()),
-            },
-            1 => Err(magnus::error::Error::new(
-                ruby.exception_runtime_error(),
-                "request reader interrupted",
-            )),
-            _ => Ok(ruby.qnil().as_value()), // channel closed
+            }
+            1 => {
+                this.rx.lock().replace(rx);
+                Err(magnus::error::Error::new(
+                    ruby.exception_runtime_error(),
+                    "request reader interrupted",
+                ))
+            }
+            _ => {
+                // Channel closed — drop rx, don't put it back.
+                drop(rx);
+                let code = this.error_flag.load(Ordering::Relaxed);
+                if code != 0 {
+                    Err(magnus::error::Error::new(
+                        ruby.exception_runtime_error(),
+                        "request stream error",
+                    ))
+                } else {
+                    Ok(ruby.qnil().as_value())
+                }
+            }
         }
     }
 }
@@ -1408,6 +1436,11 @@ impl GrpcDispatchInner {
 
         // Create request message channel (tokio mpsc for GVL-released recv).
         let (req_tx, req_rx) = mpsc::channel::<Vec<u8>>(32);
+        // Shared error flag — set by the body-reading task if the request
+        // stream had an error (invalid frame, oversized, body-read failure).
+        // RequestReader checks this when the channel closes to distinguish
+        // error-closed from legitimate end-of-stream.
+        let request_error_flag = Arc::new(AtomicU8::new(0));
 
         // Propagate deadline to Ruby handler via metadata.
         let mut metadata_with_deadline = metadata;
@@ -1431,6 +1464,7 @@ impl GrpcDispatchInner {
             metadata: metadata_with_deadline,
             stream_tx: Some(stream_tx),
             request_rx: Some(req_rx),
+            request_error_flag: request_error_flag.clone(),
         });
 
         match self.request_tx.try_send(dispatch_req) {
@@ -1468,8 +1502,8 @@ impl GrpcDispatchInner {
         // backpressures the client.  Dropping req_tx closes the channel,
         // signaling end-of-stream to the RequestReader.
         let max_msg_size = self.max_message_size;
-        let stats = self.stats.clone();
         let path_for_task = path.clone();
+        let error_flag_for_task = request_error_flag.clone();
         tokio::spawn(async move {
             use tokio_stream::StreamExt;
             let mut reader = GrpcMessageReader::new(max_msg_size);
@@ -1487,9 +1521,16 @@ impl GrpcDispatchInner {
                                 }
                                 Ok(None) => break, // need more data
                                 Err(_) => {
-                                    // Invalid frame — close channel with error.
-                                    stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                                    stats.resource_exhausted.fetch_add(1, Ordering::Relaxed);
+                                    // Invalid frame — set error flag so
+                                    // RequestReader raises instead of
+                                    // returning nil (EOS). The handler's
+                                    // Enumerator propagates the exception
+                                    // as RpcError → error trailer. Stats
+                                    // are recorded by GrpcStreamingBody.
+                                    error_flag_for_task.store(
+                                        tonic::Code::ResourceExhausted as u8,
+                                        Ordering::Relaxed,
+                                    );
                                     eprintln!(
                                         "tonic-rails: req path={path_for_task} status=ERROR code=RESOURCE_EXHAUSTED msg=invalid_frame_in_stream"
                                     );
@@ -1499,6 +1540,7 @@ impl GrpcDispatchInner {
                         }
                     }
                     Err(e) => {
+                        error_flag_for_task.store(tonic::Code::Internal as u8, Ordering::Relaxed);
                         eprintln!(
                             "tonic-rails: req path={path_for_task} status=ERROR code=INTERNAL msg=body_read_failed:{e}"
                         );
@@ -1515,7 +1557,11 @@ impl GrpcDispatchInner {
                         }
                     }
                     Ok(None) => break,
-                    Err(_) => return,
+                    Err(_) => {
+                        error_flag_for_task
+                            .store(tonic::Code::ResourceExhausted as u8, Ordering::Relaxed);
+                        return;
+                    }
                 }
             }
             // req_tx is dropped here → channel closes → RequestReader returns nil.
@@ -1822,6 +1868,12 @@ impl NativeServer {
     ///   server.start_server
     fn start_server(&self) -> Result<(), Error> {
         let ruby = Ruby::get().expect("Ruby VM must be available when #start_server is called");
+        if self.runtime.lock().is_some() {
+            return Err(magnus::error::Error::new(
+                ruby.exception_runtime_error(),
+                "server already running — call #stop_server first",
+            ));
+        }
 
         let callback = (*self.callback.lock()).ok_or_else(|| {
             magnus::error::Error::new(
