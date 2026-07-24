@@ -206,15 +206,19 @@ Tonic::Rails.server.start
 | `bind_address` | `0.0.0.0:50051` | Host and port to bind |
 | `dispatch_threads` | `4` | Ruby dispatch threads (set to `RAILS_MAX_THREADS`) |
 | `worker_threads` | num CPUs | Tokio worker threads for transport |
-| `max_message_size` | 4 MB | Max request/response size |
+| `max_message_size` | 4 MB | Max request/response size (also caps decompressed payload) |
 | `tls_cert_path` | nil | PEM certificate path for TLS |
 | `tls_key_path` | nil | PEM private key path for TLS |
 | `drain_timeout` | 10s | Graceful shutdown drain timeout |
-| `max_connections` | 10,000 | Max concurrent TCP connections |
+| `max_connections` | 64 | Max concurrent TCP connections (enforced via semaphore) |
+| `concurrency_limit_per_connection` | 32 | Max concurrent HTTP/2 streams per connection |
 | `auto_start` | false | Start alongside Rails server |
 | `log_requests` | false | Log every request (not just errors) |
 | `interceptors` | `[]` | Array of interceptor procs |
 | `compression` | false | Enable gRPC gzip compression (responses >1KB) |
+| `reflection` | false | Enable gRPC reflection (enable in development only) |
+| `keepalive_interval` | 15s | HTTP/2 keepalive ping interval |
+| `keepalive_timeout` | 5s | HTTP/2 keepalive ping timeout |
 
 ### Dispatch threads
 

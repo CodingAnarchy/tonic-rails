@@ -54,9 +54,16 @@ module Tonic
       attr_accessor :drain_timeout
 
       # Maximum number of concurrent TCP connections.  New connections
-      # exceeding this limit are dropped.  Default: 10 000.
+      # exceeding this limit are dropped.  Set to 0 for unlimited.
+      # Default: 64.
       # @return [Integer]
       attr_accessor :max_connections
+
+      # Maximum number of concurrent HTTP/2 streams per connection.
+      # Prevents a single client from exhausting the dispatch queue
+      # with many concurrent requests.  Default: 32.
+      # @return [Integer]
+      attr_accessor :concurrency_limit_per_connection
 
       # When true, log every request (including successful ones) to stderr.
       # Errors are always logged regardless.  Default: false.
@@ -81,9 +88,22 @@ module Tonic
       # Enable gRPC reflection service (grpc.reflection.v1.ServerReflection).
       # When enabled, clients like grpcurl can discover services without
       # local .proto files.  Disable in production to avoid exposing API
-      # schema.  Default: true (enabled for development convenience).
+      # schema.  Default: false (disabled for security; enable in
+      # development initializers).
       # @return [Boolean]
       attr_accessor :reflection
+
+      # HTTP/2 keepalive ping interval in seconds.  A PING frame is sent
+      # every this many seconds to keep the connection alive and detect
+      # dead peers.  Default: 15.
+      # @return [Integer]
+      attr_accessor :keepalive_interval
+
+      # HTTP/2 keepalive timeout in seconds.  If no pong is received
+      # within this many seconds after a ping, the connection is dropped.
+      # Default: 5.
+      # @return [Integer]
+      attr_accessor :keepalive_timeout
 
       # Directory containing .proto files. Used by rpc_service to
       # auto-register RPCs from proto declarations. Default: "protos".
@@ -99,11 +119,14 @@ module Tonic
         @tls_cert_path = nil
         @tls_key_path = nil
         @drain_timeout = 10
-        @max_connections = 10_000
+        @max_connections = 64
+        @concurrency_limit_per_connection = 32
         @log_requests = false
         @interceptors = []
         @compression = false
-        @reflection = true
+        @reflection = false
+        @keepalive_interval = 15
+        @keepalive_timeout = 5
         @proto_dir = "protos"
       end
     end

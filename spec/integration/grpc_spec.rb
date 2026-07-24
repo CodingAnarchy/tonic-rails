@@ -44,6 +44,7 @@ RSpec.describe "gRPC integration", :integration do
       c.bind_address = "#{ADDR}:#{@port}"
       c.dispatch_threads = 2
       c.log_requests = false
+      c.reflection = true  # enable for integration tests
       c.logger = Logger.new(IO::NULL)
     end)
     @server.register(ProductService)

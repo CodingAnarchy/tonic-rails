@@ -69,10 +69,13 @@ use http_body::{Body, Frame};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio_stream::Stream;
 use tonic::server::NamedService;
+use tonic::transport::server::Connected;
 use tonic::Status;
 use tower::Service;
 
@@ -83,8 +86,8 @@ type TonicBody = UnsyncBoxBody<Bytes, Status>;
 // ─── Magnus / rb-sys imports ──────────────────────────────────────
 
 use magnus::{
-    function, gc, method, prelude::*, typed_data::DataTypeFunctions, value::Opaque, Error, RArray,
-    RHash, Ruby, Value,
+    function, gc, method, prelude::*, typed_data::DataTypeFunctions, value::Opaque, Error,
+    IntoValue, RArray, RHash, Ruby, Value,
 };
 use rb_sys::{
     rb_str_new, rb_str_strlen, rb_string_value_ptr, rb_thread_call_with_gvl,
@@ -141,19 +144,9 @@ struct DispatchContext {
     path: String,
     request_bytes: Vec<u8>,
     metadata: Vec<(String, String)>,
-}
-
-/// Result returned from the Ruby callback through the GVL bridge.
-struct DispatchResult {
-    response_bytes: Vec<u8>,
-    /// Multiple encoded responses for server-streaming RPCs.
-    /// Empty for unary RPCs.
-    streaming_responses: Vec<Vec<u8>>,
-    /// True when the RPC is declared as server-streaming.
-    /// Disambiguates empty streams from empty unary responses.
-    streaming: bool,
-    /// (grpc_status code, message) on error
-    error: Option<(u32, String)>,
+    /// Channel for sending response messages to the tokio body.
+    /// Always set in the new dispatch model (unary sends one Data + End).
+    stream_tx: Option<mpsc::Sender<StreamMessage>>,
 }
 
 /// Extract gRPC error code from a Ruby exception.
@@ -172,48 +165,64 @@ fn extract_error_code(e: &Error) -> (u32, String) {
 
 /// C callback invoked by `rb_thread_call_with_gvl` with the GVL held.
 ///
-/// This function runs on a tokio blocking thread but WITH the GVL
-/// acquired, so it is safe to call Ruby APIs.
-///
-/// Dispatch mode: always raw bytes — handler receives binary protobuf
-/// String, returns binary String.
+/// This function runs on a Ruby worker thread WITH the GVL acquired,
+/// so it is safe to call Ruby APIs.  It owns the DispatchContext and
+/// passes a reference to dispatch_with_gvl_inner.  On panic, it sends
+/// an error End message through the channel before dropping the context.
 unsafe extern "C" fn dispatch_with_gvl(data: *mut c_void) -> *mut c_void {
-    // Wrap the entire dispatch in catch_unwind so a Rust panic (e.g.,
-    // from a malformed message or unexpected Ruby type) doesn't crash
-    // the Ruby process.  The panic is converted to an INTERNAL error.
+    let ctx = Box::from_raw(data as *mut DispatchContext);
+
+    // Clone the stream sender for panic recovery — if the inner function
+    // panics, we still need to send an End(error) so the tokio body
+    // doesn't hang waiting for trailers.
+    let panic_tx = ctx.stream_tx.clone();
+
     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dispatch_with_gvl_inner(data)
+        dispatch_with_gvl_inner(&ctx);
     }));
+
     match panic_result {
-        Ok(ret) => ret,
+        Ok(()) => { // Success — data + End already sent via channel
+        }
         Err(panic_msg) => {
             let msg = panic_msg
                 .downcast_ref::<String>()
                 .map(|s| s.as_str())
                 .or_else(|| panic_msg.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
-            Box::into_raw(Box::new(DispatchResult {
-                response_bytes: vec![],
-                streaming_responses: vec![],
-                streaming: false,
-                error: Some((13, format!("internal panic: {msg}"))),
-            })) as *mut c_void
+            if let Some(tx) = &panic_tx {
+                let cancelled = AtomicBool::new(false);
+                let _ = gvl_released_send(
+                    tx,
+                    StreamMessage::End(Some((13, format!("internal panic: {msg}")))),
+                    &cancelled,
+                );
+            }
         }
     }
+    // ctx is dropped here, which drops the original stream_tx clone.
+    // The StreamSender's clone (in the Ruby metadata hash) is GC'd later.
+    std::ptr::null_mut()
 }
 
-unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
-    let ctx = Box::from_raw(data as *mut DispatchContext);
+/// Inner dispatch: call the Ruby callback and stream the response.
+/// Takes a reference (not ownership) so the caller can handle panics.
+fn dispatch_with_gvl_inner(ctx: &DispatchContext) {
+    // Cancel flag for GVL-released sends (set by the unblock callback
+    // if the Ruby thread is interrupted during a blocking send).
+    let cancelled = AtomicBool::new(false);
 
     let ruby = match Ruby::get() {
         Ok(r) => r,
         Err(_) => {
-            return Box::into_raw(Box::new(DispatchResult {
-                response_bytes: vec![],
-                streaming_responses: vec![],
-                streaming: false,
-                error: Some((2, "Ruby VM unavailable".into())),
-            })) as *mut c_void;
+            if let Some(tx) = ctx.stream_tx.as_ref() {
+                let _ = gvl_released_send(
+                    tx,
+                    StreamMessage::End(Some((2, "Ruby VM unavailable".into()))),
+                    &cancelled,
+                );
+            }
+            return;
         }
     };
 
@@ -225,6 +234,17 @@ unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
         let _ = metadata.aset(ruby.str_new(k), ruby.str_new(v));
     }
 
+    // Create StreamSender and add it to metadata for streaming RPCs.
+    // The Ruby handler checks for "_stream_sender" in metadata and uses
+    // it to send messages incrementally (avoids materializing the full
+    // stream in memory).  For unary RPCs, the sender is unused.
+    let end_tx = ctx.stream_tx.clone();
+    if let Some(stream_tx) = ctx.stream_tx.as_ref() {
+        let sender = StreamSender::new(stream_tx.clone());
+        let obj: Value = sender.into_value_with(&ruby);
+        let _ = metadata.aset(ruby.str_new("_stream_sender"), obj);
+    }
+
     // Raw bytes path: pass binary protobuf String to Ruby handler.
     let bytes = unsafe {
         std::mem::transmute::<rb_sys::VALUE, Value>(rb_str_new(
@@ -233,80 +253,66 @@ unsafe extern "C" fn dispatch_with_gvl_inner(data: *mut c_void) -> *mut c_void {
         ))
     };
 
-    match callback.funcall::<_, _, Value>("call", (path, bytes, metadata)) {
-        Ok(result) => {
-            // Helper to extract bytes from a Ruby String value.
-            let extract_bytes = |val: Value| -> Vec<u8> {
-                unsafe {
-                    let raw: rb_sys::VALUE = std::mem::transmute(val);
-                    let mut raw_mut = raw;
-                    let ptr = rb_string_value_ptr(&mut raw_mut) as *const u8;
-                    let len = rb_str_strlen(raw) as usize;
-                    if ptr.is_null() || len == 0 {
-                        Vec::new()
-                    } else {
-                        std::slice::from_raw_parts(ptr, len).to_vec()
+    let result = callback.funcall::<_, _, Value>("call", (path, bytes, metadata));
+
+    // After the callback returns, send the terminal End message.
+    // For streaming RPCs that used the StreamSender, data was already
+    // sent incrementally — the result is nil.
+    // For unary RPCs, the result is a String with encoded bytes.
+    // For buffered streaming fallback, the result is an Array.
+    //
+    // All sends use gvl_released_send to avoid holding the GVL while
+    // waiting for channel capacity.  The channel may be full if the
+    // handler sent ~32 messages via StreamSender and the client hasn't
+    // drained them yet.
+    let end_msg = match result {
+        Ok(value) => {
+            if value.is_kind_of(ruby.class_array()) {
+                // Buffered streaming fallback: iterate and send each.
+                // Each send releases the GVL so other workers aren't
+                // starved while the client drains the channel.
+                let arr = RArray::from_value(value).unwrap();
+                for i in 0..arr.len() as isize {
+                    let bytes = extract_ruby_string(arr.entry(i).unwrap());
+                    if let Some(tx) = &end_tx {
+                        let _ = gvl_released_send(tx, StreamMessage::Data(bytes), &cancelled);
                     }
                 }
-            };
-
-            // Detect return type via Magnus: Array → server-streaming,
-            // String → unary.  The RPC DSL guarantees consistency: streaming
-            // RPCs always return an Array (even empty), unary always a String.
-            let is_array = result.is_kind_of(ruby.class_array());
-
-            if is_array {
-                // Server-streaming: extract each element's bytes.
-                let arr = RArray::from_value(result).unwrap();
-                let streaming_responses: Vec<Vec<u8>> = (0..arr.len() as isize)
-                    .map(|i| extract_bytes(arr.entry(i).unwrap()))
-                    .collect();
-                Box::into_raw(Box::new(DispatchResult {
-                    response_bytes: vec![],
-                    streaming_responses,
-                    streaming: true,
-                    error: None,
-                })) as *mut c_void
+                StreamMessage::End(None)
+            } else if value.is_nil() {
+                // Incremental streaming: data sent via StreamSender.
+                StreamMessage::End(None)
             } else {
                 // Unary: single encoded protobuf String.
-                let response_bytes = extract_bytes(result);
-                Box::into_raw(Box::new(DispatchResult {
-                    response_bytes,
-                    streaming_responses: vec![],
-                    streaming: false,
-                    error: None,
-                })) as *mut c_void
+                // The channel is empty (just created), so this send
+                // won't block — but using gvl_released_send for
+                // consistency.
+                let bytes = extract_ruby_string(value);
+                if let Some(tx) = &end_tx {
+                    let _ = gvl_released_send(tx, StreamMessage::Data(bytes), &cancelled);
+                }
+                StreamMessage::End(None)
             }
         }
         Err(e) => {
             let (code, msg) = extract_error_code(&e);
-            Box::into_raw(Box::new(DispatchResult {
-                response_bytes: vec![],
-                streaming_responses: vec![],
-                streaming: false,
-                error: Some((code, msg)),
-            })) as *mut c_void
+            StreamMessage::End(Some((code, msg)))
         }
+    };
+
+    if let Some(tx) = &end_tx {
+        let _ = gvl_released_send(tx, end_msg, &cancelled);
     }
 }
 
 // ─── GVL bridge: serve (release GVL) ──────────────────────────────
-
-/// Request dispatched from tokio to the Ruby serve thread via a channel.
-/// The Ruby thread (inside rb_thread_call_without_gvl) picks this up,
-/// re-acquires the GVL via rb_thread_call_with_gvl, runs the handler,
-/// and sends the result back through response_tx.
-struct DispatchRequest {
-    ctx: Box<DispatchContext>,
-    response_tx: oneshot::Sender<DispatchResult>,
-}
 
 /// Context for a serve worker thread.  The request_rx is shared across
 /// all worker threads via Arc (crossbeam Receiver is Sync).  The shutdown
 /// flag is shared via Arc<AtomicBool>.
 struct ServeContext {
     shutdown: Arc<AtomicBool>,
-    request_rx: Arc<crossbeam_channel::Receiver<DispatchRequest>>,
+    request_rx: Arc<crossbeam_channel::Receiver<Box<DispatchContext>>>,
 }
 
 struct UnblockContext {
@@ -334,23 +340,11 @@ unsafe extern "C" fn serve_blocking(data: *mut c_void) -> *mut c_void {
         // re-check shutdown periodically.
         match ctx.request_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => {
-                // Re-acquire GVL and call the Ruby handler.  This is
-                // the correct use of rb_thread_call_with_gvl: from
-                // inside a rb_thread_call_without_gvl callback.
-                let ctx_ptr = Box::into_raw(req.ctx) as *mut c_void;
-                let result_ptr =
-                    unsafe { rb_thread_call_with_gvl(Some(dispatch_with_gvl), ctx_ptr) };
-                let result = if result_ptr.is_null() {
-                    DispatchResult {
-                        response_bytes: vec![],
-                        streaming_responses: vec![],
-                        streaming: false,
-                        error: Some((13, "dispatch returned null".into())),
-                    }
-                } else {
-                    *Box::from_raw(result_ptr as *mut DispatchResult)
-                };
-                let _ = req.response_tx.send(result);
+                // Re-acquire GVL and call the Ruby handler.
+                // dispatch_with_gvl sends response messages through
+                // the mpsc channel in ctx — no oneshot to send.
+                let ctx_ptr = Box::into_raw(req) as *mut c_void;
+                let _ = unsafe { rb_thread_call_with_gvl(Some(dispatch_with_gvl), ctx_ptr) };
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -370,7 +364,32 @@ unsafe extern "C" fn serve_unblock(data: *mut c_void) {
 // HEADERS, not initial headers.  BoxBody can't carry trailers, so
 // we use a custom Body that yields a data Frame then a trailers Frame.
 
+/// Build gRPC error trailers with a sanitized message.
+///
+/// Replaces control chars (newlines, NULs, etc.) with spaces so the
+/// message is never silently dropped by `HeaderValue::from_str`.
+/// Used by both `GrpcBody` (pre-dispatch errors) and `GrpcStreamingBody`
+/// (mid-stream errors).
+fn build_error_trailers(code: u32, message: &str) -> http::HeaderMap {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert(
+        "grpc-status",
+        HeaderValue::from_str(&code.to_string()).unwrap_or(HeaderValue::from_static("2")),
+    );
+    if !message.is_empty() {
+        let sanitized: String = message
+            .chars()
+            .map(|c| if c.is_ascii_control() { ' ' } else { c })
+            .collect();
+        if let Ok(val) = HeaderValue::from_str(&sanitized) {
+            trailers.insert("grpc-message", val);
+        }
+    }
+    trailers
+}
+
 /// Body that yields optional data followed by gRPC trailing headers.
+/// Used for pre-dispatch error responses (no data, just trailers).
 struct GrpcBody {
     data: Option<Bytes>,
     trailers: Option<http::HeaderMap>,
@@ -378,6 +397,7 @@ struct GrpcBody {
 
 impl GrpcBody {
     /// Success response: framed protobuf data + grpc-status:0 trailers.
+    #[cfg(test)]
     fn ok(data: Bytes) -> Self {
         let mut trailers = http::HeaderMap::new();
         trailers.insert("grpc-status", HeaderValue::from_static("0"));
@@ -389,19 +409,9 @@ impl GrpcBody {
 
     /// Error response: no data + grpc-status/grpc-message trailers.
     fn error(code: u32, message: &str) -> Self {
-        let mut trailers = http::HeaderMap::new();
-        trailers.insert(
-            "grpc-status",
-            HeaderValue::from_str(&code.to_string()).unwrap_or(HeaderValue::from_static("2")),
-        );
-        if !message.is_empty() {
-            if let Ok(val) = HeaderValue::from_str(message) {
-                trailers.insert("grpc-message", val);
-            }
-        }
         Self {
             data: None,
-            trailers: Some(trailers),
+            trailers: Some(build_error_trailers(code, message)),
         }
     }
 }
@@ -425,27 +435,565 @@ impl Body for GrpcBody {
     }
 }
 
-/// Box a GrpcBody into the type tonic's add_service expects.
-fn box_body(body: GrpcBody) -> TonicBody {
-    UnsyncBoxBody::new(body)
+/// Streaming gRPC body that reads from an mpsc channel.
+///
+/// Each `Data` message becomes a gRPC data frame.  When `End` arrives
+/// (or the channel closes), trailing headers are yielded with the
+/// appropriate grpc-status.  Stats are recorded when the stream ends.
+///
+/// If a deadline is set, `poll_frame` checks it before polling the
+/// channel.  When the deadline expires, the body yields
+/// `DEADLINE_EXCEEDED` trailers and stops.
+struct GrpcStreamingBody {
+    receiver: Option<mpsc::Receiver<StreamMessage>>,
+    trailers: Option<http::HeaderMap>,
+    stats: Arc<ServerStats>,
+    path: String,
+    start: Instant,
+    compress: bool,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    stats_recorded: bool,
+    /// Per-message size limit — individual response messages exceeding
+    /// this are rejected with RESOURCE_EXHAUSTED (gRPC limit is
+    /// per-message, not per-stream).
+    max_message_size: usize,
 }
-fn unframe(data: &[u8]) -> Vec<u8> {
+
+impl GrpcStreamingBody {
+    /// Build a success trailers header map (grpc-status: 0).
+    fn success_trailers() -> http::HeaderMap {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        trailers
+    }
+
+    fn record_success(&mut self) {
+        if self.stats_recorded {
+            return;
+        }
+        self.stats_recorded = true;
+        self.stats
+            .successful_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let dur_ms = self.start.elapsed().as_millis();
+        if self.stats.log_requests.load(Ordering::Relaxed) {
+            eprintln!(
+                "tonic-rails: req path={} status=OK dur={}ms",
+                self.path, dur_ms
+            );
+        }
+    }
+
+    fn record_error(&mut self, code: u32, msg: &str) {
+        if self.stats_recorded {
+            return;
+        }
+        self.stats_recorded = true;
+        self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+        if code == tonic::Code::DeadlineExceeded as u32 {
+            self.stats.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+        } else if code == tonic::Code::ResourceExhausted as u32 {
+            self.stats
+                .resource_exhausted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let dur_ms = self.start.elapsed().as_millis();
+        // Sanitize msg for log output — Ruby error messages can contain
+        // control characters (newlines, NULs) that would inject fake log
+        // lines into stderr.  The trailers are sanitized by
+        // build_error_trailers; this is for the server-side log only.
+        let sanitized_msg: String = msg
+            .chars()
+            .map(|c| if c.is_ascii_control() { ' ' } else { c })
+            .collect();
+        eprintln!(
+            "tonic-rails: req path={} status=ERROR code={} dur={}ms msg={}",
+            self.path, code, dur_ms, sanitized_msg
+        );
+    }
+}
+
+impl Body for GrpcStreamingBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // 1. If we have buffered trailers, yield them.
+        if let Some(trailers) = self.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        // 2. Check deadline before borrowing the receiver (avoids
+        //    overlapping mutable borrows of self).
+        if let Some(deadline) = &mut self.deadline {
+            if deadline.as_mut().poll(cx).is_ready() {
+                self.receiver = None;
+                let code = tonic::Code::DeadlineExceeded as u32;
+                self.record_error(code, "deadline exceeded");
+                return Poll::Ready(Some(Ok(Frame::trailers(build_error_trailers(
+                    code,
+                    "deadline exceeded",
+                )))));
+            }
+        }
+
+        // 3. If no receiver, the stream is exhausted.
+        let receiver = match self.receiver.as_mut() {
+            Some(rx) => rx,
+            None => return Poll::Ready(None),
+        };
+
+        // 4. Poll the channel for the next message.
+        match receiver.poll_recv(cx) {
+            Poll::Ready(Some(StreamMessage::Data(bytes))) => {
+                // Check per-message size limit (gRPC limit is per-message).
+                if bytes.len() > self.max_message_size {
+                    self.receiver = None;
+                    let code = tonic::Code::ResourceExhausted as u32;
+                    self.record_error(code, "response message exceeds max_message_size");
+                    return Poll::Ready(Some(Ok(Frame::trailers(build_error_trailers(
+                        code,
+                        "response message exceeds max_message_size",
+                    )))));
+                }
+                let compress = self.compress && bytes.len() > 1024;
+                let framed = frame(&bytes, compress);
+                Poll::Ready(Some(Ok(Frame::data(framed))))
+            }
+            Poll::Ready(Some(StreamMessage::End(None))) => {
+                self.receiver = None;
+                self.record_success();
+                Poll::Ready(Some(Ok(Frame::trailers(Self::success_trailers()))))
+            }
+            Poll::Ready(Some(StreamMessage::End(Some((code, msg))))) => {
+                self.receiver = None;
+                self.record_error(code, &msg);
+                Poll::Ready(Some(Ok(Frame::trailers(build_error_trailers(code, &msg)))))
+            }
+            Poll::Ready(None) => {
+                // Channel closed without End — internal error.
+                self.receiver = None;
+                let code = tonic::Code::Internal as u32;
+                self.record_error(code, "dispatch channel closed");
+                Poll::Ready(Some(Ok(Frame::trailers(build_error_trailers(
+                    code,
+                    "dispatch channel closed",
+                )))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for GrpcStreamingBody {
+    fn drop(&mut self) {
+        // If the body is dropped without seeing End (e.g., client
+        // disconnected mid-stream), record an error for stats accuracy.
+        if !self.stats_recorded {
+            self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// ─── Incremental streaming infrastructure ─────────────────────────
+//
+// Instead of materializing the entire streaming response in memory,
+// the Ruby handler sends each encoded message through a bounded mpsc
+// channel.  The tokio side reads from the channel and frames each
+// message as a separate gRPC data frame.
+//
+// Backpressure: the channel is bounded (32 messages).  When the client
+// consumes slowly and the channel fills, the Ruby worker blocks in
+// StreamSender#send — but the GVL is released during the block, so
+// other Ruby workers can continue dispatching.  This pins one worker
+// per active stream (gated by client speed), but with the GVL released,
+// the impact on the worker pool is limited to thread count, not GVL
+// availability.  Increase dispatch_threads if many concurrent streams
+// are expected.
+
+/// Messages sent from the Ruby handler thread to the tokio body.
+enum StreamMessage {
+    /// One encoded protobuf response message.
+    Data(Vec<u8>),
+    /// End of stream: None = success, Some = error (code, message).
+    End(Option<(u32, String)>),
+}
+
+/// Extract bytes from a Ruby String value.
+/// Used by both dispatch_with_gvl_inner and StreamSender.
+fn extract_ruby_string(val: Value) -> Vec<u8> {
+    unsafe {
+        let raw: rb_sys::VALUE = std::mem::transmute(val);
+        let mut raw_mut = raw;
+        let ptr = rb_string_value_ptr(&mut raw_mut) as *const u8;
+        let len = rb_str_strlen(raw) as usize;
+        if ptr.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        }
+    }
+}
+
+// ── GVL-released send ─────────────────────────────────────────────
+//
+// StreamSender#send runs inside the GVL (called from the Ruby handler).
+// The blocking channel send must release the GVL so other Ruby workers
+// can dispatch while this worker waits for the client to consume.
+
+/// Context passed through rb_thread_call_without_gvl for stream send.
+/// All pointers are valid for the duration of the C call (same thread).
+struct StreamSendCtx {
+    sender: *const mpsc::Sender<StreamMessage>,
+    bytes: *const Vec<u8>,
+    cancelled: *const AtomicBool,
+}
+
+/// Unblock callback: sets the cancel flag so the polling loop can exit.
+unsafe extern "C" fn stream_send_unblock(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    let cancelled = unsafe { &*(data as *const AtomicBool) };
+    cancelled.store(true, Ordering::Relaxed);
+}
+
+/// Send a stream message without holding the GVL.
+/// Uses try_reserve + sleep polling so the cancel flag can be checked
+/// between attempts.  Returns null = success, 1 = cancelled, 2 = closed.
+unsafe extern "C" fn stream_send_without_gvl(data: *mut c_void) -> *mut c_void {
+    let ctx = unsafe { &*(data as *const StreamSendCtx) };
+    let sender = unsafe { &*ctx.sender };
+    let bytes = unsafe { &*ctx.bytes };
+    let cancelled = unsafe { &*ctx.cancelled };
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return 1 as *mut c_void;
+        }
+        match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(StreamMessage::Data(bytes.clone()));
+                return std::ptr::null_mut();
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return 2 as *mut c_void;
+            }
+        }
+    }
+}
+
+// ── GVL-released send for arbitrary StreamMessage ─────────────────
+//
+// dispatch_with_gvl_inner needs to send End messages (and Data messages
+// in the buffered-Array fallback) while holding the GVL.  These sends
+// can block if the channel is full (handler filled it via StreamSender,
+// or the buffered fallback has >32 elements).  Routing them through
+// rb_thread_call_without_gvl prevents GVL starvation.
+
+/// Context for sending an arbitrary StreamMessage without the GVL.
+/// The message is boxed and consumed (moved into the channel) by the
+/// C function.  All pointers are valid for the duration of the call.
+struct ChannelSendCtx {
+    sender: *const mpsc::Sender<StreamMessage>,
+    msg: *mut StreamMessage,
+    cancelled: *const AtomicBool,
+}
+
+/// Send an arbitrary StreamMessage without holding the GVL.
+/// Takes ownership of the boxed message.  Returns null = success,
+/// 1 = cancelled, 2 = closed.  On non-success, the message is dropped.
+unsafe extern "C" fn channel_send_without_gvl(data: *mut c_void) -> *mut c_void {
+    let ctx = unsafe { &*(data as *const ChannelSendCtx) };
+    let sender = unsafe { &*ctx.sender };
+    let cancelled = unsafe { &*ctx.cancelled };
+
+    // Take ownership of the message from the Box.
+    // If the pointer is null, there's nothing to send.
+    let msg = if ctx.msg.is_null() {
+        return 2 as *mut c_void;
+    } else {
+        *unsafe { Box::from_raw(ctx.msg) }
+    };
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            // msg is dropped automatically when it goes out of scope.
+            return 1 as *mut c_void;
+        }
+        match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(msg);
+                return std::ptr::null_mut();
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                // msg is dropped automatically.
+                return 2 as *mut c_void;
+            }
+        }
+    }
+}
+
+/// Send a StreamMessage through the channel, releasing the GVL during
+/// the blocking send.  Must be called from within a GVL-acquired
+/// context (inside rb_thread_call_with_gvl).  Returns Ok on success,
+/// Err if cancelled or the channel is closed.
+fn gvl_released_send(
+    sender: &mpsc::Sender<StreamMessage>,
+    msg: StreamMessage,
+    cancelled: &AtomicBool,
+) -> Result<(), ()> {
+    let msg_ptr = Box::into_raw(Box::new(msg));
+    let ctx = ChannelSendCtx {
+        sender: sender as *const _,
+        msg: msg_ptr,
+        cancelled: cancelled as *const _,
+    };
+
+    let result = unsafe {
+        rb_thread_call_without_gvl(
+            Some(channel_send_without_gvl),
+            &ctx as *const _ as *mut c_void,
+            Some(stream_send_unblock),
+            cancelled as *const _ as *mut c_void,
+        )
+    };
+
+    match result as usize {
+        0 => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Ruby-callable stream sender that pushes encoded protobuf messages
+/// through a bounded mpsc channel to the tokio body.  The GVL is
+/// released during the blocking send so other Ruby workers are not
+/// starved when a client consumes slowly.
+#[derive(magnus::TypedData)]
+#[magnus(class = "TonicRails::Native::StreamSender")]
+struct StreamSender {
+    sender: mpsc::Sender<StreamMessage>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl StreamSender {
+    fn new(sender: mpsc::Sender<StreamMessage>) -> Self {
+        Self {
+            sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Send one encoded protobuf message to the tokio body.
+    /// Called from Ruby as: stream_sender.send(encoded_bytes)
+    ///
+    /// Extracts the Ruby string bytes (GVL held), then releases the GVL
+    /// and blocks until the channel has capacity or is closed.  The GVL
+    /// release allows other Ruby workers to dispatch concurrently while
+    /// this worker waits for backpressure to clear.
+    fn send_message(&self, data: Value) -> Result<(), Error> {
+        let bytes = extract_ruby_string(data);
+
+        let ctx = StreamSendCtx {
+            sender: &self.sender as *const _,
+            bytes: &bytes as *const _,
+            cancelled: Arc::as_ptr(&self.cancelled),
+        };
+
+        let result = unsafe {
+            rb_thread_call_without_gvl(
+                Some(stream_send_without_gvl),
+                &ctx as *const _ as *mut c_void,
+                Some(stream_send_unblock),
+                Arc::as_ptr(&self.cancelled) as *mut c_void,
+            )
+        };
+
+        // GVL is re-acquired here.
+        let ruby = Ruby::get().expect("Ruby VM must be available");
+        match result as usize {
+            0 => Ok(()),
+            1 => Err(magnus::error::Error::new(
+                ruby.exception_runtime_error(),
+                "stream send cancelled",
+            )),
+            _ => Err(magnus::error::Error::new(
+                ruby.exception_runtime_error(),
+                "stream closed — client disconnected or server shutting down",
+            )),
+        }
+    }
+}
+
+impl DataTypeFunctions for StreamSender {
+    fn mark(&self, _marker: &gc::Marker) {
+        // No Ruby values to mark — StreamSender holds only Rust types.
+    }
+}
+
+/// Unframe a gRPC message, decompressing if the compressed flag is set.
+/// Returns `Ok(payload)` on success, or `Err(())` if:
+///   - the declared length exceeds the available data (truncated frame)
+///   - the uncompressed payload exceeds `max_size` (oversized message)
+///   - decompression fails or the decompressed output exceeds `max_size`
+///     (zip-bomb guard)
+fn unframe(data: &[u8], max_size: usize) -> Result<Vec<u8>, ()> {
     if data.len() < 5 {
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
     let compressed = data[0] != 0;
-    let payload = &data[5..];
+    let declared_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let remaining = &data[5..];
+
+    // Validate: declared length must not exceed available data.
+    // A truncated frame (length > remaining bytes) is a protocol error.
+    if declared_len > remaining.len() {
+        return Err(());
+    }
+
+    // Use only the declared bytes — ignores trailing data that doesn't
+    // belong to this frame (prevents protocol confusion from padding or
+    // concatenated frames in a unary request).
+    let payload = &remaining[..declared_len];
+
     if compressed {
         use std::io::Read;
         let mut decoder = flate2::read::GzDecoder::new(payload);
         let mut out = Vec::with_capacity(payload.len() * 2);
-        if decoder.read_to_end(&mut out).is_err() {
-            eprintln!("tonic-rails: gzip decompress failed — falling back to raw payload");
-            return payload.to_vec();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = decoder.read(&mut buf).map_err(|_| ())?;
+            if n == 0 {
+                break;
+            }
+            if out.len() + n > max_size {
+                return Err(());
+            }
+            out.extend_from_slice(&buf[..n]);
         }
-        out
+        Ok(out)
     } else {
-        payload.to_vec()
+        // Defense-in-depth: check uncompressed payload against max_size.
+        // The caller also checks body_bytes.len() > max_message_size,
+        // but this ensures the *payload* (excluding the 5-byte header)
+        // is within bounds even if called from a different path.
+        if payload.len() > max_size {
+            return Err(());
+        }
+        Ok(payload.to_vec())
+    }
+}
+
+// ─── Connection-limited incoming stream ───────────────────────────
+//
+// Wraps a stream of TcpStream connections with a semaphore that
+// enforces a global concurrent-connection cap.  Connections exceeding
+// the limit are dropped immediately.  The permit is held for the
+// connection's lifetime via PermitIo, which releases it on drop.
+
+/// Wrapper around TcpStream that holds a semaphore permit.
+/// When tonic drops the connection (PermitIo is dropped), the
+/// permit is released, allowing a new connection to be accepted.
+struct PermitIo {
+    inner: tokio::net::TcpStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for PermitIo {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl AsyncRead for PermitIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PermitIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connected for PermitIo {
+    type ConnectInfo = <tokio::net::TcpStream as Connected>::ConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner.connect_info()
+    }
+}
+
+/// Stream wrapper that enforces a max concurrent connection limit.
+/// When the semaphore is exhausted, incoming connections are dropped
+/// and the stream continues polling for the next one.
+struct ConnectionLimitedStream<S> {
+    inner: S,
+    semaphore: Arc<Semaphore>,
+    active: Arc<AtomicUsize>,
+}
+
+impl<S> Stream for ConnectionLimitedStream<S>
+where
+    S: Stream<Item = std::io::Result<tokio::net::TcpStream>> + Unpin,
+{
+    type Item = std::io::Result<PermitIo>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(stream))) => {
+                    match self.semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            self.active.fetch_add(1, Ordering::Relaxed);
+                            return Poll::Ready(Some(Ok(PermitIo {
+                                inner: stream,
+                                _permit: permit,
+                                active: self.active.clone(),
+                            })));
+                        }
+                        Err(_) => {
+                            // Over limit — drop the connection and continue.
+                            let active = self.active.load(Ordering::Relaxed);
+                            eprintln!(
+                                "tonic-rails: connection dropped — over limit ({active} active)"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -478,49 +1026,23 @@ fn frame(message: &[u8], compress: bool) -> Bytes {
     }
 }
 
+/// Set Content-Type and optional grpc-encoding headers on a response.
+fn set_grpc_headers(resp: &mut Response<TonicBody>, compress: bool) {
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    if compress {
+        resp.headers_mut().insert(
+            http::HeaderName::from_static("grpc-encoding"),
+            HeaderValue::from_static("gzip"),
+        );
+    }
+}
+
 fn grpc_error_response(code: u32, message: &str) -> Response<TonicBody> {
-    let mut resp = Response::new(box_body(GrpcBody::error(code, message)));
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
-    resp
-}
-
-fn grpc_ok_response(response_bytes: &[u8], compress: bool) -> Response<TonicBody> {
-    let framed = frame(response_bytes, compress);
-    let mut resp = Response::new(box_body(GrpcBody::ok(framed)));
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
-    if compress {
-        resp.headers_mut().insert(
-            http::HeaderName::from_static("grpc-encoding"),
-            HeaderValue::from_static("gzip"),
-        );
-    }
-    resp
-}
-
-/// Build a streaming gRPC response with multiple framed messages.
-fn grpc_ok_streaming_response(responses: &[Vec<u8>], compress: bool) -> Response<TonicBody> {
-    let mut buf = BytesMut::new();
-    for resp in responses {
-        let framed = frame(resp, compress);
-        buf.extend_from_slice(&framed);
-    }
-    let mut resp = Response::new(box_body(GrpcBody::ok(buf.freeze())));
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/grpc"),
-    );
-    if compress {
-        resp.headers_mut().insert(
-            http::HeaderName::from_static("grpc-encoding"),
-            HeaderValue::from_static("gzip"),
-        );
-    }
+    let mut resp = Response::new(UnsyncBoxBody::new(GrpcBody::error(code, message)));
+    set_grpc_headers(&mut resp, false);
     resp
 }
 
@@ -538,9 +1060,18 @@ fn parse_grpc_timeout(value: &str) -> Option<Duration> {
     let unit = bytes[bytes.len() - 1];
     let num_str = &value[..value.len() - 1];
     let num: u64 = num_str.parse().ok()?;
+    // Use checked_mul to prevent overflow — a malicious or buggy
+    // client could send e.g. "999999999999H" which would wrap to a
+    // tiny duration, defeating the deadline entirely.
     let dur = match unit {
-        b'H' => Duration::from_secs(num * 3600),
-        b'M' => Duration::from_secs(num * 60),
+        b'H' => {
+            let secs = num.checked_mul(3600)?;
+            Duration::from_secs(secs)
+        }
+        b'M' => {
+            let secs = num.checked_mul(60)?;
+            Duration::from_secs(secs)
+        }
         b'S' => Duration::from_secs(num),
         b'm' => Duration::from_millis(num),
         b'u' => Duration::from_micros(num),
@@ -557,7 +1088,7 @@ fn parse_grpc_timeout(value: &str) -> Option<Duration> {
 /// on the hot path — zero protobuf ops in Rust.
 struct GrpcDispatchInner {
     callback: Arc<Opaque<Value>>,
-    request_tx: crossbeam_channel::Sender<DispatchRequest>,
+    request_tx: crossbeam_channel::Sender<Box<DispatchContext>>,
     stats: Arc<ServerStats>,
     max_message_size: usize,
     compression_enabled: Arc<AtomicBool>,
@@ -568,9 +1099,44 @@ impl GrpcDispatchInner {
     /// dispatch to Ruby, frame response.  This is the same logic as the
     /// previous `handle_grpc_request`, adapted for tonic's Service trait.
     async fn handle_request(self: Arc<Self>, req: Request<TonicBody>) -> Response<TonicBody> {
-        let path = req.uri().path().to_string();
+        // Sanitize path: replace control chars to prevent log injection.
+        // The path is used for both dispatch (Ruby hash lookup) and logging;
+        // a path with control chars wouldn't match any registered route anyway.
+        let path: String = req
+            .uri()
+            .path()
+            .chars()
+            .map(|c| if c.is_ascii_control() { ' ' } else { c })
+            .collect();
         let start = Instant::now();
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        // gRPC requires HTTP POST (gRPC spec §4.1).
+        if req.method() != http::Method::POST {
+            self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+            if self.stats.log_requests.load(Ordering::Relaxed) {
+                eprintln!("tonic-rails: req path={path} status=ERROR code=UNIMPLEMENTED msg=method_not_post");
+            }
+            return grpc_error_response(
+                tonic::Code::Unimplemented as u32,
+                "gRPC requires HTTP POST",
+            );
+        }
+
+        // Check grpc-encoding header — only identity and gzip are supported.
+        let grpc_encoding = req
+            .headers()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("identity");
+        if grpc_encoding != "identity" && grpc_encoding != "gzip" {
+            self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+            eprintln!("tonic-rails: req path={path} status=ERROR code=UNIMPLEMENTED msg=unsupported_grpc_encoding:{grpc_encoding}");
+            return grpc_error_response(
+                tonic::Code::Unimplemented as u32,
+                "unsupported grpc-encoding — only identity and gzip are supported",
+            );
+        }
 
         // Content-type check — must be application/grpc.
         let content_type = req
@@ -648,7 +1214,7 @@ impl GrpcDispatchInner {
                 eprintln!("tonic-rails: req path={path} status=ERROR code=INTERNAL msg=body_read_failed:{e}");
                 return grpc_error_response(
                     tonic::Code::Internal as u32,
-                    &format!("failed to read request body: {e}"),
+                    "failed to read request body",
                 );
             }
         };
@@ -666,7 +1232,20 @@ impl GrpcDispatchInner {
             );
         }
 
-        let request_bytes = unframe(&body_bytes);
+        let request_bytes = match unframe(&body_bytes, self.max_message_size) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .resource_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED msg=decompress_failed_or_too_large");
+                return grpc_error_response(
+                    tonic::Code::ResourceExhausted as u32,
+                    "decompression failed or decompressed message exceeds max_message_size",
+                );
+            }
+        };
 
         // Propagate deadline to Ruby handler via metadata.
         // _timeout_ms gives the handler the remaining time budget so it
@@ -680,16 +1259,19 @@ impl GrpcDispatchInner {
         }
 
         // ── Channel dispatch: send to Ruby serve thread ────────────
-        let (resp_tx, resp_rx) = oneshot::channel::<DispatchResult>();
-        let dispatch_req = DispatchRequest {
-            ctx: Box::new(DispatchContext {
-                callback: (*self.callback),
-                path: path.clone(),
-                request_bytes,
-                metadata: metadata_with_deadline,
-            }),
-            response_tx: resp_tx,
-        };
+        // Create a bounded mpsc channel for streaming response messages.
+        // The Ruby handler sends Data messages (one per response) and an
+        // End message (success or error).  The tokio side reads from this
+        // channel via GrpcStreamingBody, framing and sending each message
+        // as it arrives — no full-stream materialization.
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamMessage>(32);
+        let dispatch_req = Box::new(DispatchContext {
+            callback: (*self.callback),
+            path: path.clone(),
+            request_bytes,
+            metadata: metadata_with_deadline,
+            stream_tx: Some(stream_tx),
+        });
 
         match self.request_tx.try_send(dispatch_req) {
             Ok(_) => {}
@@ -714,123 +1296,35 @@ impl GrpcDispatchInner {
             }
         }
 
-        // Parse grpc-timeout header for deadline enforcement.
-        let timeout_dur = grpc_timeout_hdr.as_deref().and_then(parse_grpc_timeout);
+        // Parse grpc-timeout for deadline enforcement in the streaming body.
+        let deadline = grpc_timeout_hdr
+            .as_deref()
+            .and_then(parse_grpc_timeout)
+            .map(|dur| Box::pin(tokio::time::sleep(dur)));
 
-        // Await the response directly — no spawn_blocking needed.
-        // The tokio worker thread is free to handle other connections
-        // while the Ruby thread processes this request.
-        // If a deadline was specified, enforce it with tokio::time::timeout.
-        let result = if let Some(dur) = timeout_dur {
-            match tokio::time::timeout(dur, resp_rx).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) => DispatchResult {
-                    response_bytes: vec![],
-                    streaming_responses: vec![],
-                    streaming: false,
-                    error: Some((
-                        tonic::Code::Internal as u32,
-                        "dispatch channel closed".into(),
-                    )),
-                },
-                Err(_) => DispatchResult {
-                    response_bytes: vec![],
-                    streaming_responses: vec![],
-                    streaming: false,
-                    error: Some((
-                        tonic::Code::DeadlineExceeded as u32,
-                        "deadline exceeded".into(),
-                    )),
-                },
-            }
-        } else {
-            match resp_rx.await {
-                Ok(r) => r,
-                Err(_) => DispatchResult {
-                    response_bytes: vec![],
-                    streaming_responses: vec![],
-                    streaming: false,
-                    error: Some((
-                        tonic::Code::Internal as u32,
-                        "dispatch channel closed".into(),
-                    )),
-                },
-            }
+        let should_compress =
+            self.compression_enabled.load(Ordering::Relaxed) && client_accepts_gzip;
+
+        // Return immediately with a streaming body that reads from the
+        // channel.  Tonic drives the body by calling poll_frame; each
+        // Data message becomes a gRPC data frame, and the End message
+        // becomes trailing headers.  Stats and logging are handled by
+        // the body when it sees End or the channel closes.
+        let body = GrpcStreamingBody {
+            receiver: Some(stream_rx),
+            trailers: None,
+            stats: self.stats.clone(),
+            path,
+            start,
+            compress: should_compress,
+            deadline,
+            stats_recorded: false,
+            max_message_size: self.max_message_size,
         };
 
-        let elapsed = start.elapsed();
-        let dur_ms = elapsed.as_millis();
-
-        match &result.error {
-            Some((code, msg)) => {
-                self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                if *code == tonic::Code::DeadlineExceeded as u32 {
-                    self.stats.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
-                } else if *code == tonic::Code::ResourceExhausted as u32 {
-                    self.stats
-                        .resource_exhausted
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                eprintln!("tonic-rails: req path={path} status=ERROR code={code} dur={dur_ms}ms msg={msg}");
-                grpc_error_response(*code, msg)
-            }
-            None => {
-                let should_compress =
-                    self.compression_enabled.load(Ordering::Relaxed) && client_accepts_gzip;
-
-                if result.streaming {
-                    // Server-streaming: frame each response as a separate gRPC message.
-                    // Check each message individually against max_message_size
-                    // (gRPC limit is per-message, not per-stream).
-                    if let Some(oversized_idx) = result
-                        .streaming_responses
-                        .iter()
-                        .position(|r| r.len() > self.max_message_size)
-                    {
-                        self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                        self.stats
-                            .resource_exhausted
-                            .fetch_add(1, Ordering::Relaxed);
-                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=stream_message_{}_too_large", oversized_idx);
-                        return grpc_error_response(
-                            tonic::Code::ResourceExhausted as u32,
-                            "streaming message exceeds max_message_size",
-                        );
-                    }
-                    self.stats
-                        .successful_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.stats.log_requests.load(Ordering::Relaxed) {
-                        eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms stream={}messages", result.streaming_responses.len());
-                    }
-                    grpc_ok_streaming_response(&result.streaming_responses, should_compress)
-                } else {
-                    // Unary: single response.
-                    let response_bytes = &result.response_bytes;
-                    if response_bytes.len() > self.max_message_size {
-                        self.stats.error_requests.fetch_add(1, Ordering::Relaxed);
-                        self.stats
-                            .resource_exhausted
-                            .fetch_add(1, Ordering::Relaxed);
-                        eprintln!("tonic-rails: req path={path} status=ERROR code=RESOURCE_EXHAUSTED dur={dur_ms}ms msg=response_too_large");
-                        return grpc_error_response(
-                            tonic::Code::ResourceExhausted as u32,
-                            "response exceeds max_message_size",
-                        );
-                    }
-                    self.stats
-                        .successful_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.stats.log_requests.load(Ordering::Relaxed) {
-                        eprintln!("tonic-rails: req path={path} status=OK dur={dur_ms}ms");
-                    }
-                    grpc_ok_response(
-                        response_bytes,
-                        should_compress && response_bytes.len() > 1024,
-                    )
-                }
-            }
-        }
+        let mut resp = Response::new(UnsyncBoxBody::new(body));
+        set_grpc_headers(&mut resp, should_compress);
+        resp
     }
 }
 
@@ -891,7 +1385,7 @@ include!(concat!(env!("OUT_DIR"), "/services.rs"));
 ///
 /// Multi-threaded dispatch: the Ruby side creates N `Thread.new` threads,
 /// each calling #serve_worker.  All workers share a single crossbeam
-/// channel receiver (Receiver<DispatchRequest> is Sync).  When one worker
+/// channel receiver (Receiver<Box<DispatchContext>> is Sync).  When one worker
 /// is inside a handler (GVL held), others wait on the channel (GVL
 /// released).  If the handler does blocking I/O (sleep, DB, HTTP — which
 /// releases the GVL internally), another worker can acquire the GVL and
@@ -906,7 +1400,7 @@ struct NativeServer {
     /// Shared shutdown flag — all worker threads check this.
     shutdown_flag: Mutex<Option<Arc<AtomicBool>>>,
     /// Channel receiver — shared (via Arc) across all worker threads.
-    request_rx: Mutex<Option<Arc<crossbeam_channel::Receiver<DispatchRequest>>>>,
+    request_rx: Mutex<Option<Arc<crossbeam_channel::Receiver<Box<DispatchContext>>>>>,
     /// Broadcast sender — triggers tonic graceful shutdown + drain timer.
     shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
     /// Optional TLS cert/key paths — passed to tonic ServerTlsConfig.
@@ -915,11 +1409,21 @@ struct NativeServer {
     drain_timeout: Mutex<Duration>,
     /// Maximum number of concurrent TCP connections.
     max_connections: AtomicUsize,
+    /// Max concurrent HTTP/2 streams per connection (DoS prevention).
+    concurrency_limit_per_connection: AtomicUsize,
+    /// Active connection counter (for observability/logging).
+    active_connections: Arc<AtomicUsize>,
+    /// Number of tokio worker threads (None = default = num CPUs).
+    worker_threads: Mutex<Option<usize>>,
+    /// HTTP/2 keepalive ping interval.
+    keepalive_interval: Mutex<Duration>,
+    /// HTTP/2 keepalive ping timeout (connection dropped if no pong).
+    keepalive_timeout: Mutex<Duration>,
     /// Atomic request counters for observability.
     stats: Arc<ServerStats>,
     /// Enable gzip compression for responses, accept compressed requests.
     compression_enabled: Arc<AtomicBool>,
-    /// Enable/disable gRPC reflection service (default: enabled).
+    /// Enable/disable gRPC reflection service (default: disabled).
     reflection_enabled: AtomicBool,
     /// Health reporter for flipping to NOT_SERVING during shutdown.
     health_reporter: Mutex<Option<tonic_health::server::HealthReporter>>,
@@ -937,11 +1441,16 @@ impl NativeServer {
             shutdown_tx: Mutex::new(None),
             tls_config: Mutex::new(None),
             drain_timeout: Mutex::new(Duration::from_secs(10)),
-            max_connections: AtomicUsize::new(10_000),
+            max_connections: AtomicUsize::new(64),
+            concurrency_limit_per_connection: AtomicUsize::new(32),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            worker_threads: Mutex::new(None),
+            keepalive_interval: Mutex::new(Duration::from_secs(15)),
+            keepalive_timeout: Mutex::new(Duration::from_secs(5)),
             compression_enabled: Arc::new(AtomicBool::new(false)),
-            reflection_enabled: AtomicBool::new(true),
-            health_reporter: Mutex::new(None),
+            reflection_enabled: AtomicBool::new(false),
             stats: Arc::new(ServerStats::new()),
+            health_reporter: Mutex::new(None),
         })
     }
 
@@ -995,9 +1504,43 @@ impl NativeServer {
     /// New connections exceeding this limit are dropped.
     ///
     /// Called from Ruby as:
-    ///   server.set_max_connections(10000)
+    ///   server.set_max_connections(64)
     fn set_max_connections(&self, max: usize) -> Result<(), Error> {
         self.max_connections.store(max, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Set the maximum number of concurrent HTTP/2 streams per
+    /// connection.  Prevents a single client from exhausting the
+    /// dispatch queue with many concurrent requests.
+    ///
+    /// Called from Ruby as:
+    ///   server.set_concurrency_limit_per_connection(32)
+    fn set_concurrency_limit_per_connection(&self, limit: usize) -> Result<(), Error> {
+        self.concurrency_limit_per_connection
+            .store(limit, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Set the number of tokio worker threads for the transport layer.
+    /// None (default) uses the number of CPU cores.
+    ///
+    /// Called from Ruby as:
+    ///   server.set_worker_threads(4)
+    fn set_worker_threads(&self, n: usize) -> Result<(), Error> {
+        *self.worker_threads.lock() = Some(n);
+        Ok(())
+    }
+
+    /// Set HTTP/2 keepalive ping interval and timeout in seconds.
+    /// A ping is sent every `interval` seconds; if no pong is received
+    /// within `timeout` seconds, the connection is dropped.
+    ///
+    /// Called from Ruby as:
+    ///   server.set_keepalive(15, 5)
+    fn set_keepalive(&self, interval_secs: u64, timeout_secs: u64) -> Result<(), Error> {
+        *self.keepalive_interval.lock() = Duration::from_secs(interval_secs);
+        *self.keepalive_timeout.lock() = Duration::from_secs(timeout_secs);
         Ok(())
     }
 
@@ -1068,19 +1611,21 @@ impl NativeServer {
             )
         })?;
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                magnus::error::Error::new(
-                    ruby.exception_runtime_error(),
-                    format!("failed to create tokio runtime: {e}"),
-                )
-            })?;
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        runtime_builder.enable_all();
+        if let Some(n) = *self.worker_threads.lock() {
+            runtime_builder.worker_threads(n);
+        }
+        let runtime = runtime_builder.build().map_err(|e| {
+            magnus::error::Error::new(
+                ruby.exception_runtime_error(),
+                format!("failed to create tokio runtime: {e}"),
+            )
+        })?;
 
         // Dispatch channel: tokio sends requests, Ruby worker threads
         // (inside rb_thread_call_without_gvl) receive and process them.
-        let (request_tx, request_rx) = crossbeam_channel::bounded::<DispatchRequest>(128);
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<Box<DispatchContext>>(128);
         let request_rx = Arc::new(request_rx);
 
         // Shared shutdown flag — all workers check this.
@@ -1116,6 +1661,7 @@ impl NativeServer {
                     format!("failed to create socket: {e}"),
                 )
             })?;
+            let _ = socket.set_reuse_address(true);
             let _ = socket.set_reuse_port(true);
             let _ = socket.set_nonblocking(true);
             socket.bind(&addr.into()).map_err(|e| {
@@ -1140,9 +1686,15 @@ impl NativeServer {
 
         // Capture config for the async block.
         let drain = *self.drain_timeout.lock();
-        let _max_conns = self.max_connections.load(Ordering::Relaxed);
+        let max_conns = self.max_connections.load(Ordering::Relaxed);
+        let concurrency_limit = self
+            .concurrency_limit_per_connection
+            .load(Ordering::Relaxed);
+        let keepalive_interval = *self.keepalive_interval.lock();
+        let keepalive_timeout = *self.keepalive_timeout.lock();
         let tls = self.tls_config.lock().clone();
-        let stats = self.stats.clone();
+        let active_conns = self.active_connections.clone();
+        let max_msg_size = self.max_message_size;
 
         // Create health reporter before spawn so we can store a clone
         // for set_not_serving during graceful shutdown.
@@ -1191,19 +1743,25 @@ impl NativeServer {
                     }
                 }
             } else {
+                eprintln!(
+                    "tonic-rails: WARNING — starting without TLS; gRPC traffic will be plaintext"
+                );
                 None
             };
 
             // ── Build tonic server ──────────────────────────────────
-            // NOTE: max_connections (global TCP connection cap) is not yet
-            // enforced by tonic's transport.  A semaphore-wrapped incoming
-            // stream or tower GlobalConcurrencyLimitLayer could add this.
-            // The set_max_connections Ruby method remains for API compat.
-            let server = tonic::transport::Server::builder()
-                .http2_keepalive_interval(Some(Duration::from_secs(15)))
-                .http2_keepalive_timeout(Some(Duration::from_secs(5)))
-                .tcp_nodelay(true);
+            let build_server = || {
+                tonic::transport::Server::builder()
+                    .http2_keepalive_interval(Some(keepalive_interval))
+                    .http2_keepalive_timeout(Some(keepalive_timeout))
+                    .tcp_nodelay(true)
+                    .tcp_keepalive(Some(Duration::from_secs(60)))
+                    .concurrency_limit_per_connection(concurrency_limit)
+                    .http2_max_header_list_size(16 * 1024)
+                    .initial_stream_window_size(max_msg_size as u32)
+            };
 
+            let server = build_server();
             let mut server = if let Some(config) = tls_config {
                 match server.tls_config(config) {
                     Ok(s) => s,
@@ -1211,13 +1769,7 @@ impl NativeServer {
                         eprintln!(
                             "tonic-rails: TLS config failed: {e} — falling back to plaintext"
                         );
-                        // Cannot recover server after tls_config consumes it,
-                        // but this is extremely unlikely after file validation
-                        // in set_tls.  Rebuild from scratch.
-                        tonic::transport::Server::builder()
-                            .http2_keepalive_interval(Some(Duration::from_secs(15)))
-                            .http2_keepalive_timeout(Some(Duration::from_secs(5)))
-                            .tcp_nodelay(true)
+                        build_server()
                     }
                 }
             } else {
@@ -1227,14 +1779,28 @@ impl NativeServer {
             // ── Register services ───────────────────────────────────
             // Generated service wrappers are registered via the macro;
             // tonic-health and tonic-reflection are sibling services.
-            let _ = stats; // stats are in dispatch_inner, this is just a clone
-
             let routes = register_dispatch_services!(server, dispatch_inner)
                 .add_service(health_service)
                 .add_service(reflection_service);
 
             // ── Serve with graceful shutdown + drain timeout ────────
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            // Wrap the incoming stream with a semaphore-enforced
+            // connection limit.  Each connection acquires a permit on
+            // accept; the permit is held in PermitIo and released when
+            // tonic drops the connection.  max_connections = 0 means
+            // unlimited (clamped to Semaphore::MAX_PERMITS).
+            let raw_incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let permits = if max_conns > 0 {
+                max_conns
+            } else {
+                Semaphore::MAX_PERMITS
+            };
+            let semaphore = Arc::new(Semaphore::new(permits));
+            let incoming = ConnectionLimitedStream {
+                inner: raw_incoming,
+                semaphore,
+                active: active_conns,
+            };
 
             // serve_with_incoming_shutdown: stops accepting when signal fires,
             // then drains in-flight connections (sends GOAWAY + waits).
@@ -1335,7 +1901,7 @@ impl NativeServer {
             eprintln!("tonic-rails: tokio runtime stopped");
         }
         // Clean up stored state — dropping Arc<Receiver> disconnects
-        // the channel, which drops any unprocessed DispatchRequests.
+        // the channel, which drops any unprocessed dispatch contexts.
         *self.shutdown_flag.lock() = None;
         *self.request_rx.lock() = None;
         Ok(())
@@ -1357,7 +1923,7 @@ impl NativeServer {
     /// Return current server stats as a Ruby Hash.
     ///
     /// Called from Ruby as:
-    ///   server.stats  → { total:, successful:, errors:, deadline_exceeded:, resource_exhausted: }
+    ///   server.stats  → { total:, successful:, errors:, deadline_exceeded:, resource_exhausted:, active_connections: }
     fn stats(&self) -> Result<RHash, Error> {
         let ruby = Ruby::get().expect("Ruby VM must be available for stats");
         let hash = ruby.hash_new();
@@ -1380,6 +1946,10 @@ impl NativeServer {
         let _ = hash.aset(
             ruby.to_symbol("resource_exhausted"),
             self.stats.resource_exhausted.load(Ordering::Relaxed),
+        );
+        let _ = hash.aset(
+            ruby.to_symbol("active_connections"),
+            self.active_connections.load(Ordering::Relaxed),
         );
         Ok(hash)
     }
@@ -1418,6 +1988,15 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         method!(NativeServer::set_max_connections, 1),
     )?;
     class.define_method(
+        "set_concurrency_limit_per_connection",
+        method!(NativeServer::set_concurrency_limit_per_connection, 1),
+    )?;
+    class.define_method(
+        "set_worker_threads",
+        method!(NativeServer::set_worker_threads, 1),
+    )?;
+    class.define_method("set_keepalive", method!(NativeServer::set_keepalive, 2))?;
+    class.define_method(
         "set_log_requests",
         method!(NativeServer::set_log_requests, 1),
     )?;
@@ -1429,5 +2008,265 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("stop_server", method!(NativeServer::stop_server, 0))?;
     class.define_method("shutdown", method!(NativeServer::shutdown, 0))?;
 
+    let stream_class = native.define_class("StreamSender", ruby.class_object())?;
+    stream_class.define_method("send", method!(StreamSender::send_message, 1))?;
+
     Ok(())
+}
+
+// ─── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_grpc_timeout ──────────────────────────────────────
+
+    #[test]
+    fn parse_timeout_seconds() {
+        assert_eq!(parse_grpc_timeout("5S"), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_timeout_millis() {
+        assert_eq!(parse_grpc_timeout("100m"), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn parse_timeout_hours() {
+        assert_eq!(parse_grpc_timeout("2H"), Some(Duration::from_secs(7200)));
+    }
+
+    #[test]
+    fn parse_timeout_overflow_hours_returns_none() {
+        // u64::MAX / 3600 would overflow if multiplied naively.
+        // checked_mul must catch this and return None.
+        let huge = u64::MAX.to_string();
+        let val = format!("{huge}H");
+        assert_eq!(parse_grpc_timeout(&val), None);
+    }
+
+    #[test]
+    fn parse_timeout_overflow_minutes_returns_none() {
+        let huge = u64::MAX.to_string();
+        let val = format!("{huge}M");
+        assert_eq!(parse_grpc_timeout(&val), None);
+    }
+
+    #[test]
+    fn parse_timeout_malformed_returns_none() {
+        assert_eq!(parse_grpc_timeout(""), None);
+        assert_eq!(parse_grpc_timeout("X"), None);
+        assert_eq!(parse_grpc_timeout("abcS"), None);
+        assert_eq!(parse_grpc_timeout("5Z"), None); // unknown unit
+    }
+
+    // ── unframe ──────────────────────────────────────────────────
+
+    #[test]
+    fn unframe_uncompressed() {
+        // 5-byte prefix (0=uncompressed, len=3) + payload "abc"
+        let data = [0u8, 0, 0, 0, 3, b'a', b'b', b'c'];
+        assert_eq!(unframe(&data, 1024), Ok(vec![b'a', b'b', b'c']));
+    }
+
+    #[test]
+    fn unframe_short_data_passthrough() {
+        // Less than 5 bytes → returned as-is
+        let data = [1u8, 2, 3];
+        assert_eq!(unframe(&data, 1024), Ok(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn unframe_decompressed_exceeds_max_returns_err() {
+        // Create a gzip-compressed payload that decompresses to
+        // something larger than max_size.
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let raw = vec![b'X'; 10_000];
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Frame: 1 byte compressed flag + 4 byte length + compressed data
+        let mut framed = vec![1u8]; // compressed = true
+        framed.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&compressed);
+
+        // max_size = 100 → decompressed 10_000 exceeds it
+        assert_eq!(unframe(&framed, 100), Err(()));
+    }
+
+    #[test]
+    fn unframe_decompressed_within_max_returns_ok() {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let raw = vec![b'Y'; 100];
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut framed = vec![1u8];
+        framed.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&compressed);
+
+        // max_size = 200 → decompressed 100 is within limit
+        assert_eq!(unframe(&framed, 200), Ok(raw));
+    }
+
+    #[test]
+    fn unframe_truncated_frame_returns_err() {
+        // Declared length 100 but only 3 bytes follow → truncated frame
+        let data = [0u8, 0, 0, 0, 100, b'a', b'b', b'c'];
+        assert_eq!(unframe(&data, 1024), Err(()));
+    }
+
+    #[test]
+    fn unframe_ignores_trailing_bytes() {
+        // Declared length 3 but 5 bytes follow — only first 3 returned
+        let data = [0u8, 0, 0, 0, 3, b'a', b'b', b'c', b'X', b'Y'];
+        assert_eq!(unframe(&data, 1024), Ok(vec![b'a', b'b', b'c']));
+    }
+
+    #[test]
+    fn unframe_uncompressed_exceeds_max_returns_err() {
+        // Uncompressed payload larger than max_size → rejected
+        let payload = vec![b'Z'; 200];
+        let mut framed = vec![0u8];
+        framed.extend_from_slice(&(200u32).to_be_bytes());
+        framed.extend_from_slice(&payload);
+        assert_eq!(unframe(&framed, 100), Err(()));
+    }
+
+    #[test]
+    fn unframe_zero_length_payload() {
+        // Declared length 0 → empty payload (valid gRPC)
+        let data = [0u8, 0, 0, 0, 0];
+        assert_eq!(unframe(&data, 1024), Ok(vec![]));
+    }
+
+    // ── frame ────────────────────────────────────────────────────
+
+    #[test]
+    fn frame_uncompressed_correct_header() {
+        let payload = b"hello";
+        let framed = frame(payload, false);
+        assert_eq!(framed[0], 0); // uncompressed flag
+        assert_eq!(&framed[1..5], &[0, 0, 0, 5]); // big-endian length
+        assert_eq!(&framed[5..], payload);
+    }
+
+    #[test]
+    fn frame_compressed_sets_flag() {
+        let payload = b"AAAAAAAAAAAAAAAAAAAA"; // compressible
+        let framed = frame(payload, true);
+        assert_eq!(framed[0], 1); // compressed flag
+                                  // Length field should match the compressed payload
+        let len = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
+        assert_eq!(len as usize, framed.len() - 5);
+    }
+
+    #[test]
+    fn frame_compressed_round_trips_through_unframe() {
+        let payload = vec![b'Z'; 500];
+        let framed = frame(&payload, true);
+        assert_eq!(unframe(&framed, 1024), Ok(payload));
+    }
+
+    #[test]
+    fn frame_empty_payload() {
+        let framed = frame(&[], false);
+        assert_eq!(framed.len(), 5); // just the header
+        assert_eq!(&framed[..], &[0, 0, 0, 0, 0]);
+    }
+
+    // ── GrpcBody ─────────────────────────────────────────────────
+
+    #[test]
+    fn grpc_body_ok_has_status_zero_trailer() {
+        let body = GrpcBody::ok(Bytes::from_static(b"data"));
+        let trailers = body.trailers.as_ref().unwrap();
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+    }
+
+    #[test]
+    fn grpc_body_error_has_correct_code_and_message() {
+        let body = GrpcBody::error(5, "not found");
+        let trailers = body.trailers.as_ref().unwrap();
+        assert_eq!(trailers.get("grpc-status").unwrap(), "5");
+        assert_eq!(trailers.get("grpc-message").unwrap(), "not found");
+    }
+
+    #[test]
+    fn grpc_body_error_sanitizes_control_chars() {
+        let body = GrpcBody::error(13, "line1\nline2\x00end");
+        let trailers = body.trailers.as_ref().unwrap();
+        // Control chars replaced with spaces — message present, not dropped
+        let msg = trailers.get("grpc-message").unwrap();
+        assert!(msg.to_str().unwrap().contains("line1"));
+        assert!(msg.to_str().unwrap().contains("line2"));
+        assert!(!msg.to_str().unwrap().contains('\n'));
+        assert!(!msg.to_str().unwrap().contains('\0'));
+    }
+
+    #[test]
+    fn grpc_body_error_empty_message_omits_trailer() {
+        let body = GrpcBody::error(13, "");
+        let trailers = body.trailers.as_ref().unwrap();
+        assert!(trailers.get("grpc-message").is_none());
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+    }
+
+    #[test]
+    fn grpc_body_error_no_data() {
+        let body = GrpcBody::error(2, "oops");
+        assert!(body.data.is_none());
+    }
+
+    #[test]
+    fn grpc_body_ok_has_data() {
+        let body = GrpcBody::ok(Bytes::from_static(b"payload"));
+        assert_eq!(body.data.as_ref().unwrap().as_ref(), b"payload");
+    }
+
+    #[test]
+    fn grpc_body_poll_frame_yields_data_then_trailers_then_none() {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        // No-op waker for synchronous poll tests
+        fn noop_waker() -> Waker {
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(
+                |_| RawWaker::new(std::ptr::null(), &VTABLE),
+                |_| {},
+                |_| {},
+                |_| {},
+            );
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let mut body = GrpcBody::ok(Bytes::from_static(b"abc"));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: data frame
+        let poll1 = Pin::new(&mut body).poll_frame(&mut cx);
+        match poll1 {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert!(frame.is_data());
+                assert_eq!(frame.into_data().unwrap().as_ref(), b"abc");
+            }
+            other => panic!("expected data frame, got {other:?}"),
+        }
+
+        // Second poll: trailers frame
+        let poll2 = Pin::new(&mut body).poll_frame(&mut cx);
+        match poll2 {
+            Poll::Ready(Some(Ok(frame))) => assert!(frame.is_trailers()),
+            other => panic!("expected trailers frame, got {other:?}"),
+        }
+
+        // Third poll: None (stream exhausted)
+        let poll3 = Pin::new(&mut body).poll_frame(&mut cx);
+        assert!(matches!(poll3, Poll::Ready(None)));
+    }
 }
