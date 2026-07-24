@@ -142,25 +142,103 @@ Initial release.
   messages can contain newlines and other control characters that would
   inject fake log lines.
 
-### Simplification pass (post-streaming refactor)
+### Compilation fixes (magnus 0.8.2 API alignment)
 
-- **Removed `DispatchResult`**: the struct and its three constructors
-  (`error`, `unary`, `streaming`) were dead code after the incremental
-  streaming refactor replaced `oneshot<DispatchResult>` with
-  `mpsc<StreamMessage>`. Three compiler warnings eliminated.
-- **Removed `DispatchRequest` wrapper**: the single-field struct
-  (`ctx: Box<DispatchContext>`) added an unnecessary indirection through
-  the crossbeam channel. The channel now carries `Box<DispatchContext>`
-  directly.
-- **Extracted `build_error_trailers` free function**: the trailer-building
-  logic (grpc-status + sanitized grpc-message) was duplicated between
-  `GrpcBody::error` and `GrpcStreamingBody::error_trailers`. Now both use
-  a shared free function, and the `error_trailers` method was removed.
-- **Inlined `grpc_response` and `box_body`**: `grpc_response` was only
-  called by `grpc_error_response` (always with `compress: false`), and
-  `box_body` was only called by `grpc_response`. Both inlined; header-
-  setting extracted into a shared `set_grpc_headers` helper used by both
-  `grpc_error_response` and `handle_request`.
-- **Marked `GrpcBody::ok` as `#[cfg(test)]`**: the success constructor
-  was only used in unit tests after the streaming refactor moved all
-  success responses to `GrpcStreamingBody`.
+- **`Buf` trait imported**: `bytes::Buf` is now imported so `BytesMut::advance`
+  compiles under the `bytes` version locked in `Cargo.lock`.
+- **`ruby.nil()` → `ruby.qnil().as_value()`**: magnus 0.8.2 exposes `qnil()`
+  (returning `Qnil`) rather than `nil()`. All nil-returning paths in
+  `RequestReader::next` now use the correct API.
+- **`RequestReader::next` parameter order**: the `RubyMethod0` trait expects
+  `fn(&Ruby, &Self)`, not `fn(&Self, &Ruby)`. The parameter order was swapped
+  so the `method!` macro resolves to the `RubyMethod0` variant.
+- **`mpsc::Receiver` is not `Clone`**: `RequestReaderNextCtx.rx` changed from
+  `*const` to `*mut`, and `dispatch_with_gvl_inner` now takes
+  `&mut DispatchContext` and uses `request_rx.take()` to extract the receiver
+  without cloning.
+- **`dispatch_with_gvl` Box handling**: the crossbeam callback now passes
+  `&mut ctx` (auto-derefed from `Box<DispatchContext>`) instead of `&mut *ctx`.
+
+### Client-streaming and bidirectional-streaming support
+
+- **Incremental request unframing**: `GrpcMessageReader` extracts gRPC
+  messages incrementally from the HTTP/2 body stream, feeding each complete
+  message through the mpsc channel to the Ruby handler. This replaces the
+  previous `unframe_all` that required the entire body in memory before
+  dispatch. Per-message size is enforced at unframe time.
+- **Unary path uses `_request_reader`**: `call_rpc` now reads the request
+  message from `_request_reader.next` when present (real dispatch), falling
+  back to `request_bytes` for unit tests that call `call_rpc` directly.
+  Previously the unary branch decoded `request_bytes` directly, which is
+  empty in real dispatch — causing every unary RPC to decode an empty
+  protobuf and fail.
+- **Malformed protobuf in unary path**: decode errors now map to
+  `:invalid_argument` with a server-side warning log, matching the
+  streaming path's error handling.
+- **`unframe` and `unframe_all` retained as test-only** (`#[cfg(test)]`):
+  both functions are superseded by `GrpcMessageReader` in production but
+  remain as test utilities with full coverage.
+
+### Unsafe code audit
+
+- **Eliminated `std::mem::transmute` for Ruby string creation**: the two
+  `rb_str_new` + `transmute::<rb_sys::VALUE, Value>` blocks in
+  `dispatch_with_gvl_inner` and `RequestReader::next` are replaced with
+  `ruby.str_from_slice(&bytes).as_value()` — a safe magnus API that calls
+  the same `rb_str_new` internally.
+- **Eliminated `extract_ruby_string` unsafe block**: the function used
+  `rb_string_value_ptr`, `rb_str_strlen`, and `slice::from_raw_parts` to
+  extract bytes from a Ruby string. Replaced with
+  `RString::from_value(val).map(|r| r.to_bytes().to_vec())` — fully safe,
+  no raw pointer manipulation.
+- **Removed `rb_str_new`, `rb_string_value_ptr`, `rb_str_strlen` from
+  rb-sys imports**: these FFI symbols are no longer referenced directly.
+- **Enabled magnus `bytes` feature**: required for `RString::to_bytes`.
+  The `bytes` crate was already in the dependency tree via tonic; this
+  only enables the magnus wrapper method.
+- **Remaining unsafe code is irreducible Ruby C API FFI**: 13 `unsafe {}`
+  blocks and 5 `unsafe extern "C" fn` callbacks (18 `unsafe` keywords total),
+  all required by `rb_thread_call_without_gvl` / `rb_thread_call_with_gvl`
+  trampolines, pointer dereferences from `void*` callback data, and
+  `Box::from_raw` for ownership transfer. No safe alternative exists in
+  magnus for the GVL-released blocking pattern.
+
+### Second-pass unsafe reduction
+
+- **MSRV bumped to 1.93** (from 1.75): enables `Waker::noop()` (stable
+  since 1.85) and `std::ptr::without_provenance_mut` (stable since 1.84).
+- **Eliminated test-only `Waker::from_raw`**: the `noop_waker()` helper
+  with its `unsafe { Waker::from_raw(RawWaker::new(...)) }` block is
+  replaced with `Waker::noop()` — a one-liner with no unsafe code.
+- **Unified `stream_send_without_gvl` into `channel_send_without_gvl`**:
+  `StreamSender::send_message` now calls the existing `gvl_released_send`
+  helper instead of maintaining its own FFI call path. Eliminates 1
+  `unsafe extern "C" fn`, 1 struct (`StreamSendCtx`), and 5 `unsafe {}`
+  blocks (4 pointer dereferences + 1 FFI call site).
+- **Unified `serve_unblock` into `cancel_unblock`** (renamed from
+  `stream_send_unblock`): both callbacks set an `AtomicBool` — now a
+  single shared callback. Eliminates 1 `unsafe extern "C" fn`, 1 struct
+  (`UnblockContext`), and 1 `unsafe {}` block.
+- **Removed `Arc<AtomicBool>` cancelled fields** from `StreamSender` and
+  `RequestReader`: stack-local `AtomicBool` is sufficient for the call
+  duration. Eliminates 2 `Arc` allocations and 2 `Arc::as_ptr` calls.
+- **Replaced integer-to-pointer casts** (`N as *mut c_void`) with
+  `std::ptr::without_provenance_mut::<c_void>(N)`: 5 occurrences in
+  callback return codes, satisfying clippy 1.93's `manual_dangling_ptr`
+  lint with provenance-safe pointer encoding.
+- **Net reduction**: 27 → 18 `unsafe` keywords (−9), 7 → 5
+  `unsafe extern "C" fn` (−2), 20 → 13 `unsafe {}` blocks (−7), 2
+  structs removed, 2 functions removed.
+
+### Edition 2024 migration
+
+- **Bumped to Rust edition 2024**: from edition 2021. The edition change
+  enforces `unsafe_op_in_unsafe_fn` (deny-by-default), requiring explicit
+  `unsafe {}` blocks for all unsafe operations inside `unsafe fn` bodies.
+  The one affected site (`Box::from_raw` in `dispatch_with_gvl`) was
+  already the only unwrapped unsafe op — all other `unsafe extern "C" fn`
+  callbacks already had explicit `unsafe {}` blocks from the prior audit.
+- **Collapsed 3 `if let` chains** using Rust 1.88+ let-chain syntax
+  (`if let X = a && let Y = b { ... }`): in `GrpcStreamingBody::poll_frame`
+  (deadline check), `handle_request` (timeout header parsing), and
+  `stop_server` (health reporter shutdown). Eliminates nested indentation.

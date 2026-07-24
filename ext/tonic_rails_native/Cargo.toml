@@ -1,8 +1,8 @@
 [package]
 name = "tonic_rails_native"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.93"
 publish = false
 
 [lib]
@@ -21,7 +21,7 @@ crate-type = ["cdylib"]
 #
 # socket2 enables SO_REUSEPORT for multi-process (Puma worker) scaling.
 [dependencies]
-magnus = "0.8"
+magnus = { version = "0.8", features = ["bytes"] }
 rb-sys = "0.9"
 tonic = { version = "0.12", features = ["tls", "gzip"] }
 tonic-reflection = { version = "0.12", features = ["server"] }

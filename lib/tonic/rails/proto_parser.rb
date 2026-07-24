@@ -10,7 +10,7 @@ module Tonic
     # Does not validate proto syntax — assumes well-formed input from protoc.
     class ProtoParser
       ServiceInfo = Struct.new(:package, :service_name, :rpcs, keyword_init: true)
-      RpcInfo = Struct.new(:name, :request_type, :response_type, :stream, keyword_init: true)
+      RpcInfo = Struct.new(:name, :request_type, :response_type, :request_stream, :response_stream, keyword_init: true)
 
       # Parse a .proto file and return the ServiceInfo for the named service.
       # Returns nil if the service is not found.
@@ -110,14 +110,18 @@ module Tonic
               break
             end
 
-            # Parse rpc lines: "rpc MethodName(RequestType) returns (ResponseType);"
-            # Or streaming: "rpc MethodName(RequestType) returns (stream ResponseType);"
-            if (match = trimmed.match(/^rpc\s+(\w+)\s*\(\s*(\w+)\s*\)\s*returns\s*\(\s*(?:(stream)\s+)?(\w+)\s*\)\s*;/))
+            # Parse rpc lines. Supports all four gRPC streaming types:
+            #   Unary:          rpc Method(Req) returns (Resp);
+            #   Server stream:  rpc Method(Req) returns (stream Resp);
+            #   Client stream:  rpc Method(stream Req) returns (Resp);
+            #   Bidi stream:    rpc Method(stream Req) returns (stream Resp);
+            if (match = trimmed.match(/^rpc\s+(\w+)\s*\(\s*(?:(stream)\s+)?(\w+)\s*\)\s*returns\s*\(\s*(?:(stream)\s+)?(\w+)\s*\)\s*;/))
               rpcs << RpcInfo.new(
                 name: match[1],
-                request_type: match[2],
-                response_type: match[4],
-                stream: match[3] == "stream",
+                request_type: match[3],
+                response_type: match[5],
+                request_stream: match[2] == "stream",
+                response_stream: match[4] == "stream",
               )
             end
           end

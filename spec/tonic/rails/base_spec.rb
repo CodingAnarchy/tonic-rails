@@ -102,7 +102,8 @@ RSpec.describe Tonic::Rails::Base do
 
       # shop.proto has no streaming RPCs, so all should be unary
       svc.grpc_rpcs.each_value do |spec|
-        expect(spec[:stream]).to be(false)
+        expect(spec[:request_stream]).to be(false)
+        expect(spec[:response_stream]).to be(false)
       end
     end
 
@@ -264,12 +265,12 @@ RSpec.describe Tonic::Rails::Base do
 
     it "registers stream: true in the RPC spec when stream: :server" do
       spec = streaming_service.grpc_rpcs["ListItems"]
-      expect(spec[:stream]).to be(true)
+      expect(spec[:response_stream]).to be(true)
     end
 
     it "registers stream: false by default (unary)" do
       spec = service_class.grpc_rpcs["SayHello"]
-      expect(spec[:stream]).to be(false)
+      expect(spec[:response_stream]).to be(false)
     end
 
     it "returns an Array of encoded responses for streaming RPCs" do
@@ -351,7 +352,7 @@ RSpec.describe Tonic::Rails::Base do
       bad_service.grpc_rpcs["Bad"][:response] = response_class
 
       expect { bad_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /unary handler must return a Hash/)
+        .to raise_error(Tonic::Rails::RpcError, /handler must return a Hash/)
     end
 
     it "supports Enumerator return for lazy streaming" do
@@ -377,6 +378,133 @@ RSpec.describe Tonic::Rails::Base do
 
       result = enum_service.new.call_rpc("Gen", "")
       expect(result).to eq(["enc:0", "enc:1", "enc:2"])
+    end
+  end
+
+  describe "client-streaming RPCs" do
+    let(:client_stream_service) do
+      Class.new do
+        include Tonic::Rails::Base
+
+        service "test.Upload"
+
+        rpc :UploadOrders, String, String, stream: :client
+
+        def upload_orders(requests)
+          count = 0
+          requests.each { |_req| count += 1 }
+          {"count" => count}
+        end
+      end
+    end
+
+    it "registers request_stream: true, response_stream: false" do
+      spec = client_stream_service.grpc_rpcs["UploadOrders"]
+      expect(spec[:request_stream]).to be(true)
+      expect(spec[:response_stream]).to be(false)
+    end
+
+    it "handler receives an Enumerator and returns a Hash" do
+      request_class = Class.new do
+        def self.decode(bytes); {id: bytes}; end
+      end
+      response_class = Class.new do
+        def self.new(hash); hash; end
+        def self.encode(msg); msg; end
+      end
+
+      client_stream_service.grpc_rpcs["UploadOrders"][:request] = request_class
+      client_stream_service.grpc_rpcs["UploadOrders"][:response] = response_class
+
+      # Test fallback: no _request_reader in metadata, so call_rpc
+      # wraps the single request_bytes in a one-element Enumerator.
+      instance = client_stream_service.new
+      result = instance.call_rpc("UploadOrders", "item1", metadata: {})
+      expect(result).to eq({"count" => 1})
+    end
+
+    it "raises RpcError when handler returns a non-Hash" do
+      bad_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.BadClient"
+        rpc :Bad, String, String, stream: :client
+        def bad(requests); ["not", "a", "hash"]; end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); m; end
+      end
+
+      bad_service.grpc_rpcs["Bad"][:request] = request_class
+      bad_service.grpc_rpcs["Bad"][:response] = response_class
+
+      expect { bad_service.new.call_rpc("Bad", "") }
+        .to raise_error(Tonic::Rails::RpcError, /handler must return a Hash/)
+    end
+  end
+
+  describe "bidi-streaming RPCs" do
+    let(:bidi_service) do
+      Class.new do
+        include Tonic::Rails::Base
+
+        service "test.Chat"
+
+        rpc :Chat, String, String, stream: :bidi
+
+        def chat(messages)
+          messages.map do |msg|
+            {"reply" => "echo: #{msg['id']}"}
+          end
+        end
+      end
+    end
+
+    it "registers request_stream: true, response_stream: true" do
+      spec = bidi_service.grpc_rpcs["Chat"]
+      expect(spec[:request_stream]).to be(true)
+      expect(spec[:response_stream]).to be(true)
+    end
+
+    it "handler receives an Enumerator and returns an Enumerable" do
+      request_class = Class.new do
+        def self.decode(bytes); {id: bytes}; end
+      end
+      response_class = Class.new do
+        def self.new(hash); hash; end
+        def self.encode(msg); "resp:#{msg['reply']}"; end
+      end
+
+      bidi_service.grpc_rpcs["Chat"][:request] = request_class
+      bidi_service.grpc_rpcs["Chat"][:response] = response_class
+
+      # Test fallback: no _request_reader, wraps single request_bytes.
+      instance = bidi_service.new
+      result = instance.call_rpc("Chat", "hello", metadata: {})
+      expect(result).to eq(["resp:echo: hello"])
+    end
+
+    it "raises RpcError when handler returns a non-Enumerable" do
+      bad_service = Class.new do
+        include Tonic::Rails::Base
+        service "test.BadBidi"
+        rpc :Bad, String, String, stream: :bidi
+        def bad(requests); "not enumerable"; end
+      end
+
+      request_class = Class.new { def self.decode(b); {}; end }
+      response_class = Class.new do
+        def self.new(h); h; end
+        def self.encode(m); m; end
+      end
+
+      bad_service.grpc_rpcs["Bad"][:request] = request_class
+      bad_service.grpc_rpcs["Bad"][:response] = response_class
+
+      expect { bad_service.new.call_rpc("Bad", "") }
+        .to raise_error(Tonic::Rails::RpcError, /streaming handler must return an Enumerable/)
     end
   end
 

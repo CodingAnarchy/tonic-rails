@@ -43,13 +43,14 @@ module Tonic
         # @param method_name [Symbol] RPC method name as defined in the .proto
         # @param request_class [Class] protobuf request class (responds to .decode)
         # @param response_class [Class] protobuf response class (responds to .encode)
-        # @param stream [Symbol] pass `stream: :server` for server-streaming RPCs
+        # @param stream [Symbol] streaming type: :server, :client, or :bidi
         def rpc(method_name, request_class, response_class, stream: nil)
           self.grpc_rpcs = grpc_rpcs.merge(
             method_name.to_s => {
               request: request_class,
               response: response_class,
-              stream: stream == :server,
+              request_stream: stream == :client || stream == :bidi,
+              response_stream: stream == :server || stream == :bidi,
             },
           )
         end
@@ -89,11 +90,21 @@ module Tonic
             request_class = ProtoParser.resolve_type(rpc_info.request_type, info.package)
             response_class = ProtoParser.resolve_type(rpc_info.response_type, info.package)
 
+            stream = if rpc_info.request_stream && rpc_info.response_stream
+              :bidi
+            elsif rpc_info.request_stream
+              :client
+            elsif rpc_info.response_stream
+              :server
+            else
+              nil
+            end
+
             rpc(
               rpc_info.name,
               request_class,
               response_class,
-              stream: rpc_info.stream ? :server : nil,
+              stream: stream,
             )
           end
         end
@@ -111,32 +122,28 @@ module Tonic
 
       # Dispatch entry point for raw-bytes mode.
       # Decodes protobuf bytes → object → Hash, calls the handler with
-      # a Hash (string keys), converts the response(s) → protobuf bytes.
+      # a Hash (string keys) or an Enumerator of Hashes, converts the
+      # response(s) → protobuf bytes.
       #
-      # Unary handlers receive a Hash and return a Hash.
-      # Server-streaming handlers (declared with `stream: :server`) receive
-      # a Hash and return an Enumerable of Hashes (Array, Enumerator, etc.).
-      # Streaming is buffered: the full Enumerable is materialized before
-      # any bytes are sent on the wire.
+      # RPC types and handler signatures:
+      #   Unary:          def method(request_hash) → Hash
+      #   Server stream:  def method(request_hash) → Enumerable of Hashes
+      #   Client stream:  def method(requests) → Hash
+      #   Bidi stream:    def method(requests) → Enumerable of Hashes
+      #
+      # For client/bidi streaming, the handler receives an Enumerator that
+      # yields decoded request Hashes one at a time.  Each yield blocks
+      # until the next message arrives from the client (via RequestReader,
+      # which releases the GVL during the blocking receive).
       #
       # @param method_name [String] RPC method name
-      # @return [String, Array<String>] encoded protobuf bytes (String for unary,
-      #   Array of Strings for server-streaming)
+      # @param request_bytes [String] raw protobuf bytes (first message;
+      #   empty when a RequestReader is provided via metadata)
       # @param metadata [Hash] gRPC metadata headers
+      # @return [String, Array<String>, nil] encoded protobuf bytes
       def call_rpc(method_name, request_bytes, metadata: {})
         spec = self.class.grpc_rpcs[method_name.to_s]
         raise Error, "Unknown RPC: #{method_name}" unless spec
-
-        # Decode protobuf → object → Hash with deep-stringified keys.
-        # Malformed protobuf is a client error → :invalid_argument.
-        begin
-          request_obj = spec[:request].decode(request_bytes)
-        rescue => e
-          logger = Tonic::Rails.configuration.logger
-          logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
-          raise RpcError.new("invalid protobuf request", code: :invalid_argument)
-        end
-        request_hash = request_obj.to_h.deep_stringify_keys
 
         # Store metadata so handler can access deadline, auth tokens, etc.
         @grpc_metadata = metadata
@@ -151,12 +158,66 @@ module Tonic
           @grpc_deadline_at = nil
         end
 
-        # Dispatch based on RPC declaration, not payload shape.
-        # This disambiguates empty streams from empty unary responses.
-        result = send(method_name.to_s.underscore, request_hash)
+        # ── Request handling ────────────────────────────────────────
+        if spec[:request_stream]
+          # Client streaming or bidi: handler receives an Enumerator
+          # of decoded request Hashes, not a single Hash.
+          request_reader = metadata["_request_reader"]
+          if request_reader
+            # Real reader from Rust — yields raw bytes, we decode each.
+            request_enum = Enumerator.new do |y|
+              while (bytes = request_reader.next)
+                begin
+                  obj = spec[:request].decode(bytes)
+                rescue => e
+                  logger = Tonic::Rails.configuration.logger
+                  logger&.warn("tonic-rails: invalid protobuf in stream for #{method_name}: #{e.class}: #{e.message}")
+                  raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+                end
+                y << obj.to_h.deep_stringify_keys
+              end
+            end
+          else
+            # Buffered fallback for tests: wrap single request_bytes.
+            begin
+              obj = spec[:request].decode(request_bytes)
+            rescue => e
+              logger = Tonic::Rails.configuration.logger
+              logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
+              raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+            end
+            request_enum = [obj.to_h.deep_stringify_keys].each
+          end
+          result = send(method_name.to_s.underscore, request_enum)
+        else
+          # Unary or server streaming: handler receives a single request Hash.
+          # In real dispatch, request_bytes is empty and the first message
+          # comes from the RequestReader. In unit tests (no reader), the
+          # request_bytes argument is used directly.
+          request_reader = metadata["_request_reader"]
+          actual_bytes = if request_reader
+            bytes = request_reader.next
+            if bytes.nil?
+              raise RpcError.new("empty request stream", code: :invalid_argument)
+            end
+            bytes
+          else
+            request_bytes
+          end
+          begin
+            request_obj = spec[:request].decode(actual_bytes)
+          rescue => e
+            logger = Tonic::Rails.configuration.logger
+            logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
+            raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+          end
+          request_hash = request_obj.to_h.deep_stringify_keys
+          result = send(method_name.to_s.underscore, request_hash)
+        end
 
-        if spec[:stream]
-          # Server-streaming: handler must return an Enumerable of Hashes.
+        # ── Response handling ───────────────────────────────────────
+        if spec[:response_stream]
+          # Server streaming or bidi: handler must return an Enumerable.
           unless result.respond_to?(:each)
             raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
           end
@@ -182,9 +243,9 @@ module Tonic
             end
           end
         else
-          # Unary: handler must return a Hash.
+          # Unary or client streaming: handler must return a Hash.
           unless result.is_a?(Hash)
-            raise RpcError.new("unary handler must return a Hash, got #{result.class}", code: :internal)
+            raise RpcError.new("handler must return a Hash, got #{result.class}", code: :internal)
           end
           spec[:response].encode(spec[:response].new(result))
         end
