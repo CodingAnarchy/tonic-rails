@@ -17,3 +17,6 @@ bench/rust_bench/src/shop_descriptor.bin
 **/*.rbc
 .ruby-version
 .ruby-gemset
+
+# TLS test keys and certs
+bench/tls/
