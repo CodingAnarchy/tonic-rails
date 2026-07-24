@@ -160,6 +160,89 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
+    describe "error sanitization" do
+      it "maps malformed protobuf decode to :invalid_argument" do
+        raising_request = Class.new do
+          def self.decode(_bytes)
+            raise StandardError, "protobuf parse error at offset 42"
+          end
+        end
+        response_class = Class.new do
+          def self.new(hash); hash; end
+          def self.encode(msg); msg; end
+        end
+
+        service_class.grpc_rpcs["SayHello"][:request] = raising_request
+        service_class.grpc_rpcs["SayHello"][:response] = response_class
+
+        instance = service_class.new
+        expect {
+          instance.call_rpc("SayHello", "garbage")
+        }.to raise_error(Tonic::Rails::RpcError) do |err|
+          expect(err.code).to eq(3) # INVALID_ARGUMENT
+          expect(err.message).to eq("invalid protobuf request")
+        end
+      end
+
+      it "sanitizes internal handler errors — does not leak details" do
+        leaking_service = Class.new do
+          include Tonic::Rails::Base
+          service "test.Leak"
+          rpc :Secret, String, String
+          def secret(_request)
+            raise StandardError, "secret internal path: /etc/passwd"
+          end
+        end
+
+        request_class = Class.new { def self.decode(_b); {}; end }
+        response_class = Class.new do
+          def self.new(h); h; end
+          def self.encode(m); m; end
+        end
+
+        leaking_service.grpc_rpcs["Secret"][:request] = request_class
+        leaking_service.grpc_rpcs["Secret"][:response] = response_class
+
+        instance = leaking_service.new
+        expect {
+          instance.call_rpc("Secret", "")
+        }.to raise_error(Tonic::Rails::RpcError) do |err|
+          expect(err.code).to eq(13) # INTERNAL
+          expect(err.message).to eq("internal error")
+          expect(err.message).not_to include("secret")
+          expect(err.message).not_to include("/etc/passwd")
+        end
+      end
+
+      it "preserves RpcError messages from handlers" do
+        explicit_error_service = Class.new do
+          include Tonic::Rails::Base
+          service "test.Explicit"
+          rpc :NotFound, String, String
+          def not_found(_request)
+            raise Tonic::Rails::RpcError.new("product not found", code: :not_found)
+          end
+        end
+
+        request_class = Class.new { def self.decode(_b); {}; end }
+        response_class = Class.new do
+          def self.new(h); h; end
+          def self.encode(m); m; end
+        end
+
+        explicit_error_service.grpc_rpcs["NotFound"][:request] = request_class
+        explicit_error_service.grpc_rpcs["NotFound"][:response] = response_class
+
+        instance = explicit_error_service.new
+        expect {
+          instance.call_rpc("NotFound", "")
+        }.to raise_error(Tonic::Rails::RpcError) do |err|
+          expect(err.code).to eq(5) # NOT_FOUND
+          expect(err.message).to eq("product not found")
+        end
+      end
+    end
+
   describe "server-streaming RPCs" do
     let(:streaming_service) do
       Class.new do

@@ -128,7 +128,14 @@ module Tonic
         raise Error, "Unknown RPC: #{method_name}" unless spec
 
         # Decode protobuf → object → Hash with deep-stringified keys.
-        request_obj = spec[:request].decode(request_bytes)
+        # Malformed protobuf is a client error → :invalid_argument.
+        begin
+          request_obj = spec[:request].decode(request_bytes)
+        rescue => e
+          logger = Tonic::Rails.configuration.logger
+          logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
+          raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+        end
         request_hash = request_obj.to_h.deep_stringify_keys
 
         # Store metadata so handler can access deadline, auth tokens, etc.
@@ -153,9 +160,26 @@ module Tonic
           unless result.respond_to?(:each)
             raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
           end
-          # Materialize and encode each response (buffered, not incremental).
-          result.map do |item|
-            spec[:response].encode(spec[:response].new(item))
+          # Incremental streaming: if a StreamSender is available (passed
+          # through metadata by the Rust dispatch layer), send each encoded
+          # message through it one at a time.  This avoids materializing the
+          # entire stream in memory — peak memory is one message, not the
+          # full collection.  Backpressure is provided by a bounded channel
+          # (32 messages); the GVL is released during each send so other
+          # Ruby workers can dispatch concurrently.
+          stream_sender = metadata["_stream_sender"]
+          if stream_sender
+            result.each do |item|
+              encoded = spec[:response].encode(spec[:response].new(item))
+              stream_sender.send(encoded)
+            end
+            nil # Signal: data sent incrementally via StreamSender.
+          else
+            # Buffered fallback (no StreamSender — e.g. in unit tests
+            # that call call_rpc directly without the Rust dispatch).
+            result.map do |item|
+              spec[:response].encode(spec[:response].new(item))
+            end
           end
         else
           # Unary: handler must return a Hash.
@@ -166,8 +190,15 @@ module Tonic
         end
       rescue RpcError
         raise  # re-raise RpcError with its original code
+      rescue Error
+        raise  # re-raise framework errors (e.g. "Unknown RPC")
       rescue => e
-        raise RpcError.new(e.message, code: :internal)
+        # Log the full error server-side; send a sanitized message to
+        # the client to avoid leaking internal details (stack traces,
+        # file paths, SQL fragments, internal hostnames).
+        logger = Tonic::Rails.configuration.logger
+        logger&.error("tonic-rails: internal error in #{method_name}: #{e.class}: #{e.message}")
+        raise RpcError.new("internal error", code: :internal)
       end
 
       # gRPC metadata for the current request.

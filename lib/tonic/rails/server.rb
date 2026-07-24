@@ -37,8 +37,6 @@ module Tonic
         Tonic::Rails._clear_shutting_down
         ensure_native_server
 
-        @configuration.logger.info("tonic-rails: raw-bytes mode (Ruby decode/encode via Google::Protobuf)")
-
         # The callback proc receives (path, request_bytes, metadata) where
         # request_bytes is a binary String.  The Ruby side decodes/encodes
         # using Google::Protobuf and the registered protobuf classes.
@@ -71,18 +69,37 @@ module Tonic
         end
 
         @native_server.on_request(callback)
-
         # Enable TLS if cert and key paths are configured.
         if @configuration.tls_cert_path && @configuration.tls_key_path
           @native_server.set_tls(@configuration.tls_cert_path, @configuration.tls_key_path)
           @configuration.logger.info("tonic-rails: TLS enabled (#{@configuration.tls_cert_path})")
+        else
+          @configuration.logger.warn("tonic-rails: starting without TLS — gRPC traffic will be plaintext")
         end
 
         # Set graceful shutdown drain timeout.
         @native_server.set_drain_timeout(@configuration.drain_timeout)
 
-        # Set max concurrent connections (stored for future enforcement).
+        # Set max concurrent connections (enforced via semaphore on the
+        # incoming stream — connections exceeding this are dropped).
         @native_server.set_max_connections(@configuration.max_connections)
+
+        # Set max concurrent HTTP/2 streams per connection (prevents a
+        # single client from exhausting the dispatch queue).
+        @native_server.set_concurrency_limit_per_connection(
+          @configuration.concurrency_limit_per_connection,
+        )
+
+        # Set tokio worker threads (nil = default = num CPUs).
+        if @configuration.worker_threads
+          @native_server.set_worker_threads(@configuration.worker_threads)
+        end
+
+        # Set HTTP/2 keepalive ping interval and timeout.
+        @native_server.set_keepalive(
+          @configuration.keepalive_interval,
+          @configuration.keepalive_timeout,
+        )
 
         # Enable per-request logging if configured.
         @native_server.set_log_requests(@configuration.log_requests)
@@ -93,7 +110,8 @@ module Tonic
           @configuration.logger.info("tonic-rails: gzip compression enabled")
         end
 
-        # Configure reflection (disable in production to hide API schema).
+        # Configure reflection (disabled by default to avoid exposing
+        # API schema; enable explicitly in development initializers).
         @native_server.set_reflection(@configuration.reflection)
 
         # Start the tokio runtime and dispatch channel (non-blocking).
@@ -133,6 +151,7 @@ module Tonic
         Signal.trap(:TERM, old_term) if old_term
         Signal.trap(:INT, old_int) if old_int
       end
+
       def stop
         return unless @running
         # Called from a signal trap — must be async-safe.
@@ -151,9 +170,9 @@ module Tonic
 
       # Return current server stats as a Hash.
       # @return [Hash{Symbol=>Integer}] counters for total, successful,
-      #   errors, deadline_exceeded, resource_exhausted requests.
+      #   errors, deadline_exceeded, resource_exhausted, active_connections.
       def stats
-        return { total: 0, successful: 0, errors: 0, deadline_exceeded: 0, resource_exhausted: 0 } unless @native_server
+        return { total: 0, successful: 0, errors: 0, deadline_exceeded: 0, resource_exhausted: 0, active_connections: 0 } unless @native_server
         @native_server.stats
       end
 
