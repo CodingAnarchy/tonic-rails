@@ -170,14 +170,50 @@ end
 ```
 
 Streaming handlers return an Enumerable (Array, Enumerator, etc.) of
-response Hashes. Each element is encoded as a separate gRPC message.
+response Hashes. Each element is encoded as a separate gRPC message and
+sent incrementally through a bounded mpsc channel (capacity 32) to the
+Rust transport layer — peak memory is one message, not the full
+collection. Backpressure is natural: when the client consumes slowly,
+the channel fills, the handler blocks (GVL released), and HTTP/2 flow
+control backpressures the client.
 
-> **Buffered streaming**: The full Enumerable is materialized in Ruby
-> before any bytes are sent on the wire. This is suitable for finite
-> result sets (queries, listings, exports) but not for infinite/tail
-> streams. True incremental streaming (flush per chunk) would require
-> an mpsc channel from Ruby→Rust and a streaming HTTP/2 body — a
-> future enhancement.
+### Client-streaming RPCs
+
+Declare with `stream: :client` — the handler receives an Enumerator
+of decoded request Hashes and returns a single response Hash:
+
+```ruby
+class ProductService
+  include Tonic::Rails::Base
+  service "shop.ProductService"
+
+  rpc :ImportProducts, Shop::Product, Shop::ImportSummary, stream: :client
+
+  def import_products(requests)
+    count = 0
+    requests.each { |req| Product.create!(req); count += 1 }
+    { "imported" => count }
+  end
+end
+```
+
+### Bidirectional-streaming RPCs
+
+Declare with `stream: :bidi` — the handler receives an Enumerator of
+request Hashes and returns an Enumerable of response Hashes:
+
+```ruby
+class ChatService
+  include Tonic::Rails::Base
+  service "chat.ChatService"
+
+  rpc :Chat, Chat::Message, Chat::Message, stream: :bidi
+
+  def chat(messages)
+    messages.lazy.map { |msg| { "text" => msg["text"].reverse } }
+  end
+end
+```
 
 ### 3. Configure and start
 
@@ -203,6 +239,7 @@ Tonic::Rails.server.start
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `proto_dir` | `"protos"` | Directory scanned by `rpc_service` for `.proto` files |
 | `bind_address` | `0.0.0.0:50051` | Host and port to bind |
 | `dispatch_threads` | `4` | Ruby dispatch threads (set to `RAILS_MAX_THREADS`) |
 | `worker_threads` | num CPUs | Tokio worker threads for transport |
@@ -242,7 +279,9 @@ throughput.
 - **Deadlines**: per-request deadline propagation and enforcement
 - **Cancellation**: `Tonic::Rails.cancelled?` for graceful shutdown
 - **Compression**: gRPC frame-level gzip (responses >1KB when enabled)
-- **Server streaming**: buffered server-streaming RPCs via `stream: :server`
+- **Streaming RPCs**: server (`stream: :server`), client (`stream: :client`),
+  and bidirectional (`stream: :bidi`) — incremental via bounded mpsc channel
+  with GVL-released backpressure
 - **Message size limits**: configurable max message size
 - **Stats**: connection count, request count, latency tracking
 
