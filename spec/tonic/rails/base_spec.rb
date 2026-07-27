@@ -486,6 +486,71 @@ RSpec.describe Tonic::Rails::Base do
       result = enum_service.new.call_rpc("Gen", "")
       expect(result).to eq(["enc:0", "enc:1", "enc:2"])
     end
+
+    describe "with StreamSender (incremental streaming)" do
+      it "sends all items via stream_sender in order" do
+        svc = Class.new do
+          include Tonic::Rails::Base
+          service "test.Incremental"
+          rpc :List, String, String, stream: :server
+          def list(request)
+            (1..5).map { |i| {"id" => i.to_s } }
+          end
+        end
+
+        request_class = Class.new { def self.decode(b); {}; end }
+        response_class = Class.new do
+          def self.new(h); h; end
+          def self.encode(m); m["id"]; end
+        end
+
+        svc.grpc_rpcs["List"][:request] = request_class
+        svc.grpc_rpcs["List"][:response] = response_class
+
+        sent = []
+        sender = Object.new
+        sender.define_singleton_method(:send) { |encoded| sent << encoded }
+
+        result = svc.new.call_rpc("List", "", metadata: {"_stream_sender" => sender})
+        expect(result).to be_nil # incremental: returns nil after sending
+        expect(sent).to eq(["1", "2", "3", "4", "5"])
+      end
+
+      it "propagates RpcError when stream_sender.send raises mid-stream" do
+        svc = Class.new do
+          include Tonic::Rails::Base
+          service "test.SendError"
+          rpc :List, String, String, stream: :server
+          def list(request)
+            (1..10).map { |i| {"id" => i.to_s } }
+          end
+        end
+
+        request_class = Class.new { def self.decode(b); {}; end }
+        response_class = Class.new do
+          def self.new(h); h; end
+          def self.encode(m); m["id"]; end
+        end
+
+        svc.grpc_rpcs["List"][:request] = request_class
+        svc.grpc_rpcs["List"][:response] = response_class
+
+        # Simulate a channel-closed error on the 3rd message
+        call_count = 0
+        failing_sender = Object.new
+        failing_sender.define_singleton_method(:send) do |encoded|
+          call_count += 1
+          raise "stream send cancelled or channel closed" if call_count == 3
+        end
+
+        expect {
+          svc.new.call_rpc("List", "", metadata: {"_stream_sender" => failing_sender})
+        }.to raise_error(Tonic::Rails::RpcError, /internal error/)
+
+        # Messages 4-10 were never sent — the stream is broken
+        expect(call_count).to eq(3)
+      end
+    end
   end
 
   describe "client-streaming RPCs" do
