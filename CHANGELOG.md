@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (2024)
+## 0.1.0 (2026)
 
 Initial release.
 
