@@ -278,3 +278,19 @@ Initial release.
 - **`rpc_service` configuration guard**: raises a clear error when
   neither `proto_file` nor `proto_dir` is configured, instead of
   failing with a confusing `NoMethodError` inside `ProtoParser`.
+
+### Streaming integration tests and send error mapping
+
+- **`stream_sender.send` error → `:unavailable`**: when the channel
+  closes mid-stream (client disconnect) or send is cancelled (server
+  shutdown), the Ruby `send` loop now rescues the error and raises
+  `RpcError` with `:unavailable` (code 14) instead of falling through
+  to the generic `:internal` (code 13). Different retry semantics, and
+  avoids spamming error logs on routine client disconnects.
+- **Server-streaming integration tests**: added `StreamProducts` RPC
+  to `shop.proto` with a handler emitting up to 50 messages (>32
+  channel capacity). Integration tests verify: (1) 5 messages stream
+  correctly, (2) 50 messages all arrive in order despite channel
+  backpressure, (3) minimal stream (limit=1) works.
+- **`stream_products` handler**: destructures the `SimulatedDB#all`
+  tuple correctly and returns string-keyed product hashes directly.

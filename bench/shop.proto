@@ -20,6 +20,8 @@ service ProductService {
   rpc CheckoutPreview(CheckoutPreviewRequest) returns (CheckoutPreviewResponse);
   // Realistic "dashboard" — 3 slow aggregate queries + stat aggregation
   rpc Dashboard(DashboardRequest) returns (DashboardResponse);
+  // Server-streaming — emits products one at a time
+  rpc StreamProducts(ListProductsRequest) returns (stream Product);
 }
 
 message Product {

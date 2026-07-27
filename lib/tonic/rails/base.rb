@@ -253,7 +253,17 @@ module Tonic
           if stream_sender
             result.each do |item|
               encoded = spec[:response].encode(spec[:response].new(item))
-              stream_sender.send(encoded)
+              begin
+                stream_sender.send(encoded)
+              rescue => e
+                # Channel closed (client disconnected) or send cancelled
+                # (server shutting down). Not a handler bug — map to
+                # :unavailable so clients know to retry, not :internal.
+                raise RpcError.new(
+                  "stream unavailable: #{e.message}",
+                  code: :unavailable,
+                )
+              end
             end
             nil # Signal: data sent incrementally via StreamSender.
           else

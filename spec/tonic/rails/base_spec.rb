@@ -100,10 +100,15 @@ RSpec.describe Tonic::Rails::Base do
         rpc_service "shop.ProductService", proto_file: file
       end
 
-      # shop.proto has no streaming RPCs, so all should be unary
-      svc.grpc_rpcs.each_value do |spec|
-        expect(spec[:request_stream]).to be(false)
-        expect(spec[:response_stream]).to be(false)
+      # shop.proto now has one server-streaming RPC (StreamProducts);
+      # all others should be unary.
+      svc.grpc_rpcs.each do |name, spec|
+        if name == "StreamProducts"
+          expect(spec[:response_stream]).to be(true)
+        else
+          expect(spec[:request_stream]).to be(false)
+          expect(spec[:response_stream]).to be(false)
+        end
       end
     end
 
@@ -545,7 +550,10 @@ RSpec.describe Tonic::Rails::Base do
 
         expect {
           svc.new.call_rpc("List", "", metadata: {"_stream_sender" => failing_sender})
-        }.to raise_error(Tonic::Rails::RpcError, /internal error/)
+        }.to raise_error(Tonic::Rails::RpcError) do |err|
+          expect(err.code).to eq(14) # UNAVAILABLE
+          expect(err.message).to match(/stream unavailable/)
+        end
 
         # Messages 4-10 were never sent — the stream is broken
         expect(call_count).to eq(3)

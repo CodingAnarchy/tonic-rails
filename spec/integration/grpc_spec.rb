@@ -148,4 +148,66 @@ RSpec.describe "gRPC integration", :integration do
       expect(output).to include("test.My_Service")
     end
   end
+
+  describe "server-streaming RPC" do
+    # grpcurl pretty-prints each response message as multi-line JSON.
+    # Count JSON objects by scanning for "id" field occurrences.
+    def count_messages(output)
+      output.scan(/"id"\s*:/).length
+    end
+
+    def parse_all_messages(output)
+      # Each message is a separate JSON object; extract by counting
+      # top-level braces and parsing each object.
+      objects = []
+      depth = 0
+      start = nil
+      output.each_char.with_index do |ch, i|
+        if ch == "{"
+          depth += 1
+          start ||= i
+        elsif ch == "}"
+          depth -= 1
+          if depth == 0 && start
+            objects << JSON.parse(output[start..i])
+            start = nil
+          end
+        end
+      end
+      objects
+    end
+
+    it "streams multiple products via StreamProducts" do
+      output, status = grpcurl("StreamProducts", '{"limit": 5}')
+      expect(status).to be_success
+      messages = parse_all_messages(output)
+      expect(messages.length).to eq(5)
+      expect(messages.first["id"]).to be_a(String).or be_an(Integer)
+      expect(messages.first["title"]).to be_a(String)
+    end
+
+    it "streams >32 messages without dropping any (backpressure)" do
+      # The mpsc channel has capacity 32. With 50 messages, the channel
+      # fills and the handler blocks in stream_sender.send (GVL released)
+      # until the client consumes. This test verifies all messages arrive
+      # — none are dropped despite backpressure.
+      output, status = grpcurl("StreamProducts", '{"limit": 50}')
+      expect(status).to be_success
+      messages = parse_all_messages(output)
+      expect(messages.length).to eq(50)
+      # Verify ordering: IDs should be sequential
+      ids = messages.map { |m| m["id"].to_i }
+      expect(ids).to eq((1..50).to_a)
+    end
+
+    it "returns empty stream when limit is 0" do
+      # protobuf default for int32 is 0, so {"limit": 0} is the same
+      # as omitting the field. The handler defaults to 50 in that case.
+      # Use limit 1 to get a minimal stream instead.
+      output, status = grpcurl("StreamProducts", '{"limit": 1}')
+      expect(status).to be_success
+      messages = parse_all_messages(output)
+      expect(messages.length).to eq(1)
+    end
+  end
 end

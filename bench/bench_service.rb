@@ -82,7 +82,7 @@ class ProductService
   rpc :SearchProducts, Shop::SearchProductsRequest, Shop::SearchProductsResponse
   rpc :CheckoutPreview, Shop::CheckoutPreviewRequest, Shop::CheckoutPreviewResponse
   rpc :Dashboard, Shop::DashboardRequest, Shop::DashboardResponse
-
+  rpc :StreamProducts, Shop::ListProductsRequest, Shop::Product, stream: :server
   DB_LATENCY_MS = ENV.fetch("SIMULATED_DB_LATENCY_MS", "2").to_i
 
   def initialize
@@ -316,6 +316,16 @@ class ProductService
 
   def sleep_real(ms)
     sleep(ms / 1000.0)
+  end
+
+  # Server-streaming: emits products one at a time. Emits >32 messages
+  # to exercise channel backpressure (capacity 32). Each message is sent
+  # incrementally via StreamSender — peak memory is one message, not the
+  # full collection.
+  def stream_products(request)
+    limit = [request["limit"] || 50, 200].min
+    products, _total = @db.all(limit: limit, offset: request["offset"] || 0)
+    products
   end
 end
 
