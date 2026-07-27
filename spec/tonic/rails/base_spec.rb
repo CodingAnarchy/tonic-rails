@@ -352,7 +352,7 @@ RSpec.describe Tonic::Rails::Base do
         end
 
         expect { svc.new.call_rpc("Bad", "") }
-          .to raise_error(Tonic::Rails::RpcError, /got nil/)
+          .to raise_error(Tonic::Rails::RpcError, /got NilClass/)
       end
     end
 
@@ -760,7 +760,7 @@ RSpec.describe Tonic::Rails::Base do
       nil_service.grpc_rpcs["Bad"][:response] = response_class
 
       expect { nil_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /got nil/)
+        .to raise_error(Tonic::Rails::RpcError, /got NilClass/)
     end
   end
 

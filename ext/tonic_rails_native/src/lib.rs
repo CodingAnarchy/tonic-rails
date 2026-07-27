@@ -525,12 +525,11 @@ impl Body for GrpcStreamingBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // 1. If we have buffered trailers, yield them.
         if let Some(trailers) = self.trailers.take() {
             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
         }
-        // 2. Check deadline before borrowing the receiver (avoids
-        //    overlapping mutable borrows of self).
+        // Before borrowing the receiver — avoids overlapping
+        // mutable borrows of self.
         if let Some(deadline) = &mut self.deadline
             && deadline.as_mut().poll(cx).is_ready()
         {
@@ -543,16 +542,14 @@ impl Body for GrpcStreamingBody {
             )))));
         }
 
-        // 3. If no receiver, the stream is exhausted.
         let receiver = match self.receiver.as_mut() {
             Some(rx) => rx,
             None => return Poll::Ready(None),
         };
 
-        // 4. Poll the channel for the next message.
         match receiver.poll_recv(cx) {
             Poll::Ready(Some(StreamMessage::Data(bytes))) => {
-                // Check per-message size limit (gRPC limit is per-message).
+                // gRPC size limit is per-message.
                 if bytes.len() > self.max_message_size {
                     self.receiver = None;
                     let code = tonic::Code::ResourceExhausted as u32;
@@ -1091,7 +1088,6 @@ impl GrpcMessageReader {
             payload.to_vec()
         };
 
-        // Consume the frame from the buffer.
         self.buf.advance(5 + length);
         Ok(Some(message))
     }
@@ -1411,7 +1407,6 @@ impl GrpcDispatchInner {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Check if client accepts gzip-compressed responses.
         let client_accepts_gzip = req
             .headers()
             .get("grpc-accept-encoding")
@@ -1918,7 +1913,6 @@ impl NativeServer {
         let (shutdown_tx, mut shutdown_rx1) = broadcast::channel::<()>(1);
         let mut shutdown_rx2 = shutdown_tx.subscribe();
 
-        // Build the shared dispatch inner.
         let dispatch_inner = Arc::new(GrpcDispatchInner {
             callback: Arc::new(callback),
             request_tx,

@@ -294,3 +294,19 @@ Initial release.
   backpressure, (3) minimal stream (limit=1) works.
 - **`stream_products` handler**: destructures the `SimulatedDB#all`
   tuple correctly and returns string-keyed product hashes directly.
+
+
+### Code simplification pass
+
+- **Extracted `decode_request` and `read_next` helpers**: eliminated 5
+  duplicated `begin/rescue → logger.warn → raise RpcError` blocks in
+  `call_rpc` by extracting two private methods. Same error codes and
+  log messages, less repetition.
+- **Removed redundant nil checks**: `if result.nil?` before
+  `unless result.respond_to?(:each)` and `unless result.is_a?(Hash)`
+  was redundant — the type checks already catch nil. Error messages
+  now say `"got NilClass"` instead of `"got nil"` (more informative).
+- **Removed "what" comments in Rust**: stripped comments that restated
+  the code (e.g. `// Consume the frame from the buffer.` before
+  `self.buf.advance(5 + length)`); kept "why" comments explaining
+  GVL semantics, borrow ordering, and design decisions.

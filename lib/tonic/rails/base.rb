@@ -170,34 +170,21 @@ module Tonic
           if request_reader
             # Real reader from Rust — yields raw bytes, we decode each.
             request_enum = Enumerator.new do |y|
-              begin
-                while (bytes = request_reader.next)
-                  begin
-                    obj = spec[:request].decode(bytes)
-                  rescue => e
-                    logger = Tonic::Rails.configuration.logger
-                    logger&.warn("tonic-rails: invalid protobuf in stream for #{method_name}: #{e.class}: #{e.message}")
-                    raise RpcError.new("invalid protobuf request", code: :invalid_argument)
-                  end
-                  y << obj.to_h.deep_stringify_keys
-                end
-              rescue RpcError => e
-                raise e
-              rescue => e
-                logger = Tonic::Rails.configuration.logger
-                logger&.warn("tonic-rails: error reading from stream for #{method_name}: #{e.class}: #{e.message}")
-                raise RpcError.new("stream read error", code: :unavailable)
+              while (bytes = read_next(method_name, request_reader))
+                obj = decode_request(method_name, bytes, spec[:request])
+                y << obj.to_h.deep_stringify_keys
               end
+            rescue RpcError
+              raise
+            rescue => e
+              Tonic::Rails.configuration.logger&.warn(
+                "tonic-rails: error in stream for #{method_name}: #{e.class}: #{e.message}",
+              )
+              raise RpcError.new("stream read error", code: :unavailable)
             end
           else
             # Buffered fallback for tests: wrap single request_bytes.
-            begin
-              obj = spec[:request].decode(request_bytes)
-            rescue => e
-              logger = Tonic::Rails.configuration.logger
-              logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
-              raise RpcError.new("invalid protobuf request", code: :invalid_argument)
-            end
+            obj = decode_request(method_name, request_bytes, spec[:request])
             request_enum = [obj.to_h.deep_stringify_keys].each
           end
           result = send(method_name.to_s.underscore, request_enum)
@@ -208,27 +195,13 @@ module Tonic
           # request_bytes argument is used directly.
           request_reader = metadata["_request_reader"]
           actual_bytes = if request_reader
-            begin
-              bytes = request_reader.next
-            rescue => e
-              logger = Tonic::Rails.configuration.logger
-              logger&.warn("tonic-rails: error reading from request for #{method_name}: #{e.class}: #{e.message}")
-              raise RpcError.new("stream read error", code: :unavailable)
-            end
-            if bytes.nil?
-              raise RpcError.new("empty request stream", code: :invalid_argument)
-            end
+            bytes = read_next(method_name, request_reader)
+            raise RpcError.new("empty request stream", code: :invalid_argument) if bytes.nil?
             bytes
           else
             request_bytes
           end
-          begin
-            request_obj = spec[:request].decode(actual_bytes)
-          rescue => e
-            logger = Tonic::Rails.configuration.logger
-            logger&.warn("tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}")
-            raise RpcError.new("invalid protobuf request", code: :invalid_argument)
-          end
+          request_obj = decode_request(method_name, actual_bytes, spec[:request])
           request_hash = request_obj.to_h.deep_stringify_keys
           result = send(method_name.to_s.underscore, request_hash)
         end
@@ -236,9 +209,6 @@ module Tonic
         # ── Response handling ───────────────────────────────────────
         if spec[:response_stream]
           # Server streaming or bidi: handler must return an Enumerable.
-          if result.nil?
-            raise RpcError.new("streaming handler must return an Enumerable, got nil", code: :internal)
-          end
           unless result.respond_to?(:each)
             raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
           end
@@ -275,9 +245,6 @@ module Tonic
           end
         else
           # Unary or client streaming: handler must return a Hash.
-          if result.nil?
-            raise RpcError.new("handler must return a Hash, got nil", code: :internal)
-          end
           unless result.is_a?(Hash)
             raise RpcError.new("handler must return a Hash, got #{result.class}", code: :internal)
           end
@@ -318,6 +285,26 @@ module Tonic
       # @return [Boolean]
       def cancelled?
         Tonic::Rails.cancelled?
+      end
+
+      private
+
+      def decode_request(method_name, bytes, request_class)
+        request_class.decode(bytes)
+      rescue => e
+        Tonic::Rails.configuration.logger&.warn(
+          "tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}",
+        )
+        raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+      end
+
+      def read_next(method_name, reader)
+        reader.next
+      rescue => e
+        Tonic::Rails.configuration.logger&.warn(
+          "tonic-rails: error reading from request for #{method_name}: #{e.class}: #{e.message}",
+        )
+        raise RpcError.new("stream read error", code: :unavailable)
       end
     end
 
