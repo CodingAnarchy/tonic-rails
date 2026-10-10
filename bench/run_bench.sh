@@ -33,7 +33,7 @@ run_bench() {
 
   # Start server
   echo "Starting server..."
-  SIMULATED_DB_LATENCY_MS=$DB_LATENCY shadowenv exec -- bundle exec ruby -Ibench -e '
+  SIMULATED_DB_LATENCY_MS=$DB_LATENCY bundle exec ruby -Ibench -e '
     require_relative "bench/bench_service"
     Tonic::Rails.server.start
   ' 2>/dev/null &
