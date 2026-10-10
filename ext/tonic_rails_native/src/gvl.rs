@@ -311,29 +311,64 @@ pub struct DispatchContext {
     pub request_error: Arc<RequestError>,
 }
 
-/// Re-acquire the GVL and run the Ruby handler for `ctx`.
-/// Called from a Ruby thread that has released the GVL.
-pub fn dispatch(ctx: Box<DispatchContext>) {
+/// Bounds on how long one thread keeps the GVL to drain a busy queue.
+/// The time bound keeps CPU-heavy handlers from hurting tail latency:
+/// only cheap requests get batched.
+const MAX_BATCH: usize = 16;
+const MAX_BATCH_TIME: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// Re-acquire the GVL and run the Ruby handler for `first`, then keep
+/// the GVL to run requests already waiting in `queue` (within
+/// `MAX_BATCH` / `MAX_BATCH_TIME`).  Each GVL handoff costs a thread wake-up, so draining a
+/// busy queue under one acquisition raises throughput.  Handlers that
+/// block on I/O still release the GVL internally, so this does not
+/// serialise I/O-bound work.  Called from a thread that has released
+/// the GVL.
+pub fn dispatch(first: Box<DispatchContext>, queue: &crossbeam_channel::Receiver<Box<DispatchContext>>) {
+    struct Batch<'a> {
+        first: Option<Box<DispatchContext>>,
+        queue: &'a crossbeam_channel::Receiver<Box<DispatchContext>>,
+    }
+
     unsafe extern "C" fn with_gvl(data: *mut c_void) -> *mut c_void {
-        let ctx = unsafe { Box::from_raw(data as *mut DispatchContext) };
-        let response_tx = ctx.response_tx.clone();
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run_handler(*ctx))) {
-            let msg = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            eprintln!("tonic-rails: panic in dispatch: {msg}");
-            let _ = response_tx.try_send(StreamMessage::End(Some((
-                tonic::Code::Internal as u32,
-                "internal error".into(),
-            ))));
+        let batch = unsafe { &mut *(data as *mut Batch<'_>) };
+        let start = std::time::Instant::now();
+        let mut next = batch.first.take();
+        let mut handled = 0;
+        while let Some(ctx) = next {
+            run_guarded(*ctx);
+            handled += 1;
+            next = if handled < MAX_BATCH && start.elapsed() < MAX_BATCH_TIME {
+                batch.queue.try_recv().ok()
+            } else {
+                None
+            };
         }
         std::ptr::null_mut()
     }
 
+    let mut batch = Batch {
+        first: Some(first),
+        queue,
+    };
     unsafe {
-        rb_thread_call_with_gvl(Some(with_gvl), Box::into_raw(ctx) as *mut c_void);
+        rb_thread_call_with_gvl(Some(with_gvl), &mut batch as *mut Batch<'_> as *mut c_void);
+    }
+}
+
+fn run_guarded(ctx: DispatchContext) {
+    let response_tx = ctx.response_tx.clone();
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run_handler(ctx))) {
+        let msg = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        eprintln!("tonic-rails: panic in dispatch: {msg}");
+        let _ = response_tx.try_send(StreamMessage::End(Some((
+            tonic::Code::Internal as u32,
+            "internal error".into(),
+        ))));
     }
 }
 

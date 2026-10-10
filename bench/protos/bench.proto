@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package bench.v1;
+
+// A generic benchmark service.  Each request describes the work a handler
+// should do, so one service covers dispatch overhead, I/O-bound,
+// CPU-bound, large-response and streaming workloads.  The Ruby
+// (tonic-rails) and Rust (tonic) servers implement it identically.
+
+message Empty {}
+
+message WorkRequest {
+  // Simulated blocking I/O calls (think database queries), run sequentially.
+  int32 io_calls = 1;
+  // Duration of each simulated I/O call, in milliseconds.
+  int32 io_ms = 2;
+  // Number of records in the response (or streamed, for StreamRecords).
+  int32 records = 3;
+  // Size of each record's blob, in bytes.
+  int32 payload_bytes = 4;
+  // Iterations of a deterministic checksum loop: pure CPU work.
+  int32 cpu_iterations = 5;
+}
+
+message Record {
+  int64 id = 1;
+  string name = 2;
+  repeated string tags = 3;
+  int64 value = 4;
+  bytes blob = 5;
+}
+
+message WorkResponse {
+  repeated Record records = 1;
+  int64 checksum = 2;
+}
+
+service BenchService {
+  // No work at all: measures pure transport + dispatch overhead.
+  rpc Ping(Empty) returns (Empty);
+  rpc Work(WorkRequest) returns (WorkResponse);
+  // Server streaming: `records` messages.
+  rpc StreamRecords(WorkRequest) returns (stream Record);
+  // Client streaming: sums the values of every uploaded record.
+  rpc Upload(stream Record) returns (WorkResponse);
+}

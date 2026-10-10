@@ -392,7 +392,7 @@ impl NativeServer {
             gvl::without_gvl(&cancel, || {
                 while !stop.load(Ordering::Acquire) && !cancel.is_cancelled() {
                     match request_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(ctx) => gvl::dispatch(ctx),
+                        Ok(ctx) => gvl::dispatch(ctx, &request_rx),
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                     }

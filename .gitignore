@@ -9,11 +9,10 @@ target/
 *.bundle
 *.dylib
 # Compiled Go binaries
-bench/go_bench/bench_client
-bench/go_bench/tonic-bench
+bench/go_bench/bench-client
+bench/go_bench/health_bench/health_bench
 # Generated proto descriptors
 *.desc
-bench/rust_bench/src/shop_descriptor.bin
 **/*.rbc
 .ruby-version
 .ruby-gemset
