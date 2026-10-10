@@ -33,7 +33,7 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir.chdir(__dir__) do
     `git ls-files -z`.split("\x0").select do |f|
-      f.start_with?("lib/", "ext/") || %w[LICENSE README.md CHANGELOG.md].include?(f)
+      f.start_with?("lib/", "ext/") || %w[Cargo.toml Cargo.lock LICENSE README.md CHANGELOG.md].include?(f)
     end
   end
   spec.require_paths = ["lib"]

@@ -1,0 +1,11 @@
+# Cargo workspace for the native extension (the layout rb_sys and
+# `bundle gem --ext=rust` expect).  The benchmark crate is standalone.
+[workspace]
+members = ["ext/tonic_rails_native"]
+exclude = ["bench/rust_bench"]
+resolver = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

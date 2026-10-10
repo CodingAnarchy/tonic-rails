@@ -2,17 +2,50 @@
 
 require "bundler/gem_tasks"
 require "rspec/core/rake_task"
+require "rb_sys/extensiontask"
 
-RSpec::Core::RakeTask.new(:spec)
+GEMSPEC = Gem::Specification.load("tonic-rails.gemspec")
 
-require "rake/extensiontask"
+# Platforms for precompiled gems (built in CI with rb-sys-dock).
+CROSS_PLATFORMS = %w[
+  aarch64-linux-gnu
+  aarch64-linux-musl
+  arm64-darwin
+  x86_64-darwin
+  x86_64-linux-gnu
+  x86_64-linux-musl
+].freeze
 
-# Build the Rust native extension as part of `rake compile`
-Rake::ExtensionTask.new("tonic_rails_native") do |ext|
-  ext.ext_dir = "ext/tonic_rails_native"
+RbSys::ExtensionTask.new("tonic_rails_native", GEMSPEC) do |ext|
   ext.lib_dir = "lib/tonic/rails"
-  ext.source_pattern = "**/*.{rs,toml,proto}"
+  ext.cross_compile = true
+  ext.cross_platform = CROSS_PLATFORMS
 end
 
+RSpec::Core::RakeTask.new(:spec)
 task spec: :compile
-task default: :spec
+
+begin
+  require "rubocop/rake_task"
+  RuboCop::RakeTask.new
+rescue LoadError
+  # RuboCop is a development dependency only.
+end
+
+namespace :cargo do
+  # Build against the Ruby running rake (rb-sys reads RUBY), in a target
+  # dir of our own so editor tooling builds never mix in.
+  env = { "RUBY" => RbConfig.ruby, "CARGO_TARGET_DIR" => File.expand_path("tmp/cargo", __dir__) }
+  manifest = "--manifest-path=ext/tonic_rails_native/Cargo.toml"
+
+  desc "Run the Rust unit tests"
+  task(:test) { sh env, "cargo test #{manifest}" }
+
+  desc "Check Rust formatting and lints"
+  task :lint do
+    sh env, "cargo fmt #{manifest} --check"
+    sh env, "cargo clippy #{manifest} --all-targets -- -D warnings"
+  end
+end
+
+task default: %i[spec cargo:test]
