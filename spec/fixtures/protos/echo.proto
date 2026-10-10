@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package echo.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum Mood {
+  MOOD_UNSPECIFIED = 0;
+  MOOD_HAPPY = 1;
+}
+
+message Detail {
+  Mood mood = 1;
+  google.protobuf.Timestamp at = 2;
+}
+
+message EchoRequest {
+  string message = 1;
+  // Server-streaming: number of responses to send.
+  int32 count = 2;
+  // Simulated work before responding.
+  int32 sleep_ms = 3;
+  // When set, the handler raises: "rpc:<code>" for an RpcError, "crash" for a RuntimeError.
+  string fail_with = 4;
+  Detail detail = 5;
+  // Bytes appended to the response, to test message size limits and compression.
+  int32 pad_bytes = 6;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 index = 2;
+  map<string, string> metadata = 3;
+  int64 deadline_ms = 4;
+  bytes padding = 5;
+}
+
+service EchoService {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
+}

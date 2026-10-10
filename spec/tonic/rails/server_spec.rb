@@ -1,60 +1,36 @@
 # frozen_string_literal: true
 
-require "spec_helper"
-
 RSpec.describe Tonic::Rails::Server do
-  let(:configuration) do
-    Tonic::Rails::Configuration.new.tap do |c|
-      c.bind_address = "127.0.0.1:0"  # ephemeral port for tests
-    end
+  subject(:server) { described_class.new(configuration: config) }
+
+  let(:config) { Tonic::Rails::Configuration.new.tap { |c| c.logger = Logger.new(IO::NULL) } }
+
+  it "registers handler classes" do
+    server.register(EchoHandler)
+    expect(server.router.paths).to include("/echo.v1.EchoService/Unary")
   end
 
-  let(:server) { described_class.new(configuration: configuration) }
-
-  describe "#register" do
-    it "registers a service class with the router" do
-      service_class = Class.new do
-        include Tonic::Rails::Base
-        service "test.Svc"
-        rpc :Ping, String, String
-      end
-
-      server.register(service_class)
-      expect(server.router.paths).to include("/test.Svc/Ping")
-    end
-
-    it "returns self for chaining" do
-      service_class = Class.new do
-        include Tonic::Rails::Base
-        service "test.Svc"
-        rpc :Ping, String, String
-      end
-
-      expect(server.register(service_class)).to be(server)
-    end
+  it "registers handler classes by name" do
+    server.register("EchoHandler")
+    expect(server.router.service_names).to eq(["echo.v1.EchoService"])
   end
 
-  describe "#start" do
-    it "raises when no services are registered" do
-      expect { server.start }.to raise_error(Tonic::Rails::Error, /No services registered/)
-    end
-
-    it "raises when already running" do
-      service_class = Class.new do
-        include Tonic::Rails::Base
-        service "test.Svc"
-        rpc :Ping, String, String
-      end
-      server.register(service_class)
-      server.define_singleton_method(:running?) { true }
-
-      expect { server.start }.to raise_error(Tonic::Rails::Error, /already running/)
-    end
+  it "refuses to start without services" do
+    expect { server.start }.to raise_error(Tonic::Rails::Error, /no services registered/)
+    expect(server).not_to be_running
   end
 
-  describe "#running?" do
-    it "returns false before start" do
-      expect(server).not_to be_running
-    end
+  it "validates configuration before starting" do
+    server.register(EchoHandler)
+    config.dispatch_threads = 0
+    expect { server.start }.to raise_error(ArgumentError, /dispatch_threads/)
+  end
+
+  it "reports zeroed stats while stopped" do
+    expect(server.stats).to include(total: 0, active_connections: 0, queued: 0)
+  end
+
+  it "ignores stop while not running" do
+    expect { server.stop }.not_to raise_error
   end
 end

@@ -2,186 +2,219 @@
 
 module Tonic
   module Rails
-    # Ruby-facing wrapper around the Rust native extension server.
-    #
-    # The native extension (TonicRails::Native::Server) handles HTTP/2,
-    # TLS, keepalive, and graceful shutdown via tonic's transport layer.
-    # Reflection (v1) and health-check services are built-in siblings.
-    # Dispatch is raw-byte passthrough: the Ruby handler receives binary
-    # protobuf bytes and returns binary protobuf bytes.
+    # Runs the gRPC server: a tonic transport in Rust plus a pool of Ruby
+    # dispatch threads.
     #
     #   server = Tonic::Rails::Server.new
-    #   server.register(GreeterService)
-    #   server.start  # blocks; run in a thread or separate process
+    #   server.register(ProductService)
+    #   server.start   # blocks until SIGTERM / SIGINT or #stop
     #
+    # Shutdown is graceful: health checks flip to NOT_SERVING, new
+    # connections are refused, in-flight RPCs get `drain_timeout` seconds
+    # to finish, then everything is torn down.
     class Server
-      attr_reader :router
+      attr_reader :router, :configuration
 
       def initialize(configuration: Tonic::Rails.configuration)
         @configuration = configuration
         @router = Router.new
-        @native_server = nil
-        @running = false
+        @native = nil
+        @state = :stopped
+        @stop_reader = nil
+        @stop_writer = nil
+        @lock = Mutex.new
       end
 
+      # @param service_class [Class, String] handler class (or its name)
       def register(service_class)
+        service_class = Object.const_get(service_class) if service_class.is_a?(String)
         service_class.register_on(@router)
         self
       end
 
-      def start
-        raise Error, "Server already running" if running?
-        raise Error, "No services registered" if @router.empty?
-        raise Error, "dispatch_threads must be >= 1" if @configuration.dispatch_threads < 1
+      # Start serving and block until stopped.
+      # @param install_signal_handlers [Boolean] trap TERM and INT to stop.
+      #   Pass false when embedding in a process that owns its signals.
+      # @yield once the server is accepting connections
+      def start(install_signal_handlers: true)
+        @lock.synchronize do
+          raise Error, "server is already running" unless @state == :stopped
 
-        Tonic::Rails._clear_shutting_down
-        ensure_native_server
-
-        # The callback proc receives (path, request_bytes, metadata) where
-        # request_bytes is a binary String.  The Ruby side decodes/encodes
-        # using Google::Protobuf and the registered protobuf classes.
-        router = @router
-        dispatch_proc = proc { |path, request_bytes, metadata|
-          router.dispatch(path, request_bytes, metadata: metadata)
-        }
-
-        # Build interceptor chain: each interceptor wraps the next.
-        # Interceptors are applied in reverse order (last = outermost).
-        callback = @configuration.interceptors.reverse.reduce(dispatch_proc) do |next_call, interceptor|
-          proc { |path, request, metadata|
-            interceptor.call(path, request, metadata, next_call)
-          }
+          @state = :starting
         end
 
-        # Wrap the entire callback in the Rails executor when available.
-        # This handles ActiveRecord connection checkout/return,
-        # CurrentAttributes reset, query cache, and reloading — the same
-        # per-request isolation that Rack middleware and Sidekiq use.
-        # Without this, thread-local state bleeds across requests on
-        # reused dispatch threads.
-        if defined?(::Rails.application) && ::Rails.application.respond_to?(:executor)
-          raw_callback = callback
-          callback = proc { |path, request, metadata|
-            ::Rails.application.executor.wrap do
-              raw_callback.call(path, request, metadata)
-            end
-          }
+        begin
+          raise Error, "no services registered" if @router.empty?
+
+          @configuration.validate!
+          Tonic::Rails.native_extension!
+          Tonic::Rails._set_shutting_down(false)
+          @stop_reader, @stop_writer = IO.pipe
+          @native = build_native_server
+          @native.start_server
+          @state = :running
+
+          previous_handlers = install_signal_handlers ? trap_signals : {}
+          workers = Array.new(@configuration.dispatch_threads) { |i| spawn_worker(i) }
+          log_startup
+          yield self if block_given?
+
+          wait_for_stop(workers)
+          shutdown(workers)
+        ensure
+          previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
+          @native&.stop_server
+          @native = nil
+          [@stop_reader, @stop_writer].each { |io| io.close if io && !io.closed? }
+          @stop_reader = @stop_writer = nil
+          Tonic::Rails._set_shutting_down(false)
+          @state = :stopped
         end
-
-        @native_server.on_request(callback)
-        # Enable TLS if cert and key paths are configured.
-        if @configuration.tls_cert_path && @configuration.tls_key_path
-          @native_server.set_tls(@configuration.tls_cert_path, @configuration.tls_key_path)
-          @configuration.logger.info("tonic-rails: TLS enabled (#{@configuration.tls_cert_path})")
-        else
-          @configuration.logger.warn("tonic-rails: starting without TLS — gRPC traffic will be plaintext")
-        end
-
-        # Set graceful shutdown drain timeout.
-        @native_server.set_drain_timeout(@configuration.drain_timeout)
-
-        # Set max concurrent connections (enforced via semaphore on the
-        # incoming stream — connections exceeding this are dropped).
-        @native_server.set_max_connections(@configuration.max_connections)
-
-        # Set max concurrent HTTP/2 streams per connection (prevents a
-        # single client from exhausting the dispatch queue).
-        @native_server.set_concurrency_limit_per_connection(
-          @configuration.concurrency_limit_per_connection,
-        )
-
-        # Set tokio worker threads (nil = default = num CPUs).
-        if @configuration.worker_threads
-          @native_server.set_worker_threads(@configuration.worker_threads)
-        end
-
-        # Set HTTP/2 keepalive ping interval and timeout.
-        @native_server.set_keepalive(
-          @configuration.keepalive_interval,
-          @configuration.keepalive_timeout,
-        )
-
-        # Enable per-request logging if configured.
-        @native_server.set_log_requests(@configuration.log_requests)
-
-        # Enable gzip compression if configured.
-        if @configuration.compression
-          @native_server.set_compression(true)
-          @configuration.logger.info("tonic-rails: gzip compression enabled")
-        end
-
-        # Configure reflection (disabled by default to avoid exposing
-        # API schema; enable explicitly in development initializers).
-        @native_server.set_reflection(@configuration.reflection)
-
-        # Start the tokio runtime and dispatch channel (non-blocking).
-        @native_server.start_server
-        @running = true
-
-        thread_count = @configuration.dispatch_threads
-        @configuration.logger.info("tonic-rails: serving on #{@configuration.bind_address} (#{thread_count} dispatch threads)")
-
-        # Install signal handlers for graceful shutdown.
-        # SIGTERM/SIGINT → stop → sets shutdown flag → all workers exit
-        # → main thread's serve_worker returns → stop_server drains.
-        old_term = Signal.trap(:TERM) { stop }
-        old_int  = Signal.trap(:INT)  { stop }
-
-        # Spawn (N-1) Ruby worker threads.  Each calls #serve_worker which
-        # blocks inside rb_thread_call_without_gvl waiting on the shared
-        # channel.  When a handler does blocking I/O (releasing the GVL),
-        # another worker can acquire the GVL and run its handler — giving
-        # I/O concurrency within a single process.
-        workers = (thread_count - 1).times.map do
-          Thread.new { @native_server.serve_worker }
-        end
-
-        # The main thread is the Nth worker.
-        @native_server.serve_worker
-
-        # serve_worker returned — shutdown was triggered.
-        @configuration.logger.info("tonic-rails: shutdown signal received — draining connections")
-
-        # All workers have exited — clean up.
-        workers.each(&:join)
-        @native_server.stop_server
-      ensure
-        @running = false
-        # Restore previous signal handlers.
-        Signal.trap(:TERM, old_term) if old_term
-        Signal.trap(:INT, old_int) if old_int
       end
 
+      # Request a graceful stop.  Safe to call from signal handlers and
+      # other threads; returns immediately.
       def stop
-        return unless @running
-        # Called from a signal trap — must be async-safe.
-        # No logging, no I/O — just set flags. The shutdown flag lets
-        # in-flight Ruby handlers check cancelled? and abort gracefully.
-        # Flip health check to NOT_SERVING so LBs stop sending traffic.
-        Tonic::Rails._set_shutting_down
-        @native_server&.set_not_serving
-        @native_server&.shutdown
-        @running = false
+        @stop_writer&.write_nonblock(".", exception: false)
+      rescue IOError
+        # Already stopped.
       end
 
       def running?
-        @running
+        @state == :running
       end
 
-      # Return current server stats as a Hash.
-      # @return [Hash{Symbol=>Integer}] counters for total, successful,
-      #   errors, deadline_exceeded, resource_exhausted, active_connections.
+      # @return [Hash{Symbol=>Integer}] request and connection counters
       def stats
-        return { total: 0, successful: 0, errors: 0, deadline_exceeded: 0, resource_exhausted: 0, active_connections: 0 } unless @native_server
-        @native_server.stats
+        native = @native
+        return native.stats if native
+
+        { total: 0, successful: 0, errors: 0, cancelled: 0, deadline_exceeded: 0,
+          resource_exhausted: 0, unimplemented: 0, active_connections: 0, queued: 0, }
       end
 
       private
 
-      def ensure_native_server
-        @native_server ||= TonicRails::Native::Server.new(
-          @configuration.bind_address,
-          @configuration.max_message_size,
+      def build_native_server
+        config = @configuration
+        native = TonicRails::Native::Server.new(config.bind_address, config.max_message_size)
+        native.on_request(build_callback)
+        native.set_routes(@router.paths)
+        if config.tls?
+          native.set_tls(config.tls_cert_path, config.tls_key_path)
+          native.set_tls_client_ca(config.tls_client_ca_path) if config.tls_client_ca_path
+        end
+        native.set_max_connections(config.max_connections)
+        native.set_concurrency_limit_per_connection(config.concurrency_limit_per_connection)
+        native.set_worker_threads(config.worker_threads || 0)
+        native.set_keepalive(config.keepalive_interval.to_f, config.keepalive_timeout.to_f)
+        native.set_dispatch_queue_size(config.dispatch_queue_size)
+        native.set_log_requests(config.log_requests ? true : false)
+        native.set_compression(config.compression ? true : false)
+        native.set_reflection(config.reflection ? true : false)
+        if config.reflection
+          native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names))
+        end
+        native
+      end
+
+      # The proc the transport calls for every RPC:
+      #   (path, metadata, call) → encoded response String, or nil if streamed
+      def build_callback
+        router = @router
+        call = ->(path, metadata, transport) { router.dispatch(path, metadata, transport) }
+
+        call = @configuration.interceptors.reverse.reduce(call) do |inner, interceptor|
+          lambda do |path, metadata, transport|
+            interceptor.call(path, metadata, -> { inner.call(path, metadata, transport) })
+          end
+        end
+
+        guarded = lambda do |path, metadata, transport|
+          call.call(path, metadata, transport)
+        rescue RpcError
+          raise
+        rescue StandardError => e
+          Tonic::Rails.log_exception(e, path)
+          raise RpcError.new("internal error", code: :internal)
+        end
+
+        wrap_with_rails_executor(guarded)
+      end
+
+      # Each RPC runs inside the Rails executor (or reloader, when code
+      # reloading is on): ActiveRecord connections are returned, query
+      # caches and CurrentAttributes are reset — the same isolation Rack
+      # requests and Active Job get.
+      def wrap_with_rails_executor(callback)
+        return callback unless defined?(::Rails.application) && ::Rails.application
+
+        app = ::Rails.application
+        wrapper = @configuration.reload_handlers ? app.reloader : app.executor
+        ->(path, metadata, transport) { wrapper.wrap { callback.call(path, metadata, transport) } }
+      end
+
+      def spawn_worker(index)
+        native = @native
+        Thread.new do
+          Thread.current.name = "tonic-rails-dispatch-#{index}"
+          native.serve_worker
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          Tonic::Rails.log_exception(e, "dispatch thread #{index}")
+          stop
+          raise
+        end
+      end
+
+      def trap_signals
+        %w[TERM INT].to_h { |signal| [signal, Signal.trap(signal) { stop }] }
+      end
+
+      def wait_for_stop(workers)
+        loop do
+          break if @stop_reader.wait_readable(1)
+
+          dead = workers.reject(&:alive?)
+          unless dead.empty?
+            @configuration.logger&.error("tonic-rails: #{dead.size} dispatch thread(s) died; shutting down")
+            break
+          end
+        end
+      end
+
+      def shutdown(workers)
+        logger = @configuration.logger
+        @state = :stopping
+        Tonic::Rails._set_shutting_down(true)
+        logger&.info("tonic-rails: shutting down, draining for up to #{@configuration.drain_timeout}s")
+
+        @native.begin_shutdown
+        unless @native.wait_for_drain(@configuration.drain_timeout.to_f)
+          logger&.warn("tonic-rails: drain timeout expired; closing remaining connections")
+        end
+        @native.stop_workers
+        workers.each do |worker|
+          worker.join
+        rescue Exception # rubocop:disable Lint/RescueException
+          # Already logged by the worker.
+        end
+        logger&.info("tonic-rails: stopped")
+      end
+
+      def log_startup
+        config = @configuration
+        logger = config.logger
+        return unless logger
+
+        if config.tls?
+          logger.info("tonic-rails: TLS enabled#{" (mutual TLS)" if config.tls_client_ca_path}")
+        else
+          logger.warn("tonic-rails: TLS is not configured; gRPC traffic is plaintext")
+        end
+        logger.info("tonic-rails: reflection enabled") if config.reflection
+        logger.info(
+          "tonic-rails: serving #{@router.service_names.join(", ")} on #{config.bind_address} " \
+          "(#{config.dispatch_threads} dispatch threads)",
         )
       end
     end
