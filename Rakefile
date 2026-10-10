@@ -14,5 +14,5 @@ Rake::ExtensionTask.new("tonic_rails_native") do |ext|
   ext.source_pattern = "**/*.{rs,toml,proto}"
 end
 
-task :spec => :compile
+task spec: :compile
 task default: :spec

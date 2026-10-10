@@ -109,15 +109,9 @@ module Tonic
         positive_integer!(:worker_threads) unless worker_threads.nil?
         %i[drain_timeout keepalive_interval keepalive_timeout].each { |name| non_negative_number!(name) }
 
-        if max_message_size > 0xFFFF_FFFF
-          raise ArgumentError, "max_message_size must be at most 4 GiB"
-        end
-        if tls_cert_path.nil? != tls_key_path.nil?
-          raise ArgumentError, "tls_cert_path and tls_key_path must be set together"
-        end
-        if tls_client_ca_path && !tls?
-          raise ArgumentError, "tls_client_ca_path requires tls_cert_path and tls_key_path"
-        end
+        raise ArgumentError, "max_message_size must be at most 4 GiB" if max_message_size > 0xFFFF_FFFF
+        raise ArgumentError, "tls_cert_path and tls_key_path must be set together" if tls_cert_path.nil? != tls_key_path.nil?
+        raise ArgumentError, "tls_client_ca_path requires tls_cert_path and tls_key_path" if tls_client_ca_path && !tls?
         unless interceptors.respond_to?(:each) && interceptors.all? { |i| i.respond_to?(:call) }
           raise ArgumentError, "interceptors must be an Array of callables"
         end
@@ -129,17 +123,26 @@ module Tonic
 
       def positive_integer!(name)
         value = public_send(name)
-        raise ArgumentError, "#{name} must be a positive Integer, got #{value.inspect}" unless value.is_a?(Integer) && value.positive?
+        return if value.is_a?(Integer) && value.positive?
+
+        raise ArgumentError,
+              "#{name} must be a positive Integer, got #{value.inspect}"
       end
 
       def non_negative_integer!(name)
         value = public_send(name)
-        raise ArgumentError, "#{name} must be a non-negative Integer, got #{value.inspect}" unless value.is_a?(Integer) && !value.negative?
+        return if value.is_a?(Integer) && !value.negative?
+
+        raise ArgumentError,
+              "#{name} must be a non-negative Integer, got #{value.inspect}"
       end
 
       def non_negative_number!(name)
         value = public_send(name)
-        raise ArgumentError, "#{name} must be a non-negative number, got #{value.inspect}" unless value.is_a?(Numeric) && !value.negative?
+        return if value.is_a?(Numeric) && !value.negative?
+
+        raise ArgumentError,
+              "#{name} must be a non-negative number, got #{value.inspect}"
       end
     end
   end

@@ -21,8 +21,8 @@ RSpec.describe "gRPC integration", :integration do
     Echo::V1::EchoService::Stub.new(handle[:address], opts.delete(:creds) || :this_channel_is_insecure, **opts)
   end
 
-  def expect_status(code, message = nil)
-    expect { yield }.to raise_error(GRPC::BadStatus) do |error|
+  def expect_status(code, message = nil, &block)
+    expect(&block).to raise_error(GRPC::BadStatus) do |error|
       expect(error.code).to eq(code)
       expect(error.details.dup.force_encoding(Encoding::UTF_8)).to eq(message) if message
     end
@@ -325,7 +325,7 @@ RSpec.describe "gRPC integration", :integration do
     before(:all) do
       @dir = Dir.mktmpdir("tonic-rails-tls")
       @ca_key = OpenSSL::PKey::EC.generate("prime256v1")
-      @ca = build_cert("tonic-rails test CA", @ca_key, nil, ca: true)
+      @ca = build_cert("tonic-rails test CA", @ca_key, nil, authority: true)
       write("ca.pem", @ca.to_pem)
 
       server_key = OpenSSL::PKey::EC.generate("prime256v1")
@@ -349,11 +349,11 @@ RSpec.describe "gRPC integration", :integration do
 
     def path(name) = File.join(@dir, name)
 
-    def build_cert(cn, key, issuer, ca: false, san: nil)
+    def build_cert(common_name, key, issuer, authority: false, san: nil)
       cert = OpenSSL::X509::Certificate.new
       cert.version = 2
       cert.serial = self.class.serial
-      cert.subject = OpenSSL::X509::Name.parse("/CN=#{cn}")
+      cert.subject = OpenSSL::X509::Name.parse("/CN=#{common_name}")
       cert.issuer = issuer ? issuer.subject : cert.subject
       cert.public_key = key
       cert.not_before = Time.now - 60
@@ -361,8 +361,8 @@ RSpec.describe "gRPC integration", :integration do
       ext = OpenSSL::X509::ExtensionFactory.new
       ext.subject_certificate = cert
       ext.issuer_certificate = issuer || cert
-      cert.add_extension(ext.create_extension("basicConstraints", ca ? "CA:TRUE" : "CA:FALSE", true))
-      cert.add_extension(ext.create_extension("keyUsage", ca ? "keyCertSign,cRLSign" : "digitalSignature", true))
+      cert.add_extension(ext.create_extension("basicConstraints", authority ? "CA:TRUE" : "CA:FALSE", true))
+      cert.add_extension(ext.create_extension("keyUsage", authority ? "keyCertSign,cRLSign" : "digitalSignature", true))
       cert.add_extension(ext.create_extension("subjectAltName", san)) if san
       cert.sign(issuer ? @ca_key : key, OpenSSL::Digest.new("SHA256"))
       cert

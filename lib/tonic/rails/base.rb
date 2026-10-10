@@ -80,8 +80,8 @@ module Tonic
           descriptor = Google::Protobuf::DescriptorPool.generated_pool.lookup(full_name.to_s)
           unless descriptor.is_a?(Google::Protobuf::ServiceDescriptor)
             raise NotConfiguredError,
-              "rpc_service: #{full_name} is not a known protobuf service. " \
-              "Require its generated _pb.rb file (protoc --ruby_out) before declaring the handler."
+                  "rpc_service: #{full_name} is not a known protobuf service. " \
+                  "Require its generated _pb.rb file (protoc --ruby_out) before declaring the handler."
           end
 
           service(full_name)
@@ -140,9 +140,7 @@ module Tonic
       def call_rpc(rpc_name, metadata:, reader:, sender: nil, timeout_ms: nil)
         spec = self.class.grpc_rpcs[rpc_name.to_s]
         raise RpcError.new("method not implemented", code: :unimplemented) unless spec
-        unless respond_to?(spec[:handler])
-          raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented)
-        end
+        raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented) unless respond_to?(spec[:handler])
 
         @grpc_metadata = metadata
         @grpc_deadline_at = timeout_ms && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + (timeout_ms / 1000.0))

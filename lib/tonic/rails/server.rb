@@ -90,7 +90,7 @@ module Tonic
         return native.stats if native
 
         { total: 0, successful: 0, errors: 0, cancelled: 0, deadline_exceeded: 0,
-          resource_exhausted: 0, unimplemented: 0, active_connections: 0, queued: 0, }
+          resource_exhausted: 0, unimplemented: 0, active_connections: 0, queued: 0 }
       end
 
       private
@@ -112,9 +112,7 @@ module Tonic
         native.set_log_requests(config.log_requests ? true : false)
         native.set_compression(config.compression ? true : false)
         native.set_reflection(config.reflection ? true : false)
-        if config.reflection
-          native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names))
-        end
+        native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names)) if config.reflection
         native
       end
 
@@ -207,13 +205,13 @@ module Tonic
         return unless logger
 
         if config.tls?
-          logger.info("tonic-rails: TLS enabled#{" (mutual TLS)" if config.tls_client_ca_path}")
+          logger.info("tonic-rails: TLS enabled#{' (mutual TLS)' if config.tls_client_ca_path}")
         else
           logger.warn("tonic-rails: TLS is not configured; gRPC traffic is plaintext")
         end
         logger.info("tonic-rails: reflection enabled") if config.reflection
         logger.info(
-          "tonic-rails: serving #{@router.service_names.join(", ")} on #{config.bind_address} " \
+          "tonic-rails: serving #{@router.service_names.join(', ')} on #{config.bind_address} " \
           "(#{config.dispatch_threads} dispatch threads)",
         )
       end

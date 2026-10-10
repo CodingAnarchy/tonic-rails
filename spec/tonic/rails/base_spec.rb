@@ -94,7 +94,7 @@ RSpec.describe Tonic::Rails::Base do
     it "passes a string-keyed Hash by default and accepts a Hash response" do
       svc = hash_service do
         def unary(request)
-          { "message" => "#{request["message"]}:#{request["detail"]["mood"]}" }
+          { "message" => "#{request['message']}:#{request['detail']['mood']}" }
         end
       end
       response = testing.call(svc, :Unary, { message: "hi", detail: { mood: :MOOD_HAPPY } })
@@ -127,10 +127,10 @@ RSpec.describe Tonic::Rails::Base do
     end
 
     it "logs unexpected exceptions server-side" do
-      logger = instance_double(Logger)
+      logger = instance_spy(Logger)
       allow(Tonic::Rails.configuration).to receive(:logger).and_return(logger)
-      expect(logger).to receive(:error).with(/RuntimeError: secret internal detail/)
       expect { testing.call(EchoHandler, :Unary, { fail_with: "crash" }) }.to raise_error(Tonic::Rails::RpcError)
+      expect(logger).to have_received(:error).with(/RuntimeError: secret internal detail/)
     end
 
     it "rejects responses of the wrong type as INTERNAL" do
@@ -239,7 +239,8 @@ RSpec.describe Tonic::Rails::Base do
     end
 
     it "raises transport errors from inside the enumeration" do
-      reader = Tonic::Rails::Testing::Reader.new([request_class.encode(request_class.new(message: "a"))], error: [13, "truncated request message"])
+      reader = Tonic::Rails::Testing::Reader.new([request_class.encode(request_class.new(message: "a"))],
+                                                 error: [13, "truncated request message"])
       expect { EchoHandler.new.call_rpc("ClientStream", metadata: {}, reader: reader) }
         .to raise_error(Tonic::Rails::RpcError, "truncated request message")
     end
@@ -256,8 +257,8 @@ RSpec.describe Tonic::Rails::Base do
     it "uses a fresh handler instance per call" do
       svc = hash_service do
         def unary(_request)
-          @calls = (@calls || 0) + 1
-          { "index" => @calls }
+          @calls = (@calls || 0) + 1 # rubocop:disable RSpec/InstanceVariable
+          { "index" => @calls } # rubocop:disable RSpec/InstanceVariable
         end
       end
       2.times { expect(testing.call(svc, :Unary, {}).index).to eq(1) }

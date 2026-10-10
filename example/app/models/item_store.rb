@@ -29,9 +29,9 @@ class ItemStore
     end
   end
 
-  def each_tagged(tag, &block)
+  def each_tagged(tag, &)
     records = @lock.synchronize { @records.values }
     records = records.select { |r| r.tags.include?(tag) } unless tag.empty?
-    records.each(&block)
+    records.each(&)
   end
 end

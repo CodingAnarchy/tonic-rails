@@ -1,0 +1,82 @@
+plugins:
+  - rubocop-rspec
+
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "**/*_pb.rb"
+    - "bench/go_bench/**/*"
+    - "bench/rust_bench/**/*"
+    - "example/vendor/**/*"
+    - "ext/**/target/**/*"
+    - "tmp/**/*"
+    - "vendor/**/*"
+
+Layout/LineLength:
+  Max: 130
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/TrailingCommaInArguments:
+  EnforcedStyleForMultiline: comma
+
+Style/TrailingCommaInArrayLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: comma
+
+Style/Documentation:
+  Enabled: false
+
+Metrics/AbcSize:
+  Max: 40
+Metrics/ClassLength:
+  Max: 250
+Metrics/CyclomaticComplexity:
+  Max: 15
+Metrics/MethodLength:
+  Max: 40
+Metrics/PerceivedComplexity:
+  Max: 15
+Metrics/BlockLength:
+  Exclude:
+    - "spec/**/*"
+    - "*.gemspec"
+    - "**/*.rake"
+
+RSpec/ExampleLength:
+  Max: 30
+RSpec/MultipleExpectations:
+  Enabled: false
+RSpec/DescribeClass:
+  Exclude:
+    - spec/integration/**/*
+RSpec/InstanceVariable:
+  Exclude:
+    - spec/integration/**/*
+RSpec/BeforeAfterAll:
+  Exclude:
+    - spec/integration/**/*
+RSpec/SpecFilePathFormat:
+  Enabled: false
+
+# `x = if ...` / `x = case ...` with the body indented from the variable.
+Layout/EndAlignment:
+  EnforcedStyleAlignWith: variable
+Layout/CaseIndentation:
+  EnforcedStyle: end
+Layout/MultilineMethodCallIndentation:
+  EnforcedStyle: indented
+
+# lib/tonic-rails.rb defines the error classes before loading the rest.
+Style/OneClassPerFile:
+  Exclude:
+    - lib/tonic-rails.rb
+Naming/FileName:
+  Exclude:
+    - lib/tonic-rails.rb
+    - lib/tonic/rails/tasks/tonic-rails.rake

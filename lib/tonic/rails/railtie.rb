@@ -15,13 +15,11 @@ module Tonic
       initializer "tonic_rails.configuration" do |app|
         configuration = Tonic::Rails.configuration
         configuration.logger = ::Rails.logger if ::Rails.logger
-        configuration.reload_handlers = app.config.respond_to?(:enable_reloading) ? app.config.enable_reloading : !app.config.cache_classes
+        configuration.reload_handlers = Railtie.reloading_enabled?(app)
 
         app.config.tonic_rails.each do |key, value|
           setter = "#{key}="
-          unless configuration.respond_to?(setter)
-            raise ArgumentError, "unknown tonic-rails setting config.tonic_rails.#{key}"
-          end
+          raise ArgumentError, "unknown tonic-rails setting config.tonic_rails.#{key}" unless configuration.respond_to?(setter)
 
           configuration.public_send(setter, value)
         end
@@ -44,6 +42,10 @@ module Tonic
             thread.join(configuration.drain_timeout.to_f + 5)
           end
         end
+      end
+
+      def self.reloading_enabled?(app)
+        app.config.respond_to?(:enable_reloading) ? app.config.enable_reloading : !app.config.cache_classes
       end
 
       rake_tasks do

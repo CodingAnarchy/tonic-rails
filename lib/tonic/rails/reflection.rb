@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "set"
 require "google/protobuf/descriptor_pb"
 
 module Tonic

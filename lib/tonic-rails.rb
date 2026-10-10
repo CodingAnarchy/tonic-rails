@@ -66,7 +66,7 @@ module Tonic
         return if defined?(::TonicRails::Native::Server)
 
         raise Error, "tonic-rails native extension is not available " \
-                     "(#{@native_load_error&.message || "unknown error"}). " \
+                     "(#{@native_load_error&.message || 'unknown error'}). " \
                      "Reinstall the gem, or run `bundle exec rake compile` in a checkout."
       end
 
@@ -88,4 +88,4 @@ module Tonic
   end
 end
 
-require "tonic/rails/railtie" if defined?(::Rails::Railtie)
+require "tonic/rails/railtie" if defined?(Rails::Railtie)
