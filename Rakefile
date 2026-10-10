@@ -20,6 +20,10 @@ RbSys::ExtensionTask.new("tonic_rails_native", GEMSPEC) do |ext|
   ext.lib_dir = "lib/tonic/rails"
   ext.cross_compile = true
   ext.cross_platform = CROSS_PLATFORMS
+  # Precompiled gems need no build-time dependencies.
+  ext.cross_compiling do |spec|
+    spec.dependencies.reject! { |dep| dep.name == "rb_sys" }
+  end
 end
 
 RSpec::Core::RakeTask.new(:spec)

@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: bundler
+    directories: ["/", "/example"]
+    schedule:
+      interval: weekly
+    groups:
+      bundler:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories: ["/", "/bench/rust_bench"]
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /bench/go_bench
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

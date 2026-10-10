@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRPCURL_VERSION: v1.9.3
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          cargo-cache: true
+          rustup-components: rustfmt, clippy
+      - name: RuboCop
+        run: bundle exec rubocop
+      - name: rustfmt + clippy
+        run: bundle exec rake cargo:lint
+
+  test:
+    name: test (${{ matrix.os }}, Ruby ${{ matrix.ruby }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ruby: ["3.2", "3.3", "3.4", "4.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          cargo-cache: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Install grpcurl (reflection specs)
+        run: |
+          go install "github.com/fullstorydev/grpcurl/cmd/grpcurl@${GRPCURL_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Compile native extension
+        run: bundle exec rake compile
+      - name: Rust unit tests
+        run: bundle exec rake cargo:test
+      - name: Specs
+        run: bundle exec rspec
+
+  package:
+    name: package (build, install from source, smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          cargo-cache: true
+      - name: Build gem
+        run: gem build tonic-rails.gemspec -o tonic-rails.gem
+      - name: Install into an empty GEM_HOME (compiles the extension)
+        run: |
+          export GEM_HOME="$RUNNER_TEMP/gems" GEM_PATH="$RUNNER_TEMP/gems"
+          gem install --no-document ./tonic-rails.gem
+          cd "$RUNNER_TEMP"
+          ruby -e 'require "tonic-rails"; Tonic::Rails.native_extension!; puts "native extension loaded"'
+      - name: Example app boots
+        working-directory: example
+        run: |
+          bundle install
+          bin/rails tonic_rails:routes | grep -q "/demo.v1.ItemService/GetItem"
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+      - name: bundler-audit
+        run: bundle exec bundle-audit check --update
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: govulncheck (benchmark client)
+        working-directory: bench/go_bench
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  bench:
+    name: bench (builds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: bench/go_bench/go.mod
+          cache-dependency-path: bench/go_bench/go.sum
+      - name: Go client
+        working-directory: bench/go_bench
+        run: go vet ./... && go build ./...
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust reference server
+        working-directory: bench/rust_bench
+        run: cargo build --locked
