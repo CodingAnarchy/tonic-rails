@@ -12,7 +12,7 @@ RSpec.describe "Tonic::Rails::Railtie" do
       require "action_controller/railtie"
       require "tonic-rails"
       require "tonic/rails/testing"
-      require #{File.expand_path("../../fixtures/lib/echo_handler", __dir__).dump}
+      require #{File.expand_path('../../fixtures/lib/echo_handler', __dir__).dump}
 
       class RailtieTestApp < Rails::Application
         config.eager_load = false
@@ -48,7 +48,7 @@ RSpec.describe "Tonic::Rails::Railtie" do
   end
 
   it "does not auto-start outside a server process" do
-    output, status = boot("config.tonic_rails.auto_start = true", 'puts Tonic::Rails.server.running?')
+    output, status = boot("config.tonic_rails.auto_start = true", "puts Tonic::Rails.server.running?")
     expect(status).to be_success, output
     expect(output.lines.last.strip).to eq("false")
   end
