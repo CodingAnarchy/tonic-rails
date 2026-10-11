@@ -232,7 +232,9 @@ impl DataTypeFunctions for StreamSender {}
 #[derive(magnus::TypedData)]
 #[magnus(class = "TonicRails::Native::RequestReader", free_immediately)]
 pub struct RequestReader {
-    rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Shared with the dispatcher, which closes it once the handler
+    /// returns so the body-reading task never outlives the call.
+    rx: Arc<Mutex<Option<mpsc::Receiver<Vec<u8>>>>>,
     error: Arc<RequestError>,
 }
 
@@ -259,11 +261,8 @@ impl RequestError {
 }
 
 impl RequestReader {
-    pub fn new(rx: mpsc::Receiver<Vec<u8>>, error: Arc<RequestError>) -> Self {
-        Self {
-            rx: Mutex::new(Some(rx)),
-            error,
-        }
+    fn new(rx: Arc<Mutex<Option<mpsc::Receiver<Vec<u8>>>>>, error: Arc<RequestError>) -> Self {
+        Self { rx, error }
     }
 
     /// Next raw message, or nil at end of stream.  Check `#error` after nil.
@@ -416,10 +415,11 @@ fn call_handler(
     for (k, v) in metadata {
         md.aset(ruby.str_new(&k), ruby.str_new(&v))?;
     }
+    let request_rx = Arc::new(Mutex::new(Some(request_rx)));
     let call = ruby.hash_new_capa(3);
     call.aset(
         ruby.to_symbol("reader"),
-        RequestReader::new(request_rx, request_error),
+        RequestReader::new(request_rx.clone(), request_error),
     )?;
     call.aset(
         ruby.to_symbol("sender"),
@@ -432,7 +432,12 @@ fn call_handler(
     }
 
     let callback = ruby.get_inner(callback);
-    let result: Value = callback.funcall("call", (ruby.str_new(path), md, call))?;
+    let result = callback.funcall::<_, _, Value>("call", (ruby.str_new(path), md, call));
+    // Unread request messages are no longer wanted: closing the channel
+    // ends the body-reading task now instead of whenever Ruby's GC frees
+    // the reader.
+    drop(request_rx.lock().take());
+    let result = result?;
 
     // A String return is a unary response; anything else means the
     // handler already streamed its messages through the sender.

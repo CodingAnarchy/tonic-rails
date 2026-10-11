@@ -22,6 +22,7 @@ module Tonic
         @state = :stopped
         @stop_reader = nil
         @stop_writer = nil
+        @stop_requested = false
         @lock = Mutex.new
       end
 
@@ -41,6 +42,7 @@ module Tonic
           raise Error, "server is already running" unless @state == :stopped
 
           @state = :starting
+          @stop_requested = false
         end
 
         begin
@@ -50,6 +52,7 @@ module Tonic
           Tonic::Rails.native_extension!
           Tonic::Rails._set_shutting_down(false)
           @stop_reader, @stop_writer = IO.pipe
+          stop if @stop_requested # requested while we were starting up
           @native = build_native_server
           @native.start_server
           @state = :running
@@ -75,6 +78,7 @@ module Tonic
       # Request a graceful stop.  Safe to call from signal handlers and
       # other threads; returns immediately.
       def stop
+        @stop_requested = true
         @stop_writer&.write_nonblock(".", exception: false)
       rescue IOError
         # Already stopped.
