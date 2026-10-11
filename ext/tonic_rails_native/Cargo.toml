@@ -23,7 +23,7 @@ crate-type = ["cdylib"]
 #
 # socket2 enables SO_REUSEPORT for multi-process (Puma worker) scaling.
 [dependencies]
-magnus = "0.8"
+magnus = "0.9"
 rb-sys = "0.9"
 tonic = { version = "0.14", default-features = false, features = ["transport", "router", "server", "tls-ring"] }
 tonic-reflection = { version = "0.14", default-features = false, features = ["server"] }
