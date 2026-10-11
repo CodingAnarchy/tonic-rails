@@ -14,6 +14,7 @@ group :development, :test do
   gem "rspec", "~> 3.13"
   gem "rubocop", "~> 1.70", require: false
   gem "rubocop-rspec", require: false
+  gem "tzinfo-data", platforms: %i[windows jruby] # Rails needs it where there's no system zoneinfo
 end
 
 group :bench do
