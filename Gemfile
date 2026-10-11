@@ -15,3 +15,7 @@ group :development, :test do
   gem "rubocop", "~> 1.70", require: false
   gem "rubocop-rspec", require: false
 end
+
+group :bench do
+  gem "puma", require: false # Rails baseline server for bench/run_bench.sh
+end

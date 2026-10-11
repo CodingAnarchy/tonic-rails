@@ -7,13 +7,16 @@
 # Environment:
 #   BIND             address to listen on (default 127.0.0.1:50051)
 #   DISPATCH_THREADS Ruby dispatch threads (default 16)
+#   WITH_RAILS=1     boot bench/rails_app.rb first, so RPCs run inside the
+#                    Rails executor as in a real Rails app
 #
-# The Rust reference server (bench/rust_bench) implements the same
-# handlers; keep the two in sync so comparisons stay fair.
+# Handler work lives in bench_work.rb, shared with the grpc gem and Rails
+# baselines; the Rust reference server mirrors it.
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__), __dir__)
+require_relative "rails_app" if ENV["WITH_RAILS"] == "1" # before tonic-rails, so its Railtie loads
 require "tonic-rails"
-require "bench_pb"
+require "bench_work"
 
 class BenchService
   include Tonic::Rails::Base
@@ -21,7 +24,6 @@ class BenchService
   rpc_service "bench.v1.BenchService"
   request_format :message
 
-  TAGS = %w[alpha beta gamma].freeze
   EMPTY = Bench::V1::Empty.new.freeze
 
   def ping(_request)
@@ -29,17 +31,13 @@ class BenchService
   end
 
   def work(request)
-    simulate_io(request)
-    Bench::V1::WorkResponse.new(
-      records: Array.new(request.records) { |i| record(i, request.payload_bytes) },
-      checksum: checksum(request.cpu_iterations),
-    )
+    BenchWork.work_response(request)
   end
 
   def stream_records(request)
-    simulate_io(request)
+    BenchWork.simulate_io(request.io_calls, request.io_ms)
     Enumerator.new do |y|
-      request.records.times { |i| y << record(i, request.payload_bytes) }
+      request.records.times { |i| y << BenchWork.record(i, request.payload_bytes) }
     end
   end
 
@@ -47,29 +45,6 @@ class BenchService
     total = 0
     records.each { |r| total += r.value }
     Bench::V1::WorkResponse.new(checksum: total)
-  end
-
-  private
-
-  def simulate_io(request)
-    request.io_calls.times { sleep(request.io_ms / 1000.0) }
-  end
-
-  # Deterministic integer work; must match the Rust implementation.
-  def checksum(iterations)
-    x = 0
-    iterations.times { |i| x = ((x * 31) + i) % 1_000_003 }
-    x
-  end
-
-  def record(index, payload_bytes)
-    Bench::V1::Record.new(
-      id: index,
-      name: "record-#{index}",
-      tags: TAGS,
-      value: index * 7,
-      blob: "x" * payload_bytes,
-    )
   end
 end
 
