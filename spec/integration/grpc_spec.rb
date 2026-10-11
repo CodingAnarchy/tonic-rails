@@ -314,6 +314,103 @@ RSpec.describe "gRPC integration", :integration do
     end
   end
 
+  context "with app-controlled health" do
+    before(:all) do
+      # A shared object: examples get copies of before(:all) ivars.
+      @state = { healthy: true }
+      state = @state
+      @handle = IntegrationServer.start do |config|
+        config.health_check = -> { state[:healthy] == :raise ? raise("db down") : state[:healthy] }
+        config.health_check_interval = 0.05
+      end
+      @health = Grpc::Health::V1::Health::Stub.new(@handle[:address], :this_channel_is_insecure)
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    after do
+      @state[:healthy] = true
+      @handle[:server].serving!
+      eventually(:SERVING) # let the checker catch up before the next example
+      eventually(:SERVING, "echo.v1.EchoService")
+    end
+
+    def status_of(service = "")
+      @health.check(Grpc::Health::V1::HealthCheckRequest.new(service: service)).status
+    end
+
+    def eventually(expected, service = "")
+      Timeout.timeout(5) { sleep 0.02 until status_of(service) == expected }
+      status_of(service)
+    end
+
+    it "follows the health check, while still serving calls" do
+      expect(status_of).to eq(:SERVING)
+      @state[:healthy] = false
+      expect(eventually(:NOT_SERVING)).to eq(:NOT_SERVING)
+      expect(eventually(:NOT_SERVING, "echo.v1.EchoService")).to eq(:NOT_SERVING)
+      expect(stub_for(@handle).unary(request.new(message: "still here")).message).to eq("still here")
+      @state[:healthy] = true
+      expect(eventually(:SERVING)).to eq(:SERVING)
+    end
+
+    it "treats a raising check as unhealthy" do
+      @state[:healthy] = :raise
+      expect(eventually(:NOT_SERVING)).to eq(:NOT_SERVING)
+    end
+
+    it "lets the app mark individual services" do
+      server = @handle[:server]
+      server.not_serving!("echo.v1.EchoService")
+      expect(status_of("echo.v1.EchoService")).to eq(:NOT_SERVING)
+      expect(status_of).to eq(:SERVING)
+    end
+
+    it "keeps manual marks across health check changes" do
+      @handle[:server].not_serving!("echo.v1.EchoService")
+      @state[:healthy] = false
+      expect(eventually(:NOT_SERVING)).to eq(:NOT_SERVING)
+      @state[:healthy] = true
+      expect(eventually(:SERVING)).to eq(:SERVING)
+      expect(status_of("echo.v1.EchoService")).to eq(:NOT_SERVING)
+    end
+
+    it "is not overridden by a manual serving! while the check fails" do
+      @state[:healthy] = false
+      expect(eventually(:NOT_SERVING)).to eq(:NOT_SERVING)
+      @handle[:server].serving!
+      expect(status_of).to eq(:NOT_SERVING)
+    end
+  end
+
+  describe "health status set before start" do
+    it "applies once the server starts" do
+      handle = IntegrationServer.start do |config|
+        config.health_check = nil
+      end
+      handle[:server].not_serving!
+      health = Grpc::Health::V1::Health::Stub.new(handle[:address], :this_channel_is_insecure)
+      expect(health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "")).status).to eq(:NOT_SERVING)
+      IntegrationServer.stop(handle)
+
+      server = Tonic::Rails::Server.new(configuration: Tonic::Rails::Configuration.new.tap do |c|
+        c.bind_address = "127.0.0.1:#{IntegrationServer.free_port}"
+        c.logger = Logger.new(IO::NULL)
+      end)
+      server.register(EchoHandler)
+      server.not_serving!("echo.v1.EchoService")
+      ready = Queue.new
+      thread = Thread.new { server.start(install_signal_handlers: false) { ready << true } }
+      ready.pop
+      health = Grpc::Health::V1::Health::Stub.new(server.configuration.bind_address, :this_channel_is_insecure)
+      expect(health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "echo.v1.EchoService")).status).to eq(:NOT_SERVING)
+      expect(health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "")).status).to eq(:SERVING)
+    ensure
+      server&.stop
+      thread&.join(10)
+    end
+  end
+
   context "with request logging" do
     before(:all) do
       @log = StringIO.new

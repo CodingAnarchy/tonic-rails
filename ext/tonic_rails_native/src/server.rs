@@ -409,6 +409,27 @@ impl NativeServer {
         Ok(())
     }
 
+    /// Set the grpc.health.v1 status of one service ("" = the whole
+    /// server).  Returns false if the server isn't running.
+    pub fn set_health(&self, service: String, serving: bool) -> bool {
+        let Some(r) = self
+            .running
+            .lock()
+            .as_ref()
+            .map(|r| (r.runtime.handle().clone(), r.health.clone()))
+        else {
+            return false;
+        };
+        let (handle, health) = r;
+        let status = if serving {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        handle.block_on(health.set_service_status(service, status));
+        true
+    }
+
     /// Mark everything NOT_SERVING and stop accepting new connections.
     /// Existing connections receive GOAWAY; in-flight RPCs continue.
     pub fn begin_shutdown(&self) {

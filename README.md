@@ -396,6 +396,8 @@ end
 | `tls_client_ca_path` | `nil` | PEM CA bundle; requires client certificates (mutual TLS) |
 | `drain_timeout` | `10` | Seconds to let in-flight calls finish on shutdown |
 | `keepalive_interval`, `keepalive_timeout` | `15`, `5` | HTTP/2 PING interval and timeout, seconds |
+| `health_check` | `nil` | Callable; while false or raising, health reports `NOT_SERVING` |
+| `health_check_interval` | `5` | Seconds between health checks |
 | `compression` | `false` | gzip responses over 1 KiB for clients that accept it |
 | `reflection` | `false` | Serve `grpc.reflection.v1`; exposes your schema |
 | `interceptors` | `[]` | See [Interceptors](#interceptors) |
@@ -442,7 +444,19 @@ Don't combine it with the plugin.
 - **Health checks.** `grpc.health.v1.Health` reports `SERVING` for the
   server (`""`) and every registered service, and flips to `NOT_SERVING`
   as soon as shutdown begins. Point your load balancer or Kubernetes
-  gRPC probes at it.
+  gRPC probes at it. To make readiness reflect your dependencies, add a
+  check that runs every `health_check_interval` seconds (default 5):
+
+  ```ruby
+  config.health_check = -> { ActiveRecord::Base.connection.active? }
+  ```
+
+  While it returns false or raises, the server reports `NOT_SERVING`
+  (calls are still served). You can also mark the server or a service
+  yourself, for example during maintenance:
+  `Tonic::Rails.server.not_serving!("demo.v1.ItemService")` and
+  `serving!`. A service is `SERVING` only while the check passes and it
+  isn't marked otherwise.
 - **Graceful shutdown.** On SIGTERM or SIGINT the server stops
   accepting connections, tells clients to go away (HTTP/2 GOAWAY), lets
   in-flight calls finish for up to `drain_timeout` seconds, then exits.

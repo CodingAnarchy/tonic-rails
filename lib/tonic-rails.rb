@@ -17,6 +17,7 @@ require "tonic/rails/configuration"
 require "tonic/rails/router"
 require "tonic/rails/instrumentation"
 require "tonic/rails/base"
+require "tonic/rails/health"
 require "tonic/rails/reflection"
 require "tonic/rails/server"
 

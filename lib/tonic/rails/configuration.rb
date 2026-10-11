@@ -69,6 +69,17 @@ module Tonic
       # HTTP/2 PING interval and ack timeout, in seconds.  Defaults 15 / 5.
       attr_accessor :keepalive_interval, :keepalive_timeout
 
+      # Callable checked every `health_check_interval` seconds (inside the
+      # Rails executor).  While it returns false or raises, grpc.health.v1
+      # reports NOT_SERVING so readiness probes and load balancers route
+      # around this instance.  Default nil (always SERVING while up).
+      #
+      #   config.health_check = -> { ActiveRecord::Base.connection.active? }
+      attr_accessor :health_check
+
+      # Seconds between health checks.  Default 5.
+      attr_accessor :health_check_interval
+
       # Look handler classes up again on each request so code reloading
       # works.  The Railtie enables this when Rails reloading is on.
       attr_accessor :reload_handlers
@@ -94,6 +105,8 @@ module Tonic
         @keepalive_interval = 15
         @keepalive_timeout = 5
         @reload_handlers = false
+        @health_check = nil
+        @health_check_interval = 5
       end
 
       def tls?
@@ -113,14 +126,23 @@ module Tonic
         raise ArgumentError, "max_message_size must be at most 4 GiB" if max_message_size > 0xFFFF_FFFF
         raise ArgumentError, "tls_cert_path and tls_key_path must be set together" if tls_cert_path.nil? != tls_key_path.nil?
         raise ArgumentError, "tls_client_ca_path requires tls_cert_path and tls_key_path" if tls_client_ca_path && !tls?
-        unless interceptors.respond_to?(:each) && interceptors.all? { |i| i.respond_to?(:call) }
-          raise ArgumentError, "interceptors must be an Array of callables"
-        end
+
+        validate_callables!
 
         self
       end
 
       private
+
+      def validate_callables!
+        raise ArgumentError, "health_check must respond to #call" if health_check && !health_check.respond_to?(:call)
+        unless health_check_interval.is_a?(Numeric) && health_check_interval.positive?
+          raise ArgumentError, "health_check_interval must be a positive number, got #{health_check_interval.inspect}"
+        end
+        return if interceptors.respond_to?(:each) && interceptors.all? { |i| i.respond_to?(:call) }
+
+        raise ArgumentError, "interceptors must be an Array of callables"
+      end
 
       def positive_integer!(name)
         value = public_send(name)
