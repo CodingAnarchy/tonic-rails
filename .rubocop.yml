@@ -72,10 +72,12 @@ Layout/CaseIndentation:
 Layout/MultilineMethodCallIndentation:
   EnforcedStyle: indented
 
-# lib/tonic-rails.rb defines the error classes before loading the rest.
+# lib/tonic-rails.rb defines the error classes before loading the rest;
+# benchmark servers are self-contained single-file scripts.
 Style/OneClassPerFile:
   Exclude:
     - lib/tonic-rails.rb
+    - bench/**/*
 Naming/FileName:
   Exclude:
     - lib/tonic-rails.rb
