@@ -45,6 +45,7 @@ RSpec.describe Tonic::Rails::RpcError do
 
   describe ".decode_details" do
     it "unpacks the details of an encoded google.rpc.Status" do
+      require "google/protobuf/well_known_types"
       unknown = Google::Protobuf::Any.new(type_url: "type.googleapis.com/acme.Unknown", value: "\x08\x01".b)
       status = described_class.new("bad", details: [Echo::V1::Detail.new(mood: :MOOD_HAPPY), unknown]).status_proto
       expect(described_class.decode_details(status)).to eq([Echo::V1::Detail.new(mood: :MOOD_HAPPY), unknown])
