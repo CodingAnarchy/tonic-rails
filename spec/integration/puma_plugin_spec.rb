@@ -60,7 +60,7 @@ RSpec.describe "Puma plugin", :integration do
 
   def stop(puma)
     Process.kill(:TERM, puma[:pid])
-    wait_until(20) { exited?(puma[:pid]) }
+    wait_until(45) { exited?(puma[:pid]) } # CI macOS runners can be slow
   rescue Errno::ESRCH
     nil
   end

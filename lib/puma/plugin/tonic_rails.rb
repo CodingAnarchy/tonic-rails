@@ -55,6 +55,9 @@ Puma::Plugin.create do
     require File.expand_path("config/environment", Dir.pwd)
   end
 
+  # Puma fires its stop hooks from its TERM trap handler, so this must
+  # not block indefinitely: allow the server's drain timeout plus a margin,
+  # then kill it.
   def stop_grpc
     pid = @grpc_pid
     return unless pid
@@ -62,9 +65,23 @@ Puma::Plugin.create do
     @grpc_pid = nil
     log "tonic-rails: stopping gRPC server (pid #{pid})"
     Process.kill(:TERM, pid)
-    Process.wait(pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + stop_timeout
+    until Process.waitpid(pid, Process::WNOHANG)
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        log "tonic-rails: gRPC server (pid #{pid}) did not stop in #{stop_timeout}s; killing it"
+        Process.kill(:KILL, pid)
+        Process.wait(pid)
+        break
+      end
+      sleep 0.05
+    end
   rescue Errno::ESRCH, Errno::ECHILD
     nil
+  end
+
+  def stop_timeout
+    drain = defined?(Tonic::Rails) ? Tonic::Rails.configuration.drain_timeout.to_f : 10.0
+    drain + 5
   end
 
   def monitor_grpc
