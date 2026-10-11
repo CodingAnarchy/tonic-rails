@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
+use crate::log::{Level, LogSink};
 use magnus::{Error, RString, Ruby, Value, prelude::*, typed_data::DataTypeFunctions, value::Opaque};
 use parking_lot::Mutex;
 use rb_sys::{RB_NOGVL_INTR_FAIL, rb_nogvl, rb_thread_call_with_gvl};
@@ -308,6 +309,7 @@ pub struct DispatchContext {
     pub response_tx: mpsc::Sender<StreamMessage>,
     pub request_rx: mpsc::Receiver<Vec<u8>>,
     pub request_error: Arc<RequestError>,
+    pub log: LogSink,
 }
 
 /// Bounds on how long one thread keeps the GVL to drain a busy queue.
@@ -357,13 +359,14 @@ pub fn dispatch(first: Box<DispatchContext>, queue: &crossbeam_channel::Receiver
 
 fn run_guarded(ctx: DispatchContext) {
     let response_tx = ctx.response_tx.clone();
+    let log = ctx.log.clone();
     if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run_handler(ctx))) {
         let msg = panic
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or("unknown panic");
-        eprintln!("tonic-rails: panic in dispatch: {msg}");
+        log.log(Level::Error, &format!("panic in dispatch: {msg}"));
         let _ = response_tx.try_send(StreamMessage::End(Some((
             tonic::Code::Internal as u32,
             "internal error".into(),
@@ -381,6 +384,7 @@ fn run_handler(ctx: DispatchContext) {
         response_tx,
         request_rx,
         request_error,
+        log,
     } = ctx;
 
     let end = match call_handler(
@@ -394,7 +398,7 @@ fn run_handler(ctx: DispatchContext) {
         request_error,
     ) {
         Ok(()) => StreamMessage::End(None),
-        Err(e) => StreamMessage::End(Some(error_status(&e))),
+        Err(e) => StreamMessage::End(Some(error_status(&e, &log))),
     };
     // Ignore failures: the client may already be gone.
     let _ = send_with_interrupts(&ruby, &response_tx, end);
@@ -451,7 +455,7 @@ fn call_handler(
 /// Map a Ruby exception to a gRPC status.  Only exceptions carrying an
 /// Integer `@code` (i.e. `Tonic::Rails::RpcError`) expose their message;
 /// anything else becomes a generic INTERNAL so details never leak.
-fn error_status(e: &Error) -> (u32, String) {
+fn error_status(e: &Error, log: &LogSink) -> (u32, String) {
     if let Some(exc) = e.value() {
         let code = exc
             .funcall::<_, _, Option<i64>>("instance_variable_get", ("@code",))
@@ -464,9 +468,9 @@ fn error_status(e: &Error) -> (u32, String) {
         let description = exc
             .funcall::<_, _, String>("inspect", ())
             .unwrap_or_else(|_| "unknown exception".into());
-        eprintln!(
-            "tonic-rails: unhandled exception in dispatch: {}",
-            crate::framing::sanitize_for_log(&description)
+        log.log(
+            Level::Error,
+            &format!("unhandled exception in dispatch: {description}"),
         );
     }
     (tonic::Code::Internal as u32, "internal error".into())

@@ -55,6 +55,7 @@ module Tonic
           stop if @stop_requested # requested while we were starting up
           @native = build_native_server
           @native.start_server
+          log_pump = spawn_log_pump
           @state = :running
 
           request_log = subscribe_request_logger
@@ -69,6 +70,7 @@ module Tonic
           ActiveSupport::Notifications.unsubscribe(request_log) if request_log
           previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
           @native&.stop_server
+          stop_log_pump(log_pump)
           @native = nil
           [@stop_reader, @stop_writer].each { |io| io.close if io && !io.closed? }
           @stop_reader = @stop_writer = nil
@@ -161,6 +163,35 @@ module Tonic
         return unless @configuration.log_requests && @configuration.logger
 
         Instrumentation::RequestLogger.new(@configuration.logger).subscribe
+      end
+
+      # Transport events from the Rust side (rejected calls, expired
+      # deadlines, refused connections, faults) can't call Ruby directly;
+      # this thread drains them into the configured logger.
+      def spawn_log_pump
+        native = @native
+        logger = @configuration.logger
+        @log_pump_running = true
+        Thread.new do
+          Thread.current.name = "tonic-rails-log"
+          write_transport_logs(logger, native.next_log_events(0.25)) while @log_pump_running
+          write_transport_logs(logger, native.next_log_events(0)) # whatever shutdown produced
+        rescue StandardError => e
+          warn("tonic-rails: log thread stopped: #{e.class}: #{e.message}")
+        end
+      end
+
+      def stop_log_pump(thread)
+        return unless thread
+
+        @log_pump_running = false
+        thread.join(2)
+      end
+
+      def write_transport_logs(logger, events)
+        return unless logger
+
+        events.each { |level, message| logger.public_send(level, "tonic-rails: #{message}") }
       end
 
       def spawn_worker(index)

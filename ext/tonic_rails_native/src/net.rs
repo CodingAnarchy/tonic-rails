@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::Stream;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 
+use crate::log::{Level, LogSink};
+
 /// Bind with SO_REUSEADDR + SO_REUSEPORT so several worker processes can
 /// share a port (the kernel load-balances accepts) and restarts don't
 /// fail on TIME_WAIT.  Must be called inside a tokio runtime context.
@@ -110,6 +112,7 @@ pub struct LimitedIncoming<S> {
     pub inner: S,
     pub semaphore: Arc<Semaphore>,
     pub active: Arc<AtomicUsize>,
+    pub log: LogSink,
 }
 
 impl<S> Stream for LimitedIncoming<S>
@@ -138,7 +141,10 @@ where
                 }
                 Err(_) => {
                     let active = self.active.load(Ordering::Relaxed);
-                    eprintln!("tonic-rails: connection refused: max_connections reached ({active} active)");
+                    self.log.log(
+                        Level::Warn,
+                        &format!("connection refused: max_connections reached ({active} active)"),
+                    );
                 }
             }
         }

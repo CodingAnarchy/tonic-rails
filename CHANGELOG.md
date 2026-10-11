@@ -17,9 +17,11 @@ minor versions may contain breaking changes.
 
 - `log_requests` now logs one line per RPC through the configured (Rails)
   logger instead of stderr.
-- The native transport no longer writes handler outcomes (for example
-  `NOT_FOUND` raised by a handler) to stderr; only rejections decided by the
-  transport itself are logged there.
+- Transport events from the native extension (rejected calls, expired
+  deadlines, refused connections, faults) now go through the configured
+  (Rails) logger, with severities, instead of stderr. Handler outcomes such
+  as a `NOT_FOUND` raised by a handler are no longer logged by the transport
+  at all; use `log_requests` or the instrumentation event for those.
 
 ## [0.1.0] - 2026-10-10
 
