@@ -73,6 +73,10 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: ${{ env.RUBY_VERSIONS }}
+          # rb-sys-dock images carry the Rust that was stable when they
+          # were built; the crate (and tonic 0.14) need edition 2024 / Rust
+          # 1.88+, so install current stable for the image's target first.
+          pre-script: rustup toolchain install stable --profile minimal --target "$RUST_TARGET" && rustup default stable
       - uses: actions/upload-artifact@v4
         with:
           name: gem-${{ matrix.platform }}

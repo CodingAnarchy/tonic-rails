@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "bundler/gem_tasks"
-require "rspec/core/rake_task"
 require "rb_sys/extensiontask"
 
 GEMSPEC = Gem::Specification.load("tonic-rails.gemspec")
@@ -26,14 +25,21 @@ RbSys::ExtensionTask.new("tonic_rails_native", GEMSPEC) do |ext|
   end
 end
 
-RSpec::Core::RakeTask.new(:spec)
-task spec: :compile
+# Development-only tasks: the cross-compilation containers install
+# just enough to build the extension.
+begin
+  require "rspec/core/rake_task"
+  RSpec::Core::RakeTask.new(:spec)
+  task spec: :compile
+rescue LoadError
+  nil
+end
 
 begin
   require "rubocop/rake_task"
   RuboCop::RakeTask.new
 rescue LoadError
-  # RuboCop is a development dependency only.
+  nil
 end
 
 namespace :cargo do
