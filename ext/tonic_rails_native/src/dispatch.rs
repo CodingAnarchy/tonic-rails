@@ -83,7 +83,7 @@ fn grpc_response(body: TonicBody, compressed: bool) -> Response<TonicBody> {
 
 impl DispatchInner {
     fn reject(&self, path: &str, start: Instant, code: Code, message: &str) -> Response<TonicBody> {
-        self.stats.record(path, code as u32, message, start);
+        self.stats.record(path, code as u32, message, start, true);
         grpc_response(TonicBody::new(ErrorBody::new(code, message)), false)
     }
 

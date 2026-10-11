@@ -7,6 +7,20 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `process_rpc.tonic_rails` ActiveSupport::Notifications event for every RPC,
+  with path, service, rpc, metadata, status and code (for APM agents,
+  OpenTelemetry and custom subscribers).
+
+### Changed
+
+- `log_requests` now logs one line per RPC through the configured (Rails)
+  logger instead of stderr.
+- The native transport no longer writes handler outcomes (for example
+  `NOT_FOUND` raised by a handler) to stderr; only rejections decided by the
+  transport itself are logged there.
+
 ## [0.1.0] - 2026-10-10
 
 First public release.

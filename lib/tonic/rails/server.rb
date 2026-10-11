@@ -57,6 +57,7 @@ module Tonic
           @native.start_server
           @state = :running
 
+          request_log = subscribe_request_logger
           previous_handlers = install_signal_handlers ? trap_signals : {}
           workers = Array.new(@configuration.dispatch_threads) { |i| spawn_worker(i) }
           log_startup
@@ -65,6 +66,7 @@ module Tonic
           wait_for_stop(workers)
           shutdown(workers)
         ensure
+          ActiveSupport::Notifications.unsubscribe(request_log) if request_log
           previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
           @native&.stop_server
           @native = nil
@@ -113,7 +115,6 @@ module Tonic
         native.set_worker_threads(config.worker_threads || 0)
         native.set_keepalive(config.keepalive_interval.to_f, config.keepalive_timeout.to_f)
         native.set_dispatch_queue_size(config.dispatch_queue_size)
-        native.set_log_requests(config.log_requests ? true : false)
         native.set_compression(config.compression ? true : false)
         native.set_reflection(config.reflection ? true : false)
         native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names)) if config.reflection
@@ -133,7 +134,7 @@ module Tonic
         end
 
         guarded = lambda do |path, metadata, transport|
-          call.call(path, metadata, transport)
+          Instrumentation.instrument(path, metadata) { call.call(path, metadata, transport) }
         rescue RpcError
           raise
         rescue StandardError => e
@@ -154,6 +155,12 @@ module Tonic
         app = ::Rails.application
         wrapper = @configuration.reload_handlers ? app.reloader : app.executor
         ->(path, metadata, transport) { wrapper.wrap { callback.call(path, metadata, transport) } }
+      end
+
+      def subscribe_request_logger
+        return unless @configuration.log_requests && @configuration.logger
+
+        Instrumentation::RequestLogger.new(@configuration.logger).subscribe
       end
 
       def spawn_worker(index)
