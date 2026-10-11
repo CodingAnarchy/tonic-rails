@@ -299,15 +299,17 @@ RSpec.describe Tonic::Rails::Client, :integration do
         config.dispatch_threads = 1
         config.dispatch_queue_size = 1
       end
-      blockers = Array.new(2) do
-        thread = Thread.new { echo(busy[:address]).unary(sleep_ms: 300) }
-        sleep 0.05
+      # One call running on the only dispatch thread, then one in the queue.
+      blockers = [[1, 0], [2, 1]].map do |total, queued|
+        thread = Thread.new { echo(busy[:address]).unary(sleep_ms: 500) }
+        Timeout.timeout(5) { sleep 0.01 until busy[:server].stats.values_at(:total, :queued) == [total, queued] }
         thread
       end
 
       expect_rpc_error(:resource_exhausted, /dispatch queue full/) { echo(busy[:address]).unary({}) }
-      retrying = echo(busy[:address], retries: { codes: [:resource_exhausted], max_attempts: 5, initial_backoff: 1,
-                                                 multiplier: 1, max_backoff: 1 })
+      # Waits of up to 2s each are all but certain to outlast the blockers.
+      retrying = echo(busy[:address], retries: { codes: [:resource_exhausted], max_attempts: 5, initial_backoff: 2,
+                                                 multiplier: 1, max_backoff: 2 })
       attempts = attempts_of { expect(retrying.unary(message: "made it").message).to eq("made it") }
       expect(attempts.first).to be > 1
       blockers.each(&:join)
