@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "timeout"
+require_relative "../fixtures/lib/counting_stream_handler"
 require_relative "../fixtures/lib/echo_handler"
 require_relative "../support/integration_server"
 require_relative "../support/test_certificates"
@@ -61,9 +62,10 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(client.stub(descriptor)).to be(stub)
     end
 
-    it "names methods in snake_case and refuses streaming RPCs" do
+    it "names methods in snake_case and refuses client-streaming RPCs" do
       expect(stub).to respond_to(:unary, :server_stream, :client_stream, :bidi)
-      expect { stub.server_stream(count: 2) }.to raise_error(NotImplementedError, /ServerStream is a streaming RPC/)
+      expect { stub.client_stream }.to raise_error(NotImplementedError, /ClientStream is a client-streaming RPC/)
+      expect { stub.bidi }.to raise_error(NotImplementedError, /Bidi is a client-streaming RPC/)
     end
 
     it "rejects unknown services and the wrong request type" do
@@ -155,6 +157,101 @@ RSpec.describe Tonic::Rails::Client, :integration do
     end
   end
 
+  describe "server streaming" do
+    before(:all) { @counting = IntegrationServer.start(services: [CountingStreamHandler]) }
+    after(:all) { IntegrationServer.stop(@counting) }
+
+    before { CountingStreamHandler.ended.clear }
+
+    let(:counting) { described_class.new(@counting[:address], tls: false).stub("echo.v1.EchoService") }
+
+    def stream_ended = CountingStreamHandler.ended.pop(timeout: 5)
+
+    it "yields each response" do
+      stream = stub.server_stream(message: "hi", count: 3)
+      expect(stream).to be_a(Tonic::Rails::Client::ServerStream)
+      expect(stream.map { |response| [response.message, response.index] }).to eq([["hi", 0], ["hi", 1], ["hi", 2]])
+      expect(stub.server_stream({ count: 0 }).to_a).to eq([])
+      expect(stub.server_stream(count: 2).each).to be_a(Enumerator)
+      expect(stub.server_stream({ count: 1 }, deadline: 5).first.deadline_ms).to be_between(4_000, 5_000)
+    end
+
+    it "yields responses as they arrive, not when the stream ends" do
+      started = monotonic
+      arrived = counting.server_stream(count: 3, sleep_ms: 300).map { monotonic - started }
+      expect(arrived.first).to be < 0.25
+      expect(arrived.last).to be > 0.5
+      expect(stream_ended).to eq(:completed)
+    end
+
+    it "returns headers and trailers once the stream has ended" do
+      stream = stub.server_stream(message: "with-metadata", count: 2)
+      expect(stream.headers).to be_nil
+      stream.to_a
+      expect(stream.headers).to include("x-echo-header" => "h1", "x-echo-bin" => "\x00\xFF".b)
+      expect(stream.trailers).to eq("x-echo-trailer" => "t1")
+    end
+
+    it "can be read once" do
+      stream = stub.server_stream(count: 1)
+      stream.to_a
+      expect { stream.to_a }.to raise_error(Tonic::Rails::Error, /already been read/)
+    end
+
+    it "raises RpcError after the responses that came before it" do
+      received = []
+      expect_rpc_error(:aborted, "failed mid-stream") do
+        counting.server_stream(count: 2, fail_with: "mid-stream").each { |response| received << response.index }
+      end
+      expect(received).to eq([0, 1])
+      expect_rpc_error(:not_found) { stub.server_stream(fail_with: "rpc:not_found").to_a }
+    end
+
+    it "cancels the call on the server when the reader stops early" do
+      expect(counting.server_stream.first(3).map(&:index)).to eq([0, 1, 2])
+      expect(stream_ended).to eq(:cancelled)
+
+      counting.server_stream.each { |response| break if response.index == 1 }
+      expect(stream_ended).to eq(:cancelled)
+
+      stop = proc { raise ArgumentError, "stop" }
+      expect { counting.server_stream.each(&stop) }.to raise_error(ArgumentError, "stop")
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "holds back a fast server while the reader is slow" do
+      sent = nil
+      counting.server_stream(pad_bytes: 64 * 1024).each do # rubocop:disable Lint/UnreachableLoop
+        sleep 0.5
+        sent = CountingStreamHandler.sent
+        break
+      end
+      # Unbounded, the server would have sent thousands by now.
+      expect(sent).to be < 200
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "applies the deadline to the whole stream, including a slow reader" do
+      received = []
+      expect_rpc_error(:deadline_exceeded) do
+        counting.server_stream({ sleep_ms: 100 }, deadline: 0.35).each { |response| received << response.index }
+      end
+      expect(received.size).to be_between(2, 5)
+
+      # The stream has no end: only the deadline stops it.  Messages read
+      # ahead before it passed are still yielded, so allow for those.
+      started = monotonic
+      expect_rpc_error(:deadline_exceeded) { counting.server_stream({}, deadline: 0.3).each { sleep 0.05 } }
+      expect(monotonic - started).to be < 3
+    end
+
+    it "is interrupted by Timeout" do
+      started = monotonic
+      expect { Timeout.timeout(0.2) { counting.server_stream(sleep_ms: 5_000).to_a } }.to raise_error(Timeout::Error)
+      expect(monotonic - started).to be < 1
+    end
+  end
+
   describe "the GVL" do
     it "lets other threads run during a call" do
       # Holding the GVL for the call would leave this thread no turns at all.
@@ -194,6 +291,7 @@ RSpec.describe Tonic::Rails::Client, :integration do
         unused = nil
         GC.start # frees a client connected in the parent
         messages = Array.new(3) { |i| stub.unary(message: "child #{i}").message }
+        messages += stub.server_stream(message: "child stream", count: 2).map(&:message)
         writer.write(messages.join(","))
         writer.close
         exit!(0)
@@ -205,7 +303,7 @@ RSpec.describe Tonic::Rails::Client, :integration do
 
       expect(stub.unary(message: "during fork").message).to eq("during fork")
       _, status = Process.wait2(pid)
-      expect(reader.read).to eq("child 0,child 1,child 2")
+      expect(reader.read).to eq("child 0,child 1,child 2,child stream,child stream")
       expect(status).to be_success
       expect(stub.unary(message: "after fork").message).to eq("after fork")
     ensure
@@ -291,12 +389,14 @@ RSpec.describe Tonic::Rails::Client, :integration do
       subscription = ActiveSupport::Notifications.subscribe("request_rpc.tonic_rails") { |event| events << event }
       stub.unary({})
       expect { stub.unary(fail_with: "rpc:not_found") }.to raise_error(Tonic::Rails::RpcError)
+      stub.server_stream(count: 2).to_a
 
       expect(events.map(&:payload)).to match(
         [
           a_hash_including(path: "/echo.v1.EchoService/Unary", service: "echo.v1.EchoService", rpc: "Unary",
                            address: address, code: 0, status: :ok),
           a_hash_including(code: 5, status: :not_found),
+          a_hash_including(path: "/echo.v1.EchoService/ServerStream", code: 0, status: :ok),
         ],
       )
     ensure

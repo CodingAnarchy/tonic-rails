@@ -20,7 +20,7 @@
 //! Modules:
 //! - [`framing`]  — gRPC wire format (frames, gzip, timeouts, trailers)
 //! - [`body`]     — response bodies and request stats
-//! - [`client`]   — `TonicRails::Native::Channel`, for outgoing calls
+//! - [`client`]   — `TonicRails::Native::Channel` and `ResponseStream`, for outgoing calls
 //! - [`dispatch`] — the fallback tower service that queues RPCs for Ruby
 //! - [`gvl`]      — GVL release/acquire and the Ruby stream objects
 //! - [`log`]      — transport log events for Ruby's logger
@@ -38,7 +38,7 @@ mod server;
 
 use magnus::{Error, Ruby, function, method, prelude::*};
 
-use client::NativeChannel;
+use client::{NativeChannel, ResponseStream};
 use gvl::{RequestReader, StreamSender};
 use server::NativeServer;
 
@@ -101,6 +101,13 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let channel = native.define_class("Channel", ruby.class_object())?;
     channel.define_singleton_method("new", function!(NativeChannel::new, 4))?;
     channel.define_method("unary", method!(NativeChannel::unary, 4))?;
+    channel.define_method("server_streaming", method!(NativeChannel::server_streaming, 4))?;
+
+    let stream = native.define_class("ResponseStream", ruby.class_object())?;
+    stream.undef_default_alloc_func();
+    stream.define_method("next", method!(ResponseStream::next, 0))?;
+    stream.define_method("result", method!(ResponseStream::result, 0))?;
+    stream.define_method("close", method!(ResponseStream::close, 0))?;
 
     Ok(())
 }

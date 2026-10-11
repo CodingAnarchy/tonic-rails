@@ -12,6 +12,7 @@ module Tonic
     #   item = items.get_item(Demo::V1::GetItemRequest.new(id: 1))
     #   item = items.get_item(id: 1)
     #   item = items.get_item({ id: 1 }, deadline: 0.5, metadata: { "x-request-id" => request_id })
+    #   items.list_items(category: "books").each { |item| ... }
     #
     # Stubs are built from the protobuf descriptors that
     # `tonic_rails:compile_protos` (protoc --ruby_out) generates; no
@@ -106,26 +107,47 @@ module Tonic
       # Make a unary call.  Stubs call this; use them instead.
       # @api private
       def unary(path, input, output, request, deadline: nil, metadata: {}, return_call: false)
-        message = case request
-        when input then request
-        when Hash then input.new(request)
-        else raise TypeError, "#{path} expects a #{input} or Hash, got #{request.class}"
-        end
-        metadata = metadata.empty? ? @metadata : @metadata.merge(Metadata.encode(metadata))
-        timeout_ms = timeout_ms(deadline)
+        message = request_message(path, input, request)
+        metadata = call_metadata(metadata)
+        timeout_ms = remaining_ms(deadline_at(deadline))
 
         Instrumentation.instrument_request(path, address, metadata) do
           code, error_message, response, headers, trailers, details =
             @native.unary(path, input.encode(message), metadata, timeout_ms)
           headers = decode_metadata(headers)
           trailers = decode_metadata(trailers)
-          unless code.zero?
-            raise RpcError.new(error_message.empty? ? nil : error_message, code: code, metadata: trailers,
-                                                                           details: RpcError.decode_details(details))
-          end
+          check_status!(code, error_message, trailers, details)
 
           response = decode_response(output, response, path)
           return_call ? Call.new(response: response, headers: headers, trailers: trailers) : response
+        end
+      end
+
+      # Start a server-streaming call.  Stubs call this; use them instead.
+      # @api private
+      def server_streaming(path, input, output, request, deadline: nil, metadata: {})
+        message = request_message(path, input, request)
+        metadata = call_metadata(metadata)
+        # Fixed now, so the stream keeps the deadline of the RPC this
+        # thread is handling even if it's read later.
+        deadline_at = deadline_at(deadline)
+
+        ServerStream.new(path) do |stream, block|
+          timeout_ms = remaining_ms(deadline_at)
+          Instrumentation.instrument_request(path, address, metadata) do
+            native = @native.server_streaming(path, input.encode(message), metadata, timeout_ms)
+            begin
+              while (bytes = native.next)
+                block.call(decode_response(output, bytes, path))
+              end
+              code, error_message, _, headers, trailers, details = native.result
+              trailers = decode_metadata(trailers)
+              stream.finish(decode_metadata(headers), trailers)
+              check_status!(code, error_message, trailers, details)
+            ensure
+              native.close
+            end
+          end
         end
       end
 
@@ -165,23 +187,46 @@ module Tonic
               "#{name} is not a known protobuf service. Require its generated _pb.rb file (protoc --ruby_out) first."
       end
 
-      # Milliseconds the call may take: the call's own deadline, or else
-      # the earlier of the client's default and the deadline of the RPC
-      # being handled.
-      def timeout_ms(deadline)
+      def request_message(path, input, request)
+        case request
+        when input then request
+        when Hash then input.new(request)
+        else raise TypeError, "#{path} expects a #{input} or Hash, got #{request.class}"
+        end
+      end
+
+      def call_metadata(metadata)
+        metadata.empty? ? @metadata : @metadata.merge(Metadata.encode(metadata))
+      end
+
+      # When the call must end, as a monotonic clock time: the call's own
+      # deadline, or else the earlier of the client's default and the
+      # deadline of the RPC being handled.
+      def deadline_at(deadline)
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        deadline_at = case deadline
+        case deadline
         when nil then [(now + @deadline if @deadline), self.class.current_deadline].compact.min
         when Numeric then now + deadline
         when Time then now + (deadline - Time.now)
         else raise ArgumentError, "deadline must be seconds (Numeric) or a Time, got #{deadline.class}"
         end
+      end
+
+      # Milliseconds left until `deadline_at`, or nil for no deadline.
+      def remaining_ms(deadline_at)
         return unless deadline_at
 
-        remaining = deadline_at - now
+        remaining = deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         raise RpcError.new("deadline exceeded", code: :deadline_exceeded) unless remaining.positive?
 
         (remaining * 1000).ceil
+      end
+
+      def check_status!(code, message, trailers, details)
+        return if code.zero?
+
+        raise RpcError.new(message.empty? ? nil : message, code: code, metadata: trailers,
+                                                           details: RpcError.decode_details(details))
       end
 
       # Wire-form [name, value] pairs to a Hash: `-bin` values decoded,
@@ -226,21 +271,27 @@ module Tonic
           def define_rpc(method)
             path = "/#{service_name}/#{method.name}"
             name = ActiveSupport::Inflector.underscore(method.name)
-            if method.client_streaming || method.server_streaming
+            if method.client_streaming
               define_method(name) do |*, **|
-                raise NotImplementedError, "#{path} is a streaming RPC; the tonic-rails client makes unary calls only"
+                raise NotImplementedError,
+                      "#{path} is a client-streaming RPC; the tonic-rails client makes unary and server-streaming calls"
+              end
+              return
+            end
+
+            input = method.input_type.msgclass
+            output = method.output_type.msgclass
+            if method.server_streaming
+              define_method(name) do |request = nil, deadline: nil, metadata: {}, **fields|
+                request = rpc_request(name, request, fields)
+                @client.server_streaming(path, input, output, request, deadline: deadline, metadata: metadata)
               end
             else
-              input = method.input_type.msgclass
-              output = method.output_type.msgclass
               # `get_item(id: 1)` works as well as `get_item({ id: 1 })`.
               define_method(name) do |request = nil, deadline: nil, metadata: {}, return_call: false, **fields|
-                unless request.nil? || fields.empty?
-                  raise ArgumentError, "#{name}: pass the request or its fields, not both (#{fields.keys.join(', ')})"
-                end
-
-                @client.unary(path, input, output, request || fields, deadline: deadline, metadata: metadata,
-                                                                      return_call: return_call)
+                request = rpc_request(name, request, fields)
+                @client.unary(path, input, output, request, deadline: deadline, metadata: metadata,
+                                                            return_call: return_call)
               end
             end
           end
@@ -255,6 +306,64 @@ module Tonic
 
         def inspect
           "#<#{self.class.inspect} #{client.address}>"
+        end
+
+        private
+
+        def rpc_request(name, request, fields)
+          unless request.nil? || fields.empty?
+            raise ArgumentError, "#{name}: pass the request or its fields, not both (#{fields.keys.join(', ')})"
+          end
+
+          request || fields
+        end
+      end
+
+      # The responses of a server-streaming call.  Nothing is sent until
+      # it's read; then messages are yielded as they arrive, a few at most
+      # buffered ahead of the reader.
+      #
+      #   items.list_items(category: "books").each { |item| ... }
+      #   items.list_items(category: "books").first(10)
+      #
+      # Stopping early (`break`, `first(n)`, an exception) cancels the call.
+      # An error from the server raises Tonic::Rails::RpcError after the
+      # messages that came before it.  A stream can be read once.
+      class ServerStream
+        include Enumerable
+
+        # @return [Hash, nil] response headers, once the stream has ended
+        attr_reader :headers
+
+        # @return [Hash, nil] trailing metadata, once the stream has ended
+        attr_reader :trailers
+
+        # @api private
+        def initialize(path, &read)
+          @path = path
+          @read = read
+        end
+
+        # @yieldparam response [Google::Protobuf::AbstractMessage]
+        # @return [self, Enumerator] an Enumerator without a block
+        def each(&block)
+          return enum_for(:each) unless block
+          raise Error, "the #{@path} stream has already been read" unless @read
+
+          read = @read
+          @read = nil
+          read.call(self, block)
+          self
+        end
+
+        # @api private
+        def finish(headers, trailers)
+          @headers = headers
+          @trailers = trailers
+        end
+
+        def inspect
+          "#<#{self.class.name} #{@path}>"
         end
       end
     end

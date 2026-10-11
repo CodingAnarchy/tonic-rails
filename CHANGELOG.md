@@ -18,6 +18,13 @@ minor versions may contain breaking changes.
   a custom CA or mutual TLS. Clients keep working across `fork` with no
   hooks, and `Timeout` and `Thread#raise` interrupt calls. Each call
   publishes a `request_rpc.tonic_rails` event. Closes #37.
+- Client: server-streaming calls. The stub method returns a stream that
+  yields each message as it arrives. A slow reader holds the server back
+  through HTTP/2 flow control, and stopping early (`break`, `first(n)`,
+  an exception) cancels the call. The deadline covers the whole stream,
+  an error partway through raises `RpcError` after the messages before
+  it, and `headers` and `trailers` are available once the stream ends.
+  Closes #38.
 
 ## [0.5.0] - 2026-10-11
 
