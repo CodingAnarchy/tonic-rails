@@ -70,17 +70,14 @@ jobs:
           bundler-cache: false
           cargo-cache: true
           cargo-vendor: true
-      # Use the rb-sys-dock image matching the locked rb_sys (otherwise the
-      # tool falls back to the gemspec's minimum, whose image lacks newer Rubies).
-      - name: rb-sys-dock image tag
-        id: rb-sys
-        run: echo "version=$(grep -oE '^    rb_sys \([0-9.]+\)' Gemfile.lock | grep -oE '[0-9.]+')" >> "$GITHUB_OUTPUT"
-      - uses: oxidize-rb/actions/cross-gem@v1
+      # Pinned past v1: v1 reads rb_sys's version from the first matching
+      # Gemfile.lock line (the gemspec constraint), selecting a stale
+      # rb-sys-dock CLI and image. main uses the locked version.
+      - uses: oxidize-rb/actions/cross-gem@e36686534da417104bb84432725f4bb881ee34c3 # main
         id: cross-gem
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: ${{ env.RUBY_VERSIONS }}
-          tag: ${{ steps.rb-sys.outputs.version }}
           # rb-sys-dock images carry the Rust that was stable when they
           # were built; the crate (and tonic 0.14) need edition 2024 / Rust
           # 1.88+, so install current stable for the image's target first.
