@@ -7,6 +7,8 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-11
+
 ### Added
 
 - Client: `Tonic::Rails::Client` makes unary calls to other gRPC
@@ -164,7 +166,8 @@ First public release.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
   macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
-[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.2.0...v0.3.0
