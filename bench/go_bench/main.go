@@ -1,23 +1,24 @@
-// Benchmark client for tonic-rails.
+// Load generator for bench.v1.BenchService.
 //
-// Uses a persistent gRPC channel (single TCP/H2 connection) with
-// concurrent goroutines to measure throughput and latency without
-// per-request connection overhead.
+// Uses one persistent gRPC connection shared by -concurrency goroutines,
+// so results reflect server throughput rather than connection setup.
 //
 // Usage:
-//   go run . -addr 127.0.0.1:50051 -rpc GetProduct -concurrency 10 -total 1000
 //
-// RPCs: HealthCheck, GetProduct, ListProducts, CreateProduct, BatchGetProducts
+//	go run . -addr 127.0.0.1:50051 -scenario io -concurrency 50 -total 5000
+//	go run . -list
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"slices"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -26,125 +27,160 @@ import (
 	pb "tonic-bench/proto"
 )
 
-func main() {
-	addr := flag.String("addr", "127.0.0.1:50051", "gRPC server address")
-	rpcName := flag.String("rpc", "GetProduct", "RPC to benchmark")
-	concurrency := flag.Int("concurrency", 10, "concurrent goroutines")
-	total := flag.Int("total", 1000, "total requests")
-	flag.Parse()
-
-	// Single persistent channel shared by all goroutines.
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("failed to connect: %v", err)
-	}
-	defer conn.Close()
-
-	client := pb.NewProductServiceClient(conn)
-
-	// Warm up the connection with a health check.
-	_, err = client.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
-	if err != nil {
-		log.Fatalf("health check failed: %v", err)
-	}
-
-	var ops int64
-	var latenciesNS int64
-	var wg sync.WaitGroup
-
-	reqsPerWorker := *total / *concurrency
-	remainder := *total % *concurrency
-
-	start := time.Now()
-
-	for i := range *concurrency {
-		wg.Add(1)
-		n := reqsPerWorker
-		if i == 0 {
-			n += remainder
-		}
-		go func(n int) {
-			defer wg.Done()
-			for range n {
-				reqStart := time.Now()
-				if err := callRPC(client, *rpcName); err != nil {
-					fmt.Fprintf(os.Stderr, "rpc error: %v\n", err)
-					continue
-				}
-				atomic.AddInt64(&latenciesNS, time.Since(reqStart).Nanoseconds())
-				atomic.AddInt64(&ops, 1)
-			}
-		}(n)
-	}
-
-	wg.Wait()
-	elapsed := time.Since(start)
-
-	completed := atomic.LoadInt64(&ops)
-	avgLatencyUS := float64(atomic.LoadInt64(&latenciesNS)) / float64(completed) / 1000.0
-	rps := float64(completed) / elapsed.Seconds()
-
-	fmt.Printf("%-16s  %6d reqs  %8.1f ms total  %8.0f rps  %7.1f µs/req\n",
-		*rpcName, completed, float64(elapsed.Microseconds())/1000.0, rps, avgLatencyUS)
+type scenario struct {
+	description string
+	call        func(ctx context.Context, c pb.BenchServiceClient) error
 }
 
-func callRPC(client pb.ProductServiceClient, rpc string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	switch rpc {
-	case "HealthCheck":
-		_, err := client.HealthCheck(ctx, &pb.HealthCheckRequest{})
+func work(req *pb.WorkRequest) func(context.Context, pb.BenchServiceClient) error {
+	return func(ctx context.Context, c pb.BenchServiceClient) error {
+		_, err := c.Work(ctx, req)
 		return err
-	case "GetProduct":
-		_, err := client.GetProduct(ctx, &pb.GetProductRequest{Id: 42})
-		return err
-	case "ListProducts":
-		_, err := client.ListProducts(ctx, &pb.ListProductsRequest{
-			Limit: 20, Offset: 0, TagFilter: "featured",
-		})
-		return err
-	case "CreateProduct":
-		_, err := client.CreateProduct(ctx, &pb.CreateProductRequest{
-			Title:       "Bench Product",
-			Description: "Created by Go benchmark",
-			PriceCents:  1999,
-			Currency:    "USD",
-			Tags:        []string{"bench", "new"},
-		})
-		return err
-	case "BatchGetProducts":
-		_, err := client.BatchGetProducts(ctx, &pb.BatchGetProductsRequest{
-			Ids: []int64{1, 2, 3, 42, 100, 999},
-		})
-		return err
-	case "GetProductDetail":
-		_, err := client.GetProductDetail(ctx, &pb.GetProductDetailRequest{Id: 42})
-		return err
-	case "SearchProducts":
-		_, err := client.SearchProducts(ctx, &pb.SearchProductsRequest{
-			Query:      "product",
-			Limit:      20,
-			Offset:     0,
-			MinPriceCents: 0,
-			MaxPriceCents: 1000000,
-			TagFilter:  "featured",
-		})
-		return err
-	case "CheckoutPreview":
-		_, err := client.CheckoutPreview(ctx, &pb.CheckoutPreviewRequest{
-			UserId: 1,
-			CartItems: []*pb.CartItem{
-				{ProductId: 1, Quantity: 2},
-				{ProductId: 2, Quantity: 1},
-				{ProductId: 3, Quantity: 3},
-			},
-		})
-		return err
-	case "Dashboard":
-		_, err := client.Dashboard(ctx, &pb.DashboardRequest{UserId: 1})
-		return err
-	default:
-		return fmt.Errorf("unknown RPC: %s", rpc)
 	}
+}
+
+var scenarios = map[string]scenario{
+	"ping": {"empty request and response: transport + dispatch overhead", func(ctx context.Context, c pb.BenchServiceClient) error {
+		_, err := c.Ping(ctx, &pb.Empty{})
+		return err
+	}},
+	"small":    {"one small record, no I/O", work(&pb.WorkRequest{Records: 1})},
+	"io":       {"one 2ms simulated I/O call, one record", work(&pb.WorkRequest{IoCalls: 1, IoMs: 2, Records: 1})},
+	"multi_io": {"three 5ms simulated I/O calls, ten records", work(&pb.WorkRequest{IoCalls: 3, IoMs: 5, Records: 10})},
+	"large":    {"100 records with 256-byte blobs (~35KB response)", work(&pb.WorkRequest{Records: 100, PayloadBytes: 256})},
+	"cpu":      {"20k-iteration checksum loop, one record", work(&pb.WorkRequest{CpuIterations: 20000, Records: 1})},
+	"mixed":    {"2ms I/O + 5k CPU iterations + 20 records", work(&pb.WorkRequest{IoCalls: 1, IoMs: 2, CpuIterations: 5000, Records: 20, PayloadBytes: 64})},
+	"stream": {"server stream of 100 records", func(ctx context.Context, c pb.BenchServiceClient) error {
+		stream, err := c.StreamRecords(ctx, &pb.WorkRequest{Records: 100, PayloadBytes: 64})
+		if err != nil {
+			return err
+		}
+		for {
+			if _, err := stream.Recv(); err == io.EOF {
+				return nil
+			} else if err != nil {
+				return err
+			}
+		}
+	}},
+	"upload": {"client stream of 100 records", func(ctx context.Context, c pb.BenchServiceClient) error {
+		stream, err := c.Upload(ctx)
+		if err != nil {
+			return err
+		}
+		for i := range 100 {
+			if err := stream.Send(&pb.Record{Id: int64(i), Value: int64(i)}); err != nil {
+				return err
+			}
+		}
+		_, err = stream.CloseAndRecv()
+		return err
+	}},
+}
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:50051", "server address")
+	name := flag.String("scenario", "ping", "scenario to run (see -list)")
+	concurrency := flag.Int("concurrency", 50, "concurrent in-flight requests")
+	total := flag.Int("total", 5000, "total requests")
+	warmup := flag.Int("warmup", 200, "unmeasured warm-up requests")
+	list := flag.Bool("list", false, "list scenarios and exit")
+	flag.Parse()
+
+	if *list {
+		names := make([]string, 0, len(scenarios))
+		for n := range scenarios {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			fmt.Printf("%-10s %s\n", n, scenarios[n].description)
+		}
+		return
+	}
+
+	sc, ok := scenarios[*name]
+	if !ok {
+		log.Fatalf("unknown scenario %q (use -list)", *name)
+	}
+
+	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewBenchServiceClient(conn)
+
+	if err := run(client, sc, *warmup, *concurrency); err != nil {
+		log.Fatalf("warm-up failed: %v", err)
+	}
+
+	latencies := make([]time.Duration, 0, *total)
+	var mu sync.Mutex
+	start := time.Now()
+	errors := runCollect(client, sc, *total, *concurrency, func(d time.Duration) {
+		mu.Lock()
+		latencies = append(latencies, d)
+		mu.Unlock()
+	})
+	elapsed := time.Since(start)
+
+	slices.Sort(latencies)
+	pct := func(p float64) float64 {
+		if len(latencies) == 0 {
+			return 0
+		}
+		return float64(latencies[int(p*float64(len(latencies)-1))].Microseconds()) / 1000.0
+	}
+	fmt.Printf("%-9s c=%-4d n=%-6d %9.0f rps   p50 %7.2fms   p99 %7.2fms   errors %d\n",
+		*name, *concurrency, len(latencies), float64(len(latencies))/elapsed.Seconds(), pct(0.50), pct(0.99), errors)
+	if errors > 0 {
+		os.Exit(1)
+	}
+}
+
+func run(client pb.BenchServiceClient, sc scenario, n, concurrency int) error {
+	if n == 0 {
+		return nil
+	}
+	if errs := runCollect(client, sc, n, concurrency, func(time.Duration) {}); errs > 0 {
+		return fmt.Errorf("%d errors", errs)
+	}
+	return nil
+}
+
+func runCollect(client pb.BenchServiceClient, sc scenario, n, concurrency int, record func(time.Duration)) int {
+	jobs := make(chan struct{}, n)
+	for range n {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errs := 0
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range jobs {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				t := time.Now()
+				err := sc.call(ctx, client)
+				cancel()
+				if err != nil {
+					mu.Lock()
+					if errs < 5 {
+						fmt.Fprintf(os.Stderr, "rpc error: %v\n", err)
+					}
+					errs++
+					mu.Unlock()
+					continue
+				}
+				record(time.Since(t))
+			}
+		}()
+	}
+	wg.Wait()
+	return errs
 }

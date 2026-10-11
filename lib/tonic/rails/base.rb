@@ -3,338 +3,212 @@
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/hash/keys"
 require "active_support/core_ext/string/inflections"
-require_relative "proto_parser"
 
 module Tonic
   module Rails
     # Include in a class to define a gRPC service handler.
     #
-    #   class GreeterService
+    #   class ProductService
     #     include Tonic::Rails::Base
+    #     rpc_service "shop.ProductService"   # every RPC from the descriptor
     #
-    #     service "helloworld.Greeter"
-    #
-    #     rpc :SayHello, HelloRequest, HelloResponse
-    #
-    #     def say_hello(request)
-    #       HelloResponse.new(message: "Hello, #{request.name}!")
+    #     def get_product(request)
+    #       Shop::Product.new(id: request.id, title: "Widget")
     #     end
     #   end
     #
-    # The `service` declaration sets the fully-qualified protobuf service name.
-    # Each `rpc` call registers a method with its request/response protobuf
-    # classes.  The instance method (snake_case of the rpc name) receives a
-    # decoded protobuf request and returns a protobuf response object.
+    # Handler methods are the snake_case RPC names.  A new instance is
+    # created for every call, so instance variables never leak between
+    # requests.
+    #
+    # Requests are decoded protobuf messages when `request_format :message`
+    # is set (fastest), or string-keyed Hashes by default.  Handlers may
+    # return either a protobuf message or a Hash; streaming handlers
+    # return any Enumerable of them.
     module Base
       def self.included(base)
         base.extend(ClassMethods)
-        base.class_attribute :grpc_service_name
-        base.class_attribute :grpc_rpcs
-        base.grpc_rpcs = {}
+        base.class_attribute :grpc_service_name, instance_writer: false
+        base.class_attribute :grpc_rpcs, instance_writer: false, default: {}
+        base.class_attribute :grpc_request_format, instance_writer: false, default: :hash
       end
 
       module ClassMethods
-        # @param name [String] fully-qualified protobuf service name,
-        #   e.g. "helloworld.Greeter"
+        # @param name [String] fully-qualified service name, e.g. "shop.ProductService"
         def service(name)
-          self.grpc_service_name = name
+          self.grpc_service_name = name.to_s
         end
 
-        # @param method_name [Symbol] RPC method name as defined in the .proto
-        # @param request_class [Class] protobuf request class (responds to .decode)
-        # @param response_class [Class] protobuf response class (responds to .encode)
-        # @param stream [Symbol] streaming type: :server, :client, or :bidi
+        # How requests are passed to handlers.
+        # @param format [Symbol] :hash (string-keyed Hash, the default) or
+        #   :message (the decoded protobuf message — avoids a conversion)
+        def request_format(format)
+          unless %i[hash message].include?(format)
+            raise ArgumentError, "request_format must be :hash or :message, got #{format.inspect}"
+          end
+
+          self.grpc_request_format = format
+        end
+
+        # Declare one RPC.
+        # @param method_name [Symbol, String] RPC name as in the .proto, e.g. :GetProduct
+        # @param request_class [Class] protobuf request message class
+        # @param response_class [Class] protobuf response message class
+        # @param stream [Symbol, nil] :server, :client, :bidi, or nil for unary
         def rpc(method_name, request_class, response_class, stream: nil)
+          unless [nil, :server, :client, :bidi].include?(stream)
+            raise ArgumentError, "stream must be :server, :client, :bidi, or nil, got #{stream.inspect}"
+          end
+
+          name = method_name.to_s
           self.grpc_rpcs = grpc_rpcs.merge(
-            method_name.to_s => {
+            name => {
               request: request_class,
               response: response_class,
-              request_stream: stream == :client || stream == :bidi,
-              response_stream: stream == :server || stream == :bidi,
-            },
+              request_stream: %i[client bidi].include?(stream),
+              response_stream: %i[server bidi].include?(stream),
+              handler: name.underscore.to_sym,
+            }.freeze,
           )
         end
 
-        # Auto-register all RPCs for a service by parsing the .proto file.
-        # Eliminates the need to declare each `rpc :Method, Req, Resp` individually.
+        # Declare the service and every RPC in it from the protobuf
+        # descriptor pool.  Load the generated `_pb.rb` file first.
         #
-        #   class ProductService
-        #     include Tonic::Rails::Base
-        #     rpc_service "shop.ProductService"  # scans config.proto_dir
-        #
-        #     def get_product(request); ... end
-        #     def list_products(request); ... end
-        #   end
-        #
-        # @param full_name [String] fully-qualified service name (package.Service)
-        # @param proto_file [String, nil] explicit .proto path; if nil, scans
-        #   Tonic::Rails.configuration.proto_dir
-        def rpc_service(full_name, proto_file: nil)
-          # Set the service name (replaces `service` declaration).
-          self.grpc_service_name = full_name
-
-          unless proto_file || Tonic::Rails.configuration.proto_dir
-            raise Error, "rpc_service: proto_dir not configured in Tonic::Rails.configuration"
+        # @param full_name [String] fully-qualified service name
+        def rpc_service(full_name)
+          descriptor = Google::Protobuf::DescriptorPool.generated_pool.lookup(full_name.to_s)
+          unless descriptor.is_a?(Google::Protobuf::ServiceDescriptor)
+            raise NotConfiguredError,
+                  "rpc_service: #{full_name} is not a known protobuf service. " \
+                  "Require its generated _pb.rb file (protoc --ruby_out) before declaring the handler."
           end
 
-          info = if proto_file
-            *pkg, service_name = full_name.split(".")
-            ProtoParser.parse_service(proto_file, service_name)
-          else
-            proto_dir = Tonic::Rails.configuration.proto_dir
-            ProtoParser.find_service(proto_dir, full_name)
-          end
-
-          unless info
-            location = proto_file || "#{Tonic::Rails.configuration.proto_dir}/"
-            raise Error, "rpc_service: service #{full_name} not found in #{location}"
-          end
-
-          info.rpcs.each do |rpc_info|
-            request_class = ProtoParser.resolve_type(rpc_info.request_type, info.package)
-            response_class = ProtoParser.resolve_type(rpc_info.response_type, info.package)
-
-            stream = if rpc_info.request_stream && rpc_info.response_stream
+          service(full_name)
+          descriptor.each do |method|
+            stream = if method.client_streaming && method.server_streaming
               :bidi
-            elsif rpc_info.request_stream
+            elsif method.client_streaming
               :client
-            elsif rpc_info.response_stream
+            elsif method.server_streaming
               :server
-            else
-              nil
             end
-
-            rpc(
-              rpc_info.name,
-              request_class,
-              response_class,
-              stream: stream,
-            )
+            rpc(method.name, method.input_type.msgclass, method.output_type.msgclass, stream: stream)
           end
         end
 
-        # Register all declared RPCs with the given router.
-        # Called by Tonic::Rails::Server#register.
+        # @api private  Called by Server#register.
         def register_on(router)
-          raise NotConfiguredError, "#{self} has no service name" unless grpc_service_name
+          raise NotConfiguredError, "#{self} has no service name; call `service` or `rpc_service`" unless grpc_service_name
+          raise NotConfiguredError, "#{self} declares no RPCs" if grpc_rpcs.empty?
 
-          grpc_rpcs.each do |method_name, spec|
-            router.add(grpc_service_name, method_name, self, method_name, spec)
-          end
+          router.add(self)
         end
       end
 
-      # Dispatch entry point for raw-bytes mode.
-      # Decodes protobuf bytes → object → Hash, calls the handler with
-      # a Hash (string keys) or an Enumerator of Hashes, converts the
-      # response(s) → protobuf bytes.
-      #
-      # RPC types and handler signatures:
-      #   Unary:          def method(request_hash) → Hash
-      #   Server stream:  def method(request_hash) → Enumerable of Hashes
-      #   Client stream:  def method(requests) → Hash
-      #   Bidi stream:    def method(requests) → Enumerable of Hashes
-      #
-      # For client/bidi streaming, the handler receives an Enumerator that
-      # yields decoded request Hashes one at a time.  Each yield blocks
-      # until the next message arrives from the client (via RequestReader,
-      # which releases the GVL during the blocking receive).
-      #
-      # @param method_name [String] RPC method name
-      # @param request_bytes [String] raw protobuf bytes (first message;
-      #   empty when a RequestReader is provided via metadata)
-      # @param metadata [Hash] gRPC metadata headers
-      # @return [String, Array<String>, nil] encoded protobuf bytes
-      def call_rpc(method_name, request_bytes, metadata: {})
-        spec = self.class.grpc_rpcs[method_name.to_s]
-        raise Error, "Unknown RPC: #{method_name}" unless spec
-
-        # Store metadata so handler can access deadline, auth tokens, etc.
-        @grpc_metadata = metadata
-
-        # Capture absolute deadline at handler entry (post-dequeue) so
-        # deadline_ms counts down as time elapses. Uses CLOCK_MONOTONIC
-        # to avoid wall-clock jumps.
-        if metadata && metadata["_timeout_ms"]
-          @grpc_deadline_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) +
-            metadata["_timeout_ms"].to_f / 1000.0
-        else
-          @grpc_deadline_at = nil
-        end
-
-        # ── Request handling ────────────────────────────────────────
-        if spec[:request_stream]
-          # Client streaming or bidi: handler receives an Enumerator
-          # of decoded request Hashes, not a single Hash.
-          request_reader = metadata["_request_reader"]
-          if request_reader
-            # Real reader from Rust — yields raw bytes, we decode each.
-            request_enum = Enumerator.new do |y|
-              while (bytes = read_next(method_name, request_reader))
-                obj = decode_request(method_name, bytes, spec[:request])
-                y << obj.to_h.deep_stringify_keys
-              end
-            rescue RpcError
-              raise
-            rescue => e
-              Tonic::Rails.configuration.logger&.warn(
-                "tonic-rails: error in stream for #{method_name}: #{e.class}: #{e.message}",
-              )
-              raise RpcError.new("stream read error", code: :unavailable)
-            end
-          else
-            # Buffered fallback for tests: wrap single request_bytes.
-            obj = decode_request(method_name, request_bytes, spec[:request])
-            request_enum = [obj.to_h.deep_stringify_keys].each
-          end
-          result = send(method_name.to_s.underscore, request_enum)
-        else
-          # Unary or server streaming: handler receives a single request Hash.
-          # In real dispatch, request_bytes is empty and the first message
-          # comes from the RequestReader. In unit tests (no reader), the
-          # request_bytes argument is used directly.
-          request_reader = metadata["_request_reader"]
-          actual_bytes = if request_reader
-            bytes = read_next(method_name, request_reader)
-            raise RpcError.new("empty request stream", code: :invalid_argument) if bytes.nil?
-            bytes
-          else
-            request_bytes
-          end
-          request_obj = decode_request(method_name, actual_bytes, spec[:request])
-          request_hash = request_obj.to_h.deep_stringify_keys
-          result = send(method_name.to_s.underscore, request_hash)
-        end
-
-        # ── Response handling ───────────────────────────────────────
-        if spec[:response_stream]
-          # Server streaming or bidi: handler must return an Enumerable.
-          unless result.respond_to?(:each)
-            raise RpcError.new("streaming handler must return an Enumerable, got #{result.class}", code: :internal)
-          end
-          # Incremental streaming: if a StreamSender is available (passed
-          # through metadata by the Rust dispatch layer), send each encoded
-          # message through it one at a time.  This avoids materializing the
-          # entire stream in memory — peak memory is one message, not the
-          # full collection.  Backpressure is provided by a bounded channel
-          # (32 messages); the GVL is released during each send so other
-          # Ruby workers can dispatch concurrently.
-          stream_sender = metadata["_stream_sender"]
-          if stream_sender
-            result.each do |item|
-              encoded = spec[:response].encode(spec[:response].new(item))
-              begin
-                stream_sender.send(encoded)
-              rescue => e
-                # Channel closed (client disconnected) or send cancelled
-                # (server shutting down). Not a handler bug — map to
-                # :unavailable so clients know to retry, not :internal.
-                raise RpcError.new(
-                  "stream unavailable: #{e.message}",
-                  code: :unavailable,
-                )
-              end
-            end
-            nil # Signal: data sent incrementally via StreamSender.
-          else
-            # Buffered fallback (no StreamSender — e.g. in unit tests
-            # that call call_rpc directly without the Rust dispatch).
-            result.map do |item|
-              spec[:response].encode(spec[:response].new(item))
-            end
-          end
-        else
-          # Unary or client streaming: handler must return a Hash.
-          unless result.is_a?(Hash)
-            raise RpcError.new("handler must return a Hash, got #{result.class}", code: :internal)
-          end
-          spec[:response].encode(spec[:response].new(result))
-        end
-      rescue RpcError
-        raise  # re-raise RpcError with its original code
-      rescue Error
-        raise  # re-raise framework errors (e.g. "Unknown RPC")
-      rescue => e
-        # Log the full error server-side; send a sanitized message to
-        # the client to avoid leaking internal details (stack traces,
-        # file paths, SQL fragments, internal hostnames).
-        logger = Tonic::Rails.configuration.logger
-        logger&.error("tonic-rails: internal error in #{method_name}: #{e.class}: #{e.message}")
-        raise RpcError.new("internal error", code: :internal)
-      end
-
-      # gRPC metadata for the current request.
-      # Includes user-defined headers plus `_timeout_ms` (if the client
-      # set a grpc-timeout header, the Rust layer injects the remaining
-      # milliseconds here).
+      # gRPC request metadata (lower-case header names).  Binary (`-bin`)
+      # values are base64-encoded, as sent on the wire.
       # @return [Hash{String=>String}]
       attr_reader :grpc_metadata
 
-      # Remaining time budget in milliseconds before the gRPC deadline
-      # expires. Returns nil if no deadline was set by the client.
-      # Decrements as time elapses — safe to poll in a loop.
+      # Milliseconds left before the client's deadline, or nil if the
+      # client did not set one.
       # @return [Integer, nil]
       def deadline_ms
-        return nil unless @grpc_deadline_at
-        remaining = (@grpc_deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC)) * 1000
-        remaining < 0 ? 0 : remaining.to_i
+        return unless @grpc_deadline_at
+
+        remaining = ((@grpc_deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC)) * 1000).to_i
+        remaining.negative? ? 0 : remaining
       end
 
-      # Check if the server is shutting down. Handlers should abort
-      # in-progress work and return quickly when this returns true.
-      # @return [Boolean]
+      # True when the deadline has passed.
+      def deadline_exceeded?
+        !deadline_ms.nil? && deadline_ms.zero?
+      end
+
+      # True when the server is shutting down.
       def cancelled?
         Tonic::Rails.cancelled?
       end
 
+      # @api private
+      # Run one RPC.  `reader` yields raw request messages (`#next`, then
+      # `#error` once exhausted); `sender` accepts raw response messages
+      # (`#push`) for server-streaming RPCs.
+      # @return [String, nil] the encoded unary response, or nil when
+      #   messages were streamed through `sender`
+      def call_rpc(rpc_name, metadata:, reader:, sender: nil, timeout_ms: nil)
+        spec = self.class.grpc_rpcs[rpc_name.to_s]
+        raise RpcError.new("method not implemented", code: :unimplemented) unless spec
+        raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented) unless respond_to?(spec[:handler])
+
+        @grpc_metadata = metadata
+        @grpc_deadline_at = timeout_ms && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + (timeout_ms / 1000.0))
+
+        request = if spec[:request_stream]
+          Enumerator.new do |y|
+            while (message = read_request(reader, spec))
+              y << message
+            end
+          end
+        else
+          read_request(reader, spec) || raise(RpcError.new("missing request message", code: :invalid_argument))
+        end
+
+        result = public_send(spec[:handler], request)
+
+        if spec[:response_stream]
+          unless result.respond_to?(:each)
+            raise TypeError, "streaming handler #{self.class}##{spec[:handler]} must return an Enumerable, got #{result.class}"
+          end
+
+          result.each { |item| push_response(sender, encode_response(item, spec)) }
+          nil
+        else
+          encode_response(result, spec)
+        end
+      rescue RpcError
+        raise
+      rescue StandardError => e
+        Tonic::Rails.log_exception(e, "#{self.class}##{rpc_name}")
+        raise RpcError.new("internal error", code: :internal)
+      end
+
       private
 
-      def decode_request(method_name, bytes, request_class)
-        request_class.decode(bytes)
-      rescue => e
-        Tonic::Rails.configuration.logger&.warn(
-          "tonic-rails: invalid protobuf for #{method_name}: #{e.class}: #{e.message}",
-        )
-        raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+      def read_request(reader, spec)
+        bytes = reader.next
+        if bytes.nil?
+          code, message = reader.error
+          raise RpcError.new(message, code: code) if code
+
+          return
+        end
+
+        message = begin
+          spec[:request].decode(bytes)
+        rescue Google::Protobuf::ParseError, ArgumentError
+          raise RpcError.new("invalid protobuf request", code: :invalid_argument)
+        end
+        self.class.grpc_request_format == :message ? message : message.to_h.deep_stringify_keys
       end
 
-      def read_next(method_name, reader)
-        reader.next
-      rescue => e
-        Tonic::Rails.configuration.logger&.warn(
-          "tonic-rails: error reading from request for #{method_name}: #{e.class}: #{e.message}",
-        )
-        raise RpcError.new("stream read error", code: :unavailable)
+      def encode_response(item, spec)
+        klass = spec[:response]
+        message = case item
+        when klass then item
+        when Hash then klass.new(item)
+        else
+          raise TypeError, "#{self.class}##{spec[:handler]} must return a #{klass} or Hash, got #{item.class}"
+        end
+        klass.encode(message)
       end
-    end
 
-    # Represents a gRPC error with a status code.
-    class RpcError < Error
-      attr_reader :code
-
-      CODES = {
-        ok: 0,
-        cancelled: 1,
-        unknown: 2,
-        invalid_argument: 3,
-        deadline_exceeded: 4,
-        not_found: 5,
-        already_exists: 6,
-        permission_denied: 7,
-        resource_exhausted: 8,
-        failed_precondition: 9,
-        aborted: 10,
-        out_of_range: 11,
-        unimplemented: 12,
-        internal: 13,
-        unavailable: 14,
-        data_loss: 15,
-        unauthenticated: 16,
-      }.freeze
-
-      def initialize(message, code: :unknown)
-        super(message)
-        @code = CODES.fetch(code, 2)
+      def push_response(sender, bytes)
+        sender.push(bytes)
+      rescue IOError
+        # The client went away; nothing left to deliver to.
+        raise RpcError.new("client cancelled the stream", code: :cancelled)
       end
     end
   end

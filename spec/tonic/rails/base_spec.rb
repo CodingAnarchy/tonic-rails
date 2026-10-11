@@ -1,830 +1,279 @@
 # frozen_string_literal: true
 
-require "spec_helper"
-
 RSpec.describe Tonic::Rails::Base do
-  let(:service_class) do
+  let(:testing) { Tonic::Rails::Testing }
+  let(:request_class) { Echo::V1::EchoRequest }
+  let(:response_class) { Echo::V1::EchoResponse }
+
+  def hash_service(&block)
+    req = request_class
+    res = response_class
     Class.new do
       include Tonic::Rails::Base
 
-      service "helloworld.Greeter"
+      service "echo.v1.EchoService"
+      rpc :Unary, req, res
+      rpc :ServerStream, req, res, stream: :server
+      rpc :ClientStream, req, res, stream: :client
+      rpc :Bidi, req, res, stream: :bidi
 
-      rpc :SayHello, String, String
+      def self.name = "HashEchoService"
 
-      def say_hello(request)
-        {"message" => "Hello, #{request['name']}!"}
-      end
-    end
-  end
-
-  describe ".service" do
-    it "sets the fully-qualified service name" do
-      expect(service_class.grpc_service_name).to eq("helloworld.Greeter")
+      class_eval(&block) if block
     end
   end
 
   describe ".rpc" do
-    it "registers the method with request and response classes" do
-      expect(service_class.grpc_rpcs).to include("SayHello")
-      spec = service_class.grpc_rpcs["SayHello"]
-      expect(spec[:request]).to eq(String)
-      expect(spec[:response]).to eq(String)
+    it "records request/response classes, streaming flags and the handler name" do
+      spec = hash_service.grpc_rpcs["ServerStream"]
+      expect(spec).to include(
+        request: request_class,
+        response: response_class,
+        request_stream: false,
+        response_stream: true,
+        handler: :server_stream,
+      )
+      expect(hash_service.grpc_rpcs["Bidi"]).to include(request_stream: true, response_stream: true)
     end
-  end
 
-  describe "class name independence" do
-    it "routes by service declaration, not Ruby class name" do
-      # A handler class named "BarController" serves "foo.FooService".
-      # Routing is by the `service` declaration + router path, not by
-      # the Ruby class name. End-to-end proof also exists in the
-      # integration test for the underscore-named service (UnderscoreService
-      # serving test.My_Service via grpcurl).
-      BarController = Class.new do
-        include Tonic::Rails::Base
-        service "foo.FooService"
-        rpc :DoThing, String, String
-        def do_thing(request)
-          {"result" => "done by BarController"}
-        end
-      end
-
-      router = Tonic::Rails::Router.new
-      BarController.register_on(router)
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-      BarController.grpc_rpcs["DoThing"][:request] = request_class
-      BarController.grpc_rpcs["DoThing"][:response] = response_class
-
-      result = router.dispatch("/foo.FooService/DoThing", "")
-      expect(result).to eq({"result" => "done by BarController"})
-    ensure
-      Object.send(:remove_const, :BarController) if defined?(BarController)
+    it "rejects unknown stream kinds" do
+      expect { hash_service.rpc(:X, request_class, response_class, stream: :sideways) }
+        .to raise_error(ArgumentError, /stream must be/)
     end
-  end
-  describe ".register_on" do
-    it "raises if no service name is set" do
-      klass = Class.new { include Tonic::Rails::Base }
-      expect { klass.register_on(Tonic::Rails::Router.new) }
-        .to raise_error(Tonic::Rails::NotConfiguredError)
+
+    it "does not leak RPCs into sibling classes" do
+      a = hash_service
+      b = hash_service
+      a.rpc(:Extra, request_class, response_class)
+      expect(b.grpc_rpcs).not_to have_key("Extra")
     end
   end
 
   describe ".rpc_service" do
-    let(:proto_path) { File.expand_path("../../../bench/shop.proto", __dir__) }
-
-    it "auto-registers all RPCs from the proto file" do
-      require_relative "../../../bench/shop_pb"
-      file = proto_path
-
-      svc = Class.new do
-        include Tonic::Rails::Base
-        rpc_service "shop.ProductService", proto_file: file
-      end
-
-      expect(svc.grpc_service_name).to eq("shop.ProductService")
-      expect(svc.grpc_rpcs.keys).to include("GetProduct", "ListProducts", "HealthCheck")
-      expect(svc.grpc_rpcs["GetProduct"][:request]).to eq(Shop::GetProductRequest)
-      expect(svc.grpc_rpcs["GetProduct"][:response]).to eq(Shop::Product)
+    it "declares every RPC from the descriptor pool" do
+      expect(EchoHandler.grpc_service_name).to eq("echo.v1.EchoService")
+      expect(EchoHandler.grpc_rpcs.keys).to contain_exactly("Unary", "ServerStream", "ClientStream", "Bidi")
+      expect(EchoHandler.grpc_rpcs["ClientStream"]).to include(request_stream: true, response_stream: false)
+      expect(EchoHandler.grpc_rpcs["Unary"]).to include(request: request_class, response: response_class)
     end
 
-    it "detects server-streaming RPCs from the proto" do
-      require_relative "../../../bench/shop_pb"
-      file = proto_path
-
-      svc = Class.new do
-        include Tonic::Rails::Base
-        rpc_service "shop.ProductService", proto_file: file
-      end
-
-      # shop.proto now has one server-streaming RPC (StreamProducts);
-      # all others should be unary.
-      svc.grpc_rpcs.each do |name, spec|
-        if name == "StreamProducts"
-          expect(spec[:response_stream]).to be(true)
-        else
-          expect(spec[:request_stream]).to be(false)
-          expect(spec[:response_stream]).to be(false)
-        end
-      end
+    it "raises a helpful error for unknown services" do
+      expect { Class.new { include Tonic::Rails::Base }.rpc_service("nope.Missing") }
+        .to raise_error(Tonic::Rails::NotConfiguredError, /not a known protobuf service/)
     end
 
-    it "raises when the service is not found in the proto file" do
-      file = proto_path
-
-      expect {
-        Class.new do
-          include Tonic::Rails::Base
-          rpc_service "shop.Nonexistent", proto_file: file
-        end
-      }.to raise_error(Tonic::Rails::Error, /not found/)
-    end
-
-    it "handles versioned packages like shop.v1.ProductService" do
-      require_relative "../../../bench/v1_order_pb"
-      file = File.expand_path("../../../bench/v1_order.proto", __dir__)
-
-      svc = Class.new do
-        include Tonic::Rails::Base
-        rpc_service "shop.v1.OrderService", proto_file: file
-      end
-
-      expect(svc.grpc_service_name).to eq("shop.v1.OrderService")
-      expect(svc.grpc_rpcs.keys).to include("GetOrder", "ListOrders")
-      expect(svc.grpc_rpcs["GetOrder"][:request]).to eq(Shop::V1::GetOrderRequest)
-      expect(svc.grpc_rpcs["GetOrder"][:response]).to eq(Shop::V1::Order)
-    end
-
-    it "raises when neither proto_file nor proto_dir is configured" do
-      original = Tonic::Rails.configuration.proto_dir
-      Tonic::Rails.configuration.proto_dir = nil
-
-      expect {
-        Class.new do
-          include Tonic::Rails::Base
-          rpc_service "shop.ProductService"
-        end
-      }.to raise_error(Tonic::Rails::Error, /proto_dir not configured/)
-
-      Tonic::Rails.configuration.proto_dir = original
+    it "raises for names that are not services" do
+      expect { Class.new { include Tonic::Rails::Base }.rpc_service("echo.v1.EchoRequest") }
+        .to raise_error(Tonic::Rails::NotConfiguredError)
     end
   end
 
-  describe "#call_rpc" do
-    it "decodes the request to a Hash, calls the method, and encodes the response" do
-      # Mock request class: decode returns a Hash (has to_h).
-      request_class = Class.new do
-        def self.decode(bytes); {name: bytes}; end
-      end
-      # Mock response class: new accepts a Hash, encode passes through.
-      response_class = Class.new do
-        def self.new(hash); hash; end
-        def self.encode(msg); msg; end
-      end
-
-      service_class.grpc_rpcs["SayHello"][:request] = request_class
-      service_class.grpc_rpcs["SayHello"][:response] = response_class
-
-      instance = service_class.new
-      result = instance.call_rpc("SayHello", "World")
-      expect(result).to eq({"message" => "Hello, World!"})
-    end
-
-    it "raises RpcError for unknown methods" do
-      instance = service_class.new
-      expect { instance.call_rpc("Unknown", "") }
-        .to raise_error(Tonic::Rails::Error, /Unknown RPC/)
+  describe ".request_format" do
+    it "only accepts :hash or :message" do
+      expect { hash_service.request_format(:json) }.to raise_error(ArgumentError)
     end
   end
 
-    describe "error sanitization" do
-      it "maps malformed protobuf decode to :invalid_argument" do
-        raising_request = Class.new do
-          def self.decode(_bytes)
-            raise StandardError, "protobuf parse error at offset 42"
-          end
-        end
-        response_class = Class.new do
-          def self.new(hash); hash; end
-          def self.encode(msg); msg; end
-        end
-
-        service_class.grpc_rpcs["SayHello"][:request] = raising_request
-        service_class.grpc_rpcs["SayHello"][:response] = response_class
-
-        instance = service_class.new
-        expect {
-          instance.call_rpc("SayHello", "garbage")
-        }.to raise_error(Tonic::Rails::RpcError) do |err|
-          expect(err.code).to eq(3) # INVALID_ARGUMENT
-          expect(err.message).to eq("invalid protobuf request")
-        end
-      end
-
-      it "sanitizes internal handler errors — does not leak details" do
-        leaking_service = Class.new do
-          include Tonic::Rails::Base
-          service "test.Leak"
-          rpc :Secret, String, String
-          def secret(_request)
-            raise StandardError, "secret internal path: /etc/passwd"
-          end
-        end
-
-        request_class = Class.new { def self.decode(_b); {}; end }
-        response_class = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m; end
-        end
-
-        leaking_service.grpc_rpcs["Secret"][:request] = request_class
-        leaking_service.grpc_rpcs["Secret"][:response] = response_class
-
-        instance = leaking_service.new
-        expect {
-          instance.call_rpc("Secret", "")
-        }.to raise_error(Tonic::Rails::RpcError) do |err|
-          expect(err.code).to eq(13) # INTERNAL
-          expect(err.message).to eq("internal error")
-          expect(err.message).not_to include("secret")
-          expect(err.message).not_to include("/etc/passwd")
-        end
-      end
-
-      it "preserves RpcError messages from handlers" do
-        explicit_error_service = Class.new do
-          include Tonic::Rails::Base
-          service "test.Explicit"
-          rpc :NotFound, String, String
-          def not_found(_request)
-            raise Tonic::Rails::RpcError.new("product not found", code: :not_found)
-          end
-        end
-
-        request_class = Class.new { def self.decode(_b); {}; end }
-        response_class = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m; end
-        end
-
-        explicit_error_service.grpc_rpcs["NotFound"][:request] = request_class
-        explicit_error_service.grpc_rpcs["NotFound"][:response] = response_class
-
-        instance = explicit_error_service.new
-        expect {
-          instance.call_rpc("NotFound", "")
-        }.to raise_error(Tonic::Rails::RpcError) do |err|
-          expect(err.code).to eq(5) # NOT_FOUND
-          expect(err.message).to eq("product not found")
-        end
-      end
+  describe ".register_on" do
+    it "requires a service name" do
+      klass = Class.new { include Tonic::Rails::Base }
+      expect { klass.register_on(Tonic::Rails::Router.new) }.to raise_error(Tonic::Rails::NotConfiguredError)
     end
 
-    describe "unary with request_reader" do
-      it "decodes request from reader.next when _request_reader is present" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.UnaryReader"
-          rpc :Echo, String, String
-          def echo(req); {"reply" => req["name"]}; end
-        end
-
-        request_class = Class.new { def self.decode(b); {"name" => b}; end }
-        response_class = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m["reply"]; end
-        end
-
-        svc.grpc_rpcs["Echo"][:request] = request_class
-        svc.grpc_rpcs["Echo"][:response] = response_class
-
-        fake_reader = Object.new
-        def fake_reader.next
-          @called ||= false
-          return nil if @called
-          @called = true
-          "hello"
-        end
-
-        result = svc.new.call_rpc("Echo", "", metadata: {"_request_reader" => fake_reader})
-        expect(result).to eq("hello")
-      end
-
-      it "raises :unavailable when reader.next raises in unary path" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.UnaryReaderErr"
-          rpc :Echo, String, String
-          def echo(req); req; end
-        end
-
-        svc.grpc_rpcs["Echo"][:request] = Class.new { def self.decode(b); {}; end }
-        svc.grpc_rpcs["Echo"][:response] = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m; end
-        end
-
-        raising_reader = Object.new
-        def raising_reader.next; raise "request reader interrupted"; end
-
-        expect {
-          svc.new.call_rpc("Echo", "", metadata: {"_request_reader" => raising_reader})
-        }.to raise_error(Tonic::Rails::RpcError, /stream read error/)
-      end
-
-      it "raises :invalid_argument when reader returns nil for unary" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.UnaryEmpty"
-          rpc :Echo, String, String
-          def echo(req); req; end
-        end
-
-        svc.grpc_rpcs["Echo"][:request] = Class.new { def self.decode(b); {}; end }
-        svc.grpc_rpcs["Echo"][:response] = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m; end
-        end
-
-        empty_reader = Object.new
-        def empty_reader.next; nil; end
-
-        expect {
-          svc.new.call_rpc("Echo", "", metadata: {"_request_reader" => empty_reader})
-        }.to raise_error(Tonic::Rails::RpcError, /empty request stream/)
-      end
-
-      it "raises :internal when unary handler returns nil" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.UnaryNil"
-          rpc :Bad, String, String
-          def bad(req); nil; end
-        end
-
-        svc.grpc_rpcs["Bad"][:request] = Class.new { def self.decode(b); {}; end }
-        svc.grpc_rpcs["Bad"][:response] = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m; end
-        end
-
-        expect { svc.new.call_rpc("Bad", "") }
-          .to raise_error(Tonic::Rails::RpcError, /got NilClass/)
-      end
-    end
-
-  describe "server-streaming RPCs" do
-    let(:streaming_service) do
-      Class.new do
+    it "requires at least one RPC" do
+      klass = Class.new do
         include Tonic::Rails::Base
 
-        service "test.Stream"
+        service "x.Y"
+      end
+      expect { klass.register_on(Tonic::Rails::Router.new) }.to raise_error(Tonic::Rails::NotConfiguredError, /no RPCs/)
+    end
+  end
 
-        rpc :ListItems, String, String, stream: :server
-
-        def list_items(request)
-          [
-            {"id" => "1", "name" => request["name"]},
-            {"id" => "2", "name" => request["name"]},
-            {"id" => "3", "name" => request["name"]},
-          ]
+  describe "unary RPCs" do
+    it "passes a string-keyed Hash by default and accepts a Hash response" do
+      svc = hash_service do
+        def unary(request)
+          { "message" => "#{request['message']}:#{request['detail']['mood']}" }
         end
       end
+      response = testing.call(svc, :Unary, { message: "hi", detail: { mood: :MOOD_HAPPY } })
+      expect(response).to eq(response_class.new(message: "hi:MOOD_HAPPY"))
     end
 
-    it "registers stream: true in the RPC spec when stream: :server" do
-      spec = streaming_service.grpc_rpcs["ListItems"]
-      expect(spec[:response_stream]).to be(true)
+    it "passes the protobuf message with request_format :message" do
+      response = testing.call(EchoHandler, :Unary, request_class.new(message: "hi"))
+      expect(response.message).to eq("hi")
     end
 
-    it "registers stream: false by default (unary)" do
-      spec = service_class.grpc_rpcs["SayHello"]
-      expect(spec[:response_stream]).to be(false)
+    it "exposes metadata and the remaining deadline" do
+      response = testing.call(EchoHandler, :Unary, { message: "x" }, metadata: { "x-user" => "7" }, timeout_ms: 5_000)
+      expect(response.metadata.to_h).to eq("x-user" => "7")
+      expect(response.deadline_ms).to be_between(4_000, 5_000)
     end
 
-    it "returns an Array of encoded responses for streaming RPCs" do
-      request_class = Class.new do
-        def self.decode(bytes); {name: bytes}; end
-      end
-      response_class = Class.new do
-        def self.new(hash); hash; end
-        def self.encode(msg); "encoded:#{msg['id']}"; end
-      end
-
-      streaming_service.grpc_rpcs["ListItems"][:request] = request_class
-      streaming_service.grpc_rpcs["ListItems"][:response] = response_class
-
-      instance = streaming_service.new
-      result = instance.call_rpc("ListItems", "Widget")
-      expect(result).to be_an(Array)
-      expect(result.length).to eq(3)
-      expect(result).to eq(["encoded:1", "encoded:2", "encoded:3"])
+    it "reports no deadline when the client sets none" do
+      expect(testing.call(EchoHandler, :Unary, { message: "x" }).deadline_ms).to eq(-1)
     end
 
-    it "returns an empty Array for a streaming handler that yields nothing" do
-      empty_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.EmptyStream"
-        rpc :Empty, String, String, stream: :server
-        def empty(request); []; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); "x"; end
-      end
-
-      empty_service.grpc_rpcs["Empty"][:request] = request_class
-      empty_service.grpc_rpcs["Empty"][:response] = response_class
-
-      result = empty_service.new.call_rpc("Empty", "")
-      expect(result).to eq([])
+    it "propagates RpcError with its code and message" do
+      expect { testing.call(EchoHandler, :Unary, { fail_with: "rpc:not_found" }) }
+        .to raise_error(Tonic::Rails::RpcError, "failed with not_found") { |e| expect(e.code).to eq(5) }
     end
 
-    it "raises RpcError when a streaming handler returns a non-Enumerable" do
-      bad_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.BadStream"
-        rpc :Bad, String, String, stream: :server
-        def bad(request); "not an array"; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      bad_service.grpc_rpcs["Bad"][:request] = request_class
-      bad_service.grpc_rpcs["Bad"][:response] = response_class
-
-      expect { bad_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /streaming handler must return an Enumerable/)
+    it "hides unexpected exceptions behind INTERNAL" do
+      expect { testing.call(EchoHandler, :Unary, { fail_with: "crash" }) }
+        .to raise_error(Tonic::Rails::RpcError, "internal error") { |e| expect(e.code_name).to eq(:internal) }
     end
 
-    it "raises RpcError when a unary handler returns a non-Hash" do
-      bad_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.BadUnary"
-        rpc :Bad, String, String
-        def bad(request); ["not", "a", "hash"]; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      bad_service.grpc_rpcs["Bad"][:request] = request_class
-      bad_service.grpc_rpcs["Bad"][:response] = response_class
-
-      expect { bad_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /handler must return a Hash/)
+    it "logs unexpected exceptions server-side" do
+      logger = instance_spy(Logger)
+      allow(Tonic::Rails.configuration).to receive(:logger).and_return(logger)
+      expect { testing.call(EchoHandler, :Unary, { fail_with: "crash" }) }.to raise_error(Tonic::Rails::RpcError)
+      expect(logger).to have_received(:error).with(/RuntimeError: secret internal detail/)
     end
 
-    it "supports Enumerator return for lazy streaming" do
-      enum_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.EnumStream"
-        rpc :Gen, String, String, stream: :server
-        def gen(request)
+    it "rejects responses of the wrong type as INTERNAL" do
+      svc = hash_service do
+        def unary(_request) = "not a message"
+      end
+      expect { testing.call(svc, :Unary, {}) }.to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code).to eq(13) }
+    end
+
+    it "returns UNIMPLEMENTED when the handler method is missing" do
+      expect { testing.call(hash_service, :Unary, {}) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:unimplemented) }
+    end
+  end
+
+  describe "call_rpc wire handling" do
+    let(:sender) { Tonic::Rails::Testing::Sender.new }
+
+    def reader(*messages, error: nil)
+      Tonic::Rails::Testing::Reader.new(messages, error: error)
+    end
+
+    it "maps undecodable request bytes to INVALID_ARGUMENT" do
+      expect { EchoHandler.new.call_rpc("Unary", metadata: {}, reader: reader("\xFF\xFF\xFF".b)) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:invalid_argument) }
+    end
+
+    it "requires a request message for unary RPCs" do
+      expect { EchoHandler.new.call_rpc("Unary", metadata: {}, reader: reader) }
+        .to raise_error(Tonic::Rails::RpcError, /missing request/)
+    end
+
+    it "surfaces transport errors reported by the reader" do
+      expect { EchoHandler.new.call_rpc("Unary", metadata: {}, reader: reader(error: [8, "too big"])) }
+        .to raise_error(Tonic::Rails::RpcError, "too big") { |e| expect(e.code).to eq(8) }
+    end
+
+    it "maps a closed response stream to CANCELLED" do
+      closed = Object.new
+      def closed.push(_bytes) = raise(IOError, "closed")
+      bytes = request_class.encode(request_class.new(count: 3))
+      expect { EchoHandler.new.call_rpc("ServerStream", metadata: {}, reader: reader(bytes), sender: closed) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:cancelled) }
+    end
+
+    it "returns UNIMPLEMENTED for undeclared RPCs" do
+      expect { EchoHandler.new.call_rpc("Nope", metadata: {}, reader: reader) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:unimplemented) }
+    end
+  end
+
+  describe "server streaming" do
+    it "streams each element of the returned Enumerable" do
+      responses = testing.call(EchoHandler, :ServerStream, { message: "m", count: 3 })
+      expect(responses.map(&:index)).to eq([0, 1, 2])
+      expect(responses.map(&:message).uniq).to eq(["m"])
+    end
+
+    it "supports empty streams" do
+      expect(testing.call(EchoHandler, :ServerStream, { count: 0 })).to eq([])
+    end
+
+    it "accepts Hash elements" do
+      svc = hash_service do
+        def server_stream(request)
+          Array.new(2) { |i| { "message" => request["message"], "index" => i } }
+        end
+      end
+      expect(testing.call(svc, :ServerStream, { message: "h" }).map(&:index)).to eq([0, 1])
+    end
+
+    it "requires an Enumerable" do
+      svc = hash_service do
+        def server_stream(_request) = 42
+      end
+      expect { testing.call(svc, :ServerStream, {}) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:internal) }
+    end
+
+    it "keeps messages already sent when the handler fails midway" do
+      sender = Tonic::Rails::Testing::Sender.new
+      svc = hash_service do
+        def server_stream(_request)
           Enumerator.new do |y|
-            3.times { |i| y << {"id" => i.to_s} }
+            y << { "index" => 1 }
+            raise Tonic::Rails::RpcError.new("stop", code: :aborted)
           end
         end
       end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); "enc:#{m['id']}"; end
-      end
-
-      enum_service.grpc_rpcs["Gen"][:request] = request_class
-      enum_service.grpc_rpcs["Gen"][:response] = response_class
-
-      result = enum_service.new.call_rpc("Gen", "")
-      expect(result).to eq(["enc:0", "enc:1", "enc:2"])
-    end
-
-    describe "with StreamSender (incremental streaming)" do
-      it "sends all items via stream_sender in order" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.Incremental"
-          rpc :List, String, String, stream: :server
-          def list(request)
-            (1..5).map { |i| {"id" => i.to_s } }
-          end
-        end
-
-        request_class = Class.new { def self.decode(b); {}; end }
-        response_class = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m["id"]; end
-        end
-
-        svc.grpc_rpcs["List"][:request] = request_class
-        svc.grpc_rpcs["List"][:response] = response_class
-
-        sent = []
-        sender = Object.new
-        sender.define_singleton_method(:send) { |encoded| sent << encoded }
-
-        result = svc.new.call_rpc("List", "", metadata: {"_stream_sender" => sender})
-        expect(result).to be_nil # incremental: returns nil after sending
-        expect(sent).to eq(["1", "2", "3", "4", "5"])
-      end
-
-      it "propagates RpcError when stream_sender.send raises mid-stream" do
-        svc = Class.new do
-          include Tonic::Rails::Base
-          service "test.SendError"
-          rpc :List, String, String, stream: :server
-          def list(request)
-            (1..10).map { |i| {"id" => i.to_s } }
-          end
-        end
-
-        request_class = Class.new { def self.decode(b); {}; end }
-        response_class = Class.new do
-          def self.new(h); h; end
-          def self.encode(m); m["id"]; end
-        end
-
-        svc.grpc_rpcs["List"][:request] = request_class
-        svc.grpc_rpcs["List"][:response] = response_class
-
-        # Simulate a channel-closed error on the 3rd message
-        call_count = 0
-        failing_sender = Object.new
-        failing_sender.define_singleton_method(:send) do |encoded|
-          call_count += 1
-          raise "stream send cancelled or channel closed" if call_count == 3
-        end
-
-        expect {
-          svc.new.call_rpc("List", "", metadata: {"_stream_sender" => failing_sender})
-        }.to raise_error(Tonic::Rails::RpcError) do |err|
-          expect(err.code).to eq(14) # UNAVAILABLE
-          expect(err.message).to match(/stream unavailable/)
-        end
-
-        # Messages 4-10 were never sent — the stream is broken
-        expect(call_count).to eq(3)
-      end
+      reader = Tonic::Rails::Testing::Reader.new([request_class.encode(request_class.new)])
+      expect { svc.new.call_rpc("ServerStream", metadata: {}, reader: reader, sender: sender) }
+        .to raise_error(Tonic::Rails::RpcError, "stop")
+      expect(sender.messages.size).to eq(1)
     end
   end
 
-  describe "client-streaming RPCs" do
-    let(:client_stream_service) do
-      Class.new do
-        include Tonic::Rails::Base
-
-        service "test.Upload"
-
-        rpc :UploadOrders, String, String, stream: :client
-
-        def upload_orders(requests)
-          count = 0
-          requests.each { |_req| count += 1 }
-          {"count" => count}
-        end
-      end
+  describe "client streaming" do
+    it "yields each request lazily and returns one response" do
+      response = testing.call(EchoHandler, :ClientStream, [{ message: "a" }, { message: "b" }, { message: "c" }])
+      expect(response.message).to eq("a,b,c")
+      expect(response.index).to eq(3)
     end
 
-    it "registers request_stream: true, response_stream: false" do
-      spec = client_stream_service.grpc_rpcs["UploadOrders"]
-      expect(spec[:request_stream]).to be(true)
-      expect(spec[:response_stream]).to be(false)
+    it "handles an empty request stream" do
+      expect(testing.call(EchoHandler, :ClientStream, []).index).to eq(0)
     end
 
-    it "handler receives an Enumerator and returns a Hash" do
-      request_class = Class.new do
-        def self.decode(bytes); {id: bytes}; end
-      end
-      response_class = Class.new do
-        def self.new(hash); hash; end
-        def self.encode(msg); msg; end
-      end
-
-      client_stream_service.grpc_rpcs["UploadOrders"][:request] = request_class
-      client_stream_service.grpc_rpcs["UploadOrders"][:response] = response_class
-
-      # Test fallback: no _request_reader in metadata, so call_rpc
-      # wraps the single request_bytes in a one-element Enumerator.
-      instance = client_stream_service.new
-      result = instance.call_rpc("UploadOrders", "item1", metadata: {})
-      expect(result).to eq({"count" => 1})
-    end
-
-    it "raises RpcError when handler returns a non-Hash" do
-      bad_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.BadClient"
-        rpc :Bad, String, String, stream: :client
-        def bad(requests); ["not", "a", "hash"]; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      bad_service.grpc_rpcs["Bad"][:request] = request_class
-      bad_service.grpc_rpcs["Bad"][:response] = response_class
-
-      expect { bad_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /handler must return a Hash/)
-    end
-
-    it "raises RpcError :unavailable when request_reader.next raises" do
-      svc = Class.new do
-        include Tonic::Rails::Base
-        service "test.ReaderError"
-        rpc :Bad, String, String, stream: :client
-        def bad(requests); requests.first; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      svc.grpc_rpcs["Bad"][:request] = request_class
-      svc.grpc_rpcs["Bad"][:response] = response_class
-
-      raising_reader = Object.new
-      def raising_reader.next; raise "request reader interrupted"; end
-
-      expect {
-        svc.new.call_rpc("Bad", "", metadata: {"_request_reader" => raising_reader})
-      }.to raise_error(Tonic::Rails::RpcError, /stream read error/)
-    end
-
-    it "raises RpcError :invalid_argument when decode fails on streamed message" do
-      svc = Class.new do
-        include Tonic::Rails::Base
-        service "test.DecodeError"
-        rpc :Bad, String, String, stream: :client
-        def bad(requests); requests.first; end
-      end
-
-      request_class = Class.new { def self.decode(_b); raise "protobuf parse error"; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      svc.grpc_rpcs["Bad"][:request] = request_class
-      svc.grpc_rpcs["Bad"][:response] = response_class
-
-      fake_reader = Object.new
-      def fake_reader.next
-        @called ||= false
-        return nil if @called
-        @called = true
-        "bad bytes"
-      end
-
-      expect {
-        svc.new.call_rpc("Bad", "", metadata: {"_request_reader" => fake_reader})
-      }.to raise_error(Tonic::Rails::RpcError, /invalid protobuf request/)
+    it "raises transport errors from inside the enumeration" do
+      reader = Tonic::Rails::Testing::Reader.new([request_class.encode(request_class.new(message: "a"))],
+                                                 error: [13, "truncated request message"])
+      expect { EchoHandler.new.call_rpc("ClientStream", metadata: {}, reader: reader) }
+        .to raise_error(Tonic::Rails::RpcError, "truncated request message")
     end
   end
 
-  describe "bidi-streaming RPCs" do
-    let(:bidi_service) do
-      Class.new do
-        include Tonic::Rails::Base
-
-        service "test.Chat"
-
-        rpc :Chat, String, String, stream: :bidi
-
-        def chat(messages)
-          messages.map do |msg|
-            {"reply" => "echo: #{msg['id']}"}
-          end
-        end
-      end
-    end
-
-    it "registers request_stream: true, response_stream: true" do
-      spec = bidi_service.grpc_rpcs["Chat"]
-      expect(spec[:request_stream]).to be(true)
-      expect(spec[:response_stream]).to be(true)
-    end
-
-    it "handler receives an Enumerator and returns an Enumerable" do
-      request_class = Class.new do
-        def self.decode(bytes); {id: bytes}; end
-      end
-      response_class = Class.new do
-        def self.new(hash); hash; end
-        def self.encode(msg); "resp:#{msg['reply']}"; end
-      end
-
-      bidi_service.grpc_rpcs["Chat"][:request] = request_class
-      bidi_service.grpc_rpcs["Chat"][:response] = response_class
-
-      # Test fallback: no _request_reader, wraps single request_bytes.
-      instance = bidi_service.new
-      result = instance.call_rpc("Chat", "hello", metadata: {})
-      expect(result).to eq(["resp:echo: hello"])
-    end
-
-    it "raises RpcError when handler returns a non-Enumerable" do
-      bad_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.BadBidi"
-        rpc :Bad, String, String, stream: :bidi
-        def bad(requests); "not enumerable"; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      bad_service.grpc_rpcs["Bad"][:request] = request_class
-      bad_service.grpc_rpcs["Bad"][:response] = response_class
-
-      expect { bad_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /streaming handler must return an Enumerable/)
-    end
-
-    it "raises RpcError when handler returns nil for streaming" do
-      nil_service = Class.new do
-        include Tonic::Rails::Base
-        service "test.NilBidi"
-        rpc :Bad, String, String, stream: :bidi
-        def bad(requests); nil; end
-      end
-
-      request_class = Class.new { def self.decode(b); {}; end }
-      response_class = Class.new do
-        def self.new(h); h; end
-        def self.encode(m); m; end
-      end
-
-      nil_service.grpc_rpcs["Bad"][:request] = request_class
-      nil_service.grpc_rpcs["Bad"][:response] = response_class
-
-      expect { nil_service.new.call_rpc("Bad", "") }
-        .to raise_error(Tonic::Rails::RpcError, /got NilClass/)
+  describe "bidi streaming" do
+    it "responds to each request" do
+      responses = testing.call(EchoHandler, :Bidi, [{ message: "a" }, { message: "b" }])
+      expect(responses.map { |r| [r.message, r.index] }).to eq([["a", 0], ["b", 1]])
     end
   end
 
-  describe "#deadline_ms" do
-    it "returns nil when no deadline is set" do
-      instance = service_class.new
-      instance.instance_variable_set(:@grpc_deadline_at, nil)
-      expect(instance.deadline_ms).to be_nil
-    end
-
-    it "returns remaining milliseconds when a deadline is set" do
-      instance = service_class.new
-      future = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0
-      instance.instance_variable_set(:@grpc_deadline_at, future)
-      remaining = instance.deadline_ms
-      expect(remaining).to be_between(4500, 5000).inclusive
-    end
-
-    it "returns 0 when the deadline has passed" do
-      instance = service_class.new
-      past = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1.0
-      instance.instance_variable_set(:@grpc_deadline_at, past)
-      expect(instance.deadline_ms).to eq(0)
-    end
-
-    it "counts down as time elapses" do
-      instance = service_class.new
-      future = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.1
-      instance.instance_variable_set(:@grpc_deadline_at, future)
-      first = instance.deadline_ms
-      sleep 0.05
-      second = instance.deadline_ms
-      expect(second).to be < first
+  describe "isolation" do
+    it "uses a fresh handler instance per call" do
+      svc = hash_service do
+        def unary(_request)
+          @calls = (@calls || 0) + 1 # rubocop:disable RSpec/InstanceVariable
+          { "index" => @calls } # rubocop:disable RSpec/InstanceVariable
+        end
+      end
+      2.times { expect(testing.call(svc, :Unary, {}).index).to eq(1) }
     end
   end
 
   describe "#cancelled?" do
-    it "returns false when server is not shutting down" do
-      Tonic::Rails._clear_shutting_down
-      instance = service_class.new
-      expect(instance.cancelled?).to be(false)
+    before { Tonic::Rails._set_shutting_down(false) }
+    after { Tonic::Rails._set_shutting_down(false) }
+
+    it "reflects server shutdown" do
+      handler = EchoHandler.new
+      expect(handler.cancelled?).to be(false)
+      Tonic::Rails._set_shutting_down(true)
+      expect(handler.cancelled?).to be(true)
     end
-
-    it "returns true after _set_shutting_down is called" do
-      Tonic::Rails._set_shutting_down
-      instance = service_class.new
-      expect(instance.cancelled?).to be(true)
-    end
-
-    after do
-      Tonic::Rails._clear_shutting_down
-    end
-  end
-
-end
-
-RSpec.describe Tonic::Rails::RpcError do
-  it "maps symbolic codes to numeric gRPC status codes" do
-    expect(Tonic::Rails::RpcError.new("msg", code: :not_found).code).to eq(5)
-    expect(Tonic::Rails::RpcError.new("msg", code: :internal).code).to eq(13)
-    expect(Tonic::Rails::RpcError.new("msg", code: :unauthenticated).code).to eq(16)
-  end
-
-  it "defaults to UNKNOWN (2) for unrecognized codes" do
-    expect(Tonic::Rails::RpcError.new("msg", code: :bogus).code).to eq(2)
   end
 end

@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package demo.v1;
+
+message Item {
+  int64 id = 1;
+  string name = 2;
+  repeated string tags = 3;
+}
+
+message GetItemRequest {
+  int64 id = 1;
+}
+
+message CreateItemRequest {
+  string name = 1;
+  repeated string tags = 2;
+}
+
+message ListItemsRequest {
+  // Only items carrying this tag; empty means all items.
+  string tag = 1;
+}
+
+message ImportItemsResponse {
+  int32 created = 1;
+}
+
+service ItemService {
+  rpc GetItem(GetItemRequest) returns (Item);
+  rpc CreateItem(CreateItemRequest) returns (Item);
+  // Server streaming: one message per matching item.
+  rpc ListItems(ListItemsRequest) returns (stream Item);
+  // Client streaming: create many items in one call.
+  rpc ImportItems(stream CreateItemRequest) returns (ImportItemsResponse);
+}

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-# Define error classes first — base.rb references Tonic::Rails::Error
-# in `class RpcError < Error`, so they must exist before base.rb loads.
+require "google/protobuf"
+
 module Tonic
   module Rails
     class Error < StandardError; end
@@ -10,27 +10,18 @@ module Tonic
 end
 
 require "tonic/rails/version"
+require "tonic/rails/rpc_error"
 require "tonic/rails/configuration"
 require "tonic/rails/router"
 require "tonic/rails/base"
+require "tonic/rails/reflection"
 require "tonic/rails/server"
-
-# Load the Rust native extension (tonic transport via Magnus).
-# Failure is non-fatal at require time so that code that only references
-# Ruby-side types (e.g. in tests without a compiled extension) still loads.
-begin
-  require "tonic/rails/tonic_rails_native"
-rescue LoadError => e
-  warn "tonic-rails: native extension not loaded — #{e.message}"
-end
 
 module Tonic
   module Rails
     @configuration = Configuration.new
-    # Async-safe shutdown flag — set by Server#stop (called from signal
-    # trap), checked by handlers via Tonic::Rails.cancelled? or
-    # Base#cancelled?. Plain boolean assignment is atomic in CRuby.
     @shutting_down = false
+    @native_load_error = nil
 
     class << self
       attr_reader :configuration
@@ -39,28 +30,62 @@ module Tonic
         yield @configuration
       end
 
+      # The process-wide server used by the Railtie and rake tasks.
       def server
         @server ||= Server.new
       end
 
-      # @return [Boolean] true if the server is shutting down — handlers
-      #   should abort in-progress work and return quickly.
+      # True once shutdown has begun.  Long-running handlers (especially
+      # streams) should check this and finish early.
       def cancelled?
         @shutting_down
       end
 
-      # @api private  Called by Server#stop (async-safe, no I/O).
-      def _set_shutting_down
-        @shutting_down = true
+      # @api private
+      def _set_shutting_down(value)
+        @shutting_down = value
       end
 
-      # @api private  Called by Server#start before serving.
-      def _clear_shutting_down
-        @shutting_down = false
+      # @api private
+      # Log an unexpected exception (and hand it to the Rails error
+      # reporter, if present) without exposing it to the client.
+      def log_exception(error, context)
+        configuration.logger&.error(
+          "tonic-rails: #{context}: #{error.class}: #{error.message}\n" \
+          "#{Array(error.backtrace).first(20).join("\n")}",
+        )
+        if defined?(::Rails.error) && ::Rails.respond_to?(:error)
+          ::Rails.error.report(error, handled: true, source: "tonic-rails", context: { rpc: context })
+        end
+      rescue StandardError
+        nil
+      end
+
+      # @api private
+      def native_extension!
+        return if defined?(::TonicRails::Native::Server)
+
+        raise Error, "tonic-rails native extension is not available " \
+                     "(#{@native_load_error&.message || 'unknown error'}). " \
+                     "Reinstall the gem, or run `bundle exec rake compile` in a checkout."
+      end
+
+      # @api private
+      def load_native_extension
+        # Precompiled platform gems ship one binary per Ruby minor version.
+        ruby_version = RUBY_VERSION[/\d+\.\d+/]
+        require "tonic/rails/#{ruby_version}/tonic_rails_native"
+      rescue LoadError
+        begin
+          require "tonic/rails/tonic_rails_native"
+        rescue LoadError => e
+          @native_load_error = e
+        end
       end
     end
+
+    load_native_extension
   end
 end
 
-# Load Railtie if Rails is present
-require "tonic/rails/railtie" if defined?(::Rails::Railtie)
+require "tonic/rails/railtie" if defined?(Rails::Railtie)

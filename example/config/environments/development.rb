@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 Rails.application.configure do
-  config.cache_classes = false
+  config.enable_reloading = true
   config.eager_load = false
   config.consider_all_requests_local = true
   config.log_level = :info
-  config.logger = Logger.new($stdout)
+  config.logger = ActiveSupport::Logger.new($stdout)
 end

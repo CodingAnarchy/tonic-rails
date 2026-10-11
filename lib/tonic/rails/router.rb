@@ -2,56 +2,69 @@
 
 module Tonic
   module Rails
-    # Maps gRPC method paths (e.g. "/helloworld.Greeter/SayHello") to
-    # Ruby service handlers.  The native extension calls back into the
-    # router's #dispatch for each incoming request.
+    # Maps gRPC method paths ("/package.Service/Method") to handler classes.
     class Router
-      # @api private
-      Handler = Struct.new(:service_class, :method_name, :spec, keyword_init: true)
+      Route = Struct.new(:service_class, :rpc_name)
 
       def initialize
         @routes = {}
+        @services = {}
       end
 
-      # @param service_name [String] fully-qualified protobuf service name
-      # @param method_name [String] RPC method name
-      # @param service_class [Class] class including Tonic::Rails::Base
-      # @param rpc_method [String] method to call on the service instance
-      # @param spec [Hash] :request and :response protobuf classes
-      def add(service_name, method_name, service_class, rpc_method, spec)
-        path = "/#{service_name}/#{method_name}"
-        @routes[path] = Handler.new(
-          service_class: service_class,
-          method_name: rpc_method,
-          spec: spec,
-        )
+      # Register (or re-register, e.g. after a code reload) every RPC of
+      # a handler class.
+      # @param service_class [Class] a class including Tonic::Rails::Base
+      def add(service_class)
+        name = service_class.grpc_service_name
+        @routes.delete_if { |_, route| route.service_class.grpc_service_name == name }
+        @services[name] = service_class
+        service_class.grpc_rpcs.each_key do |rpc_name|
+          @routes["/#{name}/#{rpc_name}"] = Route.new(service_class, rpc_name)
+        end
+        self
       end
 
       # @param path [String] gRPC method path
-      # @param request_bytes [String] raw protobuf request bytes
-      # @param metadata [Hash] gRPC metadata
-      # @return [String] encoded protobuf response bytes
-      # @raise [Error] if no handler is registered for the path
-      def dispatch(path, request_bytes, metadata: {})
-        handler = @routes[path]
-        raise Error, "No handler registered for #{path}" unless handler
+      # @param metadata [Hash{String=>String}]
+      # @param call [Hash] :reader, :sender and optional :timeout_ms from the transport
+      # @return [String, nil] encoded unary response, or nil for streamed responses
+      def dispatch(path, metadata, call)
+        route = @routes[path]
+        raise RpcError.new("unknown method #{path}", code: :unimplemented) unless route
 
-        # Fresh instance per request — handler @ivars must not bleed
-        # across requests on reused dispatch threads. The Rails executor
-        # resets CurrentAttributes and AR connections, but cannot reset
-        # arbitrary instance variables on cached handler objects.
-        instance = handler.service_class.new
-        instance.call_rpc(handler.method_name, request_bytes, metadata: metadata)
+        resolve(route.service_class).new.call_rpc(
+          route.rpc_name,
+          metadata: metadata,
+          reader: call[:reader],
+          sender: call[:sender],
+          timeout_ms: call[:timeout_ms],
+        )
       end
 
-      # @return [Array<String>] all registered gRPC method paths
+      # @return [Array<String>] registered gRPC method paths
       def paths
         @routes.keys
       end
 
-      # @return [Boolean]
+      # @return [Array<String>] registered fully-qualified service names
+      def service_names
+        @services.keys
+      end
+
       def empty?
         @routes.empty?
+      end
+
+      private
+
+      # With code reloading on, look the class up again so edits to
+      # handler bodies take effect without a restart.
+      def resolve(service_class)
+        return service_class unless Tonic::Rails.configuration.reload_handlers
+
+        Object.const_get(service_class.name)
+      rescue NameError
+        service_class
       end
     end
   end

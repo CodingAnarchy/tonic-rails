@@ -5,119 +5,84 @@ require "logger"
 module Tonic
   module Rails
     class Configuration
-      # Address the gRPC server binds to.
-      # @return [String] host:port, defaults to "0.0.0.0:50051"
+      # Address the gRPC server binds to ("host:port").  Default "0.0.0.0:50051".
       attr_accessor :bind_address
 
-      # Maximum message size in bytes for both request and response.
-      # @return [Integer]
+      # Maximum request and response message size in bytes (also caps
+      # decompressed payloads).  Default 4 MiB.
       attr_accessor :max_message_size
 
-      # Whether to auto-start the gRPC server alongside the Rails server.
-      # Set to false if you prefer to start it explicitly (e.g. in a separate process).
-      # @return [Boolean]
+      # Start the gRPC server in a background thread when `rails server`
+      # boots.  Prefer a dedicated process (`bin/rails tonic_rails:serve`)
+      # in production.  Default false.
       attr_accessor :auto_start
 
-      # Logger used by the gRPC server and dispatch layer.
-      # @return [Logger]
       attr_accessor :logger
 
-      # Number of tokio worker threads for the tonic transport layer.
-      # Defaults to the number of CPU cores.
-      # @return [Integer, nil]
+      # Tokio worker threads for the transport.  nil = number of CPUs.
       attr_accessor :worker_threads
 
-      # Number of Ruby dispatch threads that drain the request channel.
-      # Each thread calls rb_thread_call_without_gvl to wait for requests
-      # and re-acquires the GVL to run handlers.  When one handler does
-      # blocking I/O (sleep, DB, HTTP — releases the GVL internally),
-      # another dispatch thread can pick up the next request and run its
-      # handler concurrently.  Default: 4.
-      # @return [Integer]
+      # Ruby threads running handlers.  Match your ActiveRecord pool size
+      # (RAILS_MAX_THREADS).  Default 4.
       attr_accessor :dispatch_threads
 
-      # Path to a PEM-encoded TLS certificate file.  When both this and
-      # tls_key_path are set, the server accepts TLS-encrypted gRPC
-      # connections with ALPN "h2" negotiation.
-      # @return [String, nil]
-      attr_accessor :tls_cert_path
+      # RPCs that may wait for a free dispatch thread.  Beyond this the
+      # server answers RESOURCE_EXHAUSTED immediately.  Default 128.
+      attr_accessor :dispatch_queue_size
 
-      # Path to a PEM-encoded TLS private key file.
-      # @return [String, nil]
-      attr_accessor :tls_key_path
+      # PEM certificate and private key.  Set both to enable TLS.
+      attr_accessor :tls_cert_path, :tls_key_path
 
-      # Graceful shutdown drain timeout in seconds.  When the server
-      # receives a shutdown signal, it stops accepting new connections
-      # and waits this long for active connections to finish in-flight
-      # requests before force-closing them.  Default: 10.
-      # @return [Integer]
+      # PEM CA bundle.  When set, clients must present a certificate
+      # signed by it (mutual TLS).
+      attr_accessor :tls_client_ca_path
+
+      # Seconds to wait for in-flight RPCs during shutdown.  Default 10.
       attr_accessor :drain_timeout
 
-      # Maximum number of concurrent TCP connections.  New connections
-      # exceeding this limit are dropped.  Set to 0 for unlimited.
-      # Default: 64.
-      # @return [Integer]
+      # Concurrent TCP connections; extra connections are refused.
+      # 0 = unlimited.  Default 64.
       attr_accessor :max_connections
 
-      # Maximum number of concurrent HTTP/2 streams per connection.
-      # Prevents a single client from exhausting the dispatch queue
-      # with many concurrent requests.  Default: 32.
-      # @return [Integer]
+      # Concurrent HTTP/2 streams per connection.  0 = unlimited.  Default 32.
       attr_accessor :concurrency_limit_per_connection
 
-      # When true, log every request (including successful ones) to stderr.
-      # Errors are always logged regardless.  Default: false.
-      # @return [Boolean]
+      # Log every request, not just errors, to stderr.  Default false.
       attr_accessor :log_requests
 
-      # Array of interceptors (procs/lambdas) that wrap each request.
-      # Each interceptor is called with (path, request, metadata, next_call)
-      # and must call next_call.(path, request, metadata) to continue the
-      # chain, or return early to short-circuit.  Interceptors are applied
-      # in reverse order (last added = outermost wrapper).
-      # @return [Array[Proc]]
+      # Callables wrapping every RPC, outermost first:
+      #
+      #   ->(path, metadata, next_call) { next_call.call }
+      #
+      # Raise RpcError to reject the call.
       attr_accessor :interceptors
 
-      # Enable gzip compression for gRPC responses. When true, the server
-      # compresses responses larger than 1KB if the client indicates gzip
-      # support via the grpc-accept-encoding header. Inbound compressed
-      # requests are always decompressed regardless of this setting.
-      # @return [Boolean]
+      # gzip responses larger than 1 KiB for clients that accept it.
+      # Compressed requests are always accepted.  Default false.
       attr_accessor :compression
 
-      # Enable gRPC reflection service (grpc.reflection.v1.ServerReflection).
-      # When enabled, clients like grpcurl can discover services without
-      # local .proto files.  Disable in production to avoid exposing API
-      # schema.  Default: false (disabled for security; enable in
-      # development initializers).
-      # @return [Boolean]
+      # Serve grpc.reflection.v1 (for grpcurl and friends).  Exposes your
+      # API schema; keep it off in production.  Default false.
       attr_accessor :reflection
 
-      # HTTP/2 keepalive ping interval in seconds.  A PING frame is sent
-      # every this many seconds to keep the connection alive and detect
-      # dead peers.  Default: 15.
-      # @return [Integer]
-      attr_accessor :keepalive_interval
+      # HTTP/2 PING interval and ack timeout, in seconds.  Defaults 15 / 5.
+      attr_accessor :keepalive_interval, :keepalive_timeout
 
-      # HTTP/2 keepalive timeout in seconds.  If no pong is received
-      # within this many seconds after a ping, the connection is dropped.
-      # Default: 5.
-      # @return [Integer]
-      attr_accessor :keepalive_timeout
+      # Look handler classes up again on each request so code reloading
+      # works.  The Railtie enables this when Rails reloading is on.
+      attr_accessor :reload_handlers
 
-      # Directory containing .proto files. Used by rpc_service to
-      # auto-register RPCs from proto declarations. Default: "protos".
-      # @return [String]
-      attr_accessor :proto_dir
       def initialize
         @bind_address = "0.0.0.0:50051"
-        @max_message_size = 4 * 1024 * 1024  # 4 MB
+        @max_message_size = 4 * 1024 * 1024
         @auto_start = false
         @logger = Logger.new($stdout)
         @worker_threads = nil
         @dispatch_threads = 4
+        @dispatch_queue_size = 128
         @tls_cert_path = nil
         @tls_key_path = nil
+        @tls_client_ca_path = nil
         @drain_timeout = 10
         @max_connections = 64
         @concurrency_limit_per_connection = 32
@@ -127,7 +92,57 @@ module Tonic
         @reflection = false
         @keepalive_interval = 15
         @keepalive_timeout = 5
-        @proto_dir = "protos"
+        @reload_handlers = false
+      end
+
+      def tls?
+        !tls_cert_path.nil? && !tls_key_path.nil?
+      end
+
+      # @raise [ArgumentError] describing the first invalid setting
+      def validate!
+        positive_integer!(:dispatch_threads)
+        positive_integer!(:dispatch_queue_size)
+        positive_integer!(:max_message_size)
+        non_negative_integer!(:max_connections)
+        non_negative_integer!(:concurrency_limit_per_connection)
+        positive_integer!(:worker_threads) unless worker_threads.nil?
+        %i[drain_timeout keepalive_interval keepalive_timeout].each { |name| non_negative_number!(name) }
+
+        raise ArgumentError, "max_message_size must be at most 4 GiB" if max_message_size > 0xFFFF_FFFF
+        raise ArgumentError, "tls_cert_path and tls_key_path must be set together" if tls_cert_path.nil? != tls_key_path.nil?
+        raise ArgumentError, "tls_client_ca_path requires tls_cert_path and tls_key_path" if tls_client_ca_path && !tls?
+        unless interceptors.respond_to?(:each) && interceptors.all? { |i| i.respond_to?(:call) }
+          raise ArgumentError, "interceptors must be an Array of callables"
+        end
+
+        self
+      end
+
+      private
+
+      def positive_integer!(name)
+        value = public_send(name)
+        return if value.is_a?(Integer) && value.positive?
+
+        raise ArgumentError,
+              "#{name} must be a positive Integer, got #{value.inspect}"
+      end
+
+      def non_negative_integer!(name)
+        value = public_send(name)
+        return if value.is_a?(Integer) && !value.negative?
+
+        raise ArgumentError,
+              "#{name} must be a non-negative Integer, got #{value.inspect}"
+      end
+
+      def non_negative_number!(name)
+        value = public_send(name)
+        return if value.is_a?(Numeric) && !value.negative?
+
+        raise ArgumentError,
+              "#{name} must be a non-negative number, got #{value.inspect}"
       end
     end
   end

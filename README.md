@@ -1,363 +1,391 @@
 # tonic-rails
 
-gRPC endpoints for Rails, powered by [tonic] via a Rust native extension.
+[![CI](https://github.com/CodingAnarchy/tonic-rails/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingAnarchy/tonic-rails/actions/workflows/ci.yml)
+[![Gem Version](https://badge.fury.io/rb/tonic-rails.svg)](https://rubygems.org/gems/tonic-rails)
 
-tonic-rails brings gRPC to Rails applications. The HTTP/2 transport layer
-(framing, connection management, flow control, TLS, health checks, reflection)
-is implemented in Rust using [tonic] and exposed to Ruby through a native
-extension built with [Magnus]. Protobuf (de)serialization and business logic
-remain in Ruby, giving you Rails-grade controllers, routing, and middleware
-for your gRPC services.
+Serve gRPC from your Rails app, with the transport handled by
+[tonic], Rust's production gRPC stack.
 
-## Architecture
+Think of it like Puma for gRPC. Puma handles sockets and HTTP so your
+controllers only see requests. tonic-rails does the same for gRPC:
+HTTP/2, TLS, flow control, keepalives, health checks and reflection all
+run in Rust, outside the GVL. Your handlers are plain Ruby classes that
+receive protobuf messages and return them, inside the Rails executor,
+with your models, caches and error reporting all available.
 
-```
-                     ┌─────────────────────────────────┐
-                     │         Rust (tonic)             │
-  gRPC client ──H2──▶│  HTTP/2 transport + framing      │
-                     │  tonic-health (Rust-native)      │
-                     │  tonic-reflection (Rust-native)  │
-                     │  ┌─────────────────────────┐     │
-                     │  │  GVL bridge (Magnus)    │     │
-                     │  │  raw bytes ──▶ Ruby     │     │
-                     │  │  raw bytes ◀── Ruby     │     │
-                     │  └─────────────────────────┘     │
-                     └────────────┬────────────────────┘
-                                  │ GVL
-                     ┌────────────▼────────────────────┐
-                     │         Ruby (Rails)             │
-                     │  google-protobuf decode (C ext)  │
-                     │  handler (your business logic)   │
-                     │  google-protobuf encode (C ext)  │
-                     └─────────────────────────────────┘
+```ruby
+class ItemService
+  include Tonic::Rails::Base
+  rpc_service "demo.v1.ItemService"
+  request_format :message
+
+  def get_item(request)
+    item = Item.find_by(id: request.id)
+    raise Tonic::Rails::RpcError.new("item not found", code: :not_found) unless item
+
+    Demo::V1::Item.new(id: item.id, name: item.name)
+  end
+end
 ```
 
-The transport layer runs in Rust without the GVL. Application RPCs cross
-the GVL boundary via `rb_thread_call_with_gvl` to execute Ruby handlers.
-During blocking I/O (DB queries, HTTP calls), the GVL is released, allowing
-other dispatch threads to run concurrently.
+## Why tonic-rails
 
-`grpc.health.v1.Health/Check` and `grpc.reflection.v1.ServerReflection/*`
-are served entirely in Rust — zero GVL overhead.
+- **Fast where it counts.** Transport overhead is small: an empty RPC
+  runs at roughly 75–80% of a pure-Rust tonic server's throughput. I/O-bound
+  handlers scale with dispatch threads because Ruby releases the GVL
+  while waiting. See [PERF.md](PERF.md).
+- **All four RPC kinds.** Unary, server streaming, client streaming and
+  bidirectional streaming, with backpressure in both directions.
+- **Production defaults.** Graceful draining on SIGTERM, health checks
+  that flip to NOT_SERVING during shutdown, deadlines, message size and
+  connection limits, load shedding, gzip, TLS and mutual TLS.
+- **Safe by default.** Unexpected exceptions reach clients as a generic
+  INTERNAL error (the details go to your logs and `Rails.error`).
+  Reflection is off unless you turn it on. TLS problems stop the server
+  instead of silently falling back to plaintext.
+- **No Rust toolchain needed** on the platforms we ship precompiled gems
+  for (Linux and macOS, x86_64 and arm64).
 
 ## Installation
 
-Add to your Gemfile:
-
 ```ruby
+# Gemfile
 gem "tonic-rails"
+gem "google-protobuf"
 ```
 
-Then install:
+Requires Ruby 3.3+ and Rails 7.1+ (or just ActiveSupport, outside Rails).
+On platforms without a precompiled gem, installation builds the
+extension from source, which needs a [Rust toolchain](https://rustup.rs).
 
-```sh
-bundle install
-rake compile   # builds the Rust native extension
-```
-
-The native extension requires Rust (via [rustup] or Homebrew) and
-`protoc` (the Protocol Buffer compiler).
+To generate Ruby classes from your `.proto` files you also need `protoc`
+(the Protocol Buffers compiler) during development.
 
 ## Quick start
 
-### 1. Define your proto
+### 1. Define the service
 
 ```protobuf
+// app/protos/items.proto
 syntax = "proto3";
-package shop;
+package demo.v1;
 
-service ProductService {
-  rpc GetProduct(GetProductRequest) returns (Product);
-  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+message Item { int64 id = 1; string name = 2; }
+message GetItemRequest { int64 id = 1; }
+
+service ItemService {
+  rpc GetItem(GetItemRequest) returns (Item);
 }
-
-message GetProductRequest { int64 id = 1; }
-message Product { int64 id = 1; string title = 2; int64 price_cents = 3; }
-message HealthCheckRequest {}
-message HealthCheckResponse { bool healthy = 1; }
 ```
 
-Generate Ruby protobuf classes:
+Generate the Ruby classes:
 
 ```sh
-protoc --ruby_out=app/grpc -Iprotos protos/shop.proto
+bin/rails tonic_rails:compile_protos   # app/protos → lib/grpc
 ```
 
-### 2. Define a service handler
-
-#### Auto-registration from proto (recommended)
-
-Use `rpc_service` to auto-register all RPCs from the `.proto` file —
-no need to declare each `rpc :Method, Req, Resp` individually:
+Generated files `require` each other by name, so keep them out of the
+autoload paths and put their directory on the load path:
 
 ```ruby
-class ProductService
-  include Tonic::Rails::Base
-  rpc_service "shop.ProductService"  # scans config.proto_dir
+# config/application.rb
+$LOAD_PATH.unshift(File.expand_path("../lib/grpc", __dir__))
 
-  def get_product(request)
-    product = Product.find(request["id"])
-    raise Tonic::Rails::RpcError.new("not found", code: :not_found) unless product
-
-    {
-      "id" => product.id,
-      "title" => product.title,
-      "price_cents" => product.price_cents,
-    }
-  end
-
-  def health_check(_request)
-    { "healthy" => true }
+module MyApp
+  class Application < Rails::Application
+    config.autoload_lib(ignore: %w[grpc])
   end
 end
 ```
 
-`rpc_service` sets the service name and registers all RPCs by parsing
-the `.proto` file. The proto directory defaults to `"protos"` and can
-be configured:
+### 2. Write a handler
+
+Handlers live anywhere Rails autoloads from; `app/grpc` is a good home.
+Each RPC maps to a snake_case method.
 
 ```ruby
-Tonic::Rails.configure do |config|
-  config.proto_dir = "app/protos"
+# app/grpc/item_service.rb
+require "items_pb"
+
+class ItemService
+  include Tonic::Rails::Base
+
+  rpc_service "demo.v1.ItemService"   # every RPC, read from the descriptor
+  request_format :message             # receive protobuf messages
+
+  def get_item(request)
+    item = Item.find(request.id)
+    Demo::V1::Item.new(id: item.id, name: item.name)
+  rescue ActiveRecord::RecordNotFound
+    raise Tonic::Rails::RpcError.new("item #{request.id} not found", code: :not_found)
+  end
 end
 ```
 
-Or specify the proto file explicitly:
+### 3. Register and run
+
+Register handlers in `to_prepare` so they work with code reloading:
 
 ```ruby
-rpc_service "shop.v1.ProductService", proto_file: "protos/shop.proto"
-```
-
-#### Manual registration
-
-For finer control, declare each RPC individually:
-
-```ruby
-class ProductService
-  include Tonic::Rails::Base
-  service "shop.ProductService"
-  rpc :GetProduct, Shop::GetProductRequest, Shop::Product
-  rpc :HealthCheck, Shop::HealthCheckRequest, Shop::HealthCheckResponse
+# config/initializers/tonic_rails.rb
+Rails.application.config.to_prepare do
+  Tonic::Rails.server.register(ItemService)
 end
 ```
 
-Handlers receive a decoded Hash (via `google-protobuf`) and return a Hash
-that gets encoded back to protobuf. Raise `Tonic::Rails::RpcError` for
-gRPC error codes. The Ruby class name is irrelevant — routing is by the
-`service` declaration.
+```sh
+bin/rails tonic_rails:serve    # serves on 0.0.0.0:50051
+bin/rails tonic_rails:routes   # lists registered methods
+```
 
-### Server-streaming RPCs
+Run it as its own process (a separate Procfile entry, container or
+Kubernetes deployment) next to your web server.
 
-Declare a server-streaming RPC with `stream: :server`:
+The [example app](example/) is a complete, runnable version of all of the
+above.
+
+## Handlers
+
+### Requests and responses
+
+By default handlers receive a string-keyed Hash. With
+`request_format :message` they receive the decoded protobuf message
+instead, which is faster and type-safe. Either way, return a protobuf
+message or a Hash:
 
 ```ruby
-class ProductService
+def get_item(request)
+  { "id" => request.id, "name" => "Widget" }   # a Hash works too
+end
+```
+
+A fresh handler instance serves each call, so instance variables never
+leak between requests.
+
+### Declaring RPCs
+
+`rpc_service "package.Service"` reads every RPC (and its streaming kind)
+from the generated descriptor. To declare RPCs one at a time instead:
+
+```ruby
+class ItemService
   include Tonic::Rails::Base
-  service "shop.ProductService"
+  service "demo.v1.ItemService"
 
-  rpc :ListProducts, Shop::ListProductsRequest, Shop::Product, stream: :server
+  rpc :GetItem, Demo::V1::GetItemRequest, Demo::V1::Item
+  rpc :ListItems, Demo::V1::ListItemsRequest, Demo::V1::Item, stream: :server
+end
+```
 
-  def list_products(request)
-    Product.where("price_cents <= ?", request["max_price_cents"]).map do |p|
-      {
-        "id" => p.id,
-        "title" => p.title,
-        "price_cents" => p.price_cents,
-      }
+RPCs declared without a handler method answer `UNIMPLEMENTED`.
+
+### Streaming
+
+Server streaming: return any Enumerable. Messages go out as you produce
+them, and if the client reads slowly your handler waits (without holding
+the GVL) instead of buffering everything in memory.
+
+```ruby
+def list_items(request)
+  Enumerator.new do |stream|
+    Item.where(tag: request.tag).find_each do |item|
+      break if cancelled?   # the server is shutting down
+      stream << Demo::V1::Item.new(id: item.id, name: item.name)
     end
   end
 end
 ```
 
-Streaming handlers return an Enumerable (Array, Enumerator, etc.) of
-response Hashes. Each element is encoded as a separate gRPC message and
-sent incrementally through a bounded mpsc channel (capacity 32) to the
-Rust transport layer — peak memory is one message, not the full
-collection. Backpressure is natural: when the client consumes slowly,
-the channel fills, the handler blocks (GVL released), and HTTP/2 flow
-control backpressures the client.
-
-### Client-streaming RPCs
-
-Declare with `stream: :client` — the handler receives an Enumerator
-of decoded request Hashes and returns a single response Hash:
+Client streaming: the argument is an Enumerator that yields each request
+as it arrives.
 
 ```ruby
-class ProductService
-  include Tonic::Rails::Base
-  service "shop.ProductService"
+def import_items(requests)
+  created = requests.count { |r| Item.create!(name: r.name) }
+  Demo::V1::ImportItemsResponse.new(created: created)
+end
+```
 
-  rpc :ImportProducts, Shop::Product, Shop::ImportSummary, stream: :client
+Bidirectional streaming combines both: take the request Enumerator and
+return an Enumerable. Responses can be sent before the client finishes
+sending.
 
-  def import_products(requests)
-    count = 0
-    requests.each { |req| Product.create!(req); count += 1 }
-    { "imported" => count }
+```ruby
+def chat(messages)
+  Enumerator.new do |out|
+    messages.each { |m| out << Demo::V1::Reply.new(text: m.text.upcase) }
   end
 end
 ```
 
-### Bidirectional-streaming RPCs
+### Errors
 
-Declare with `stream: :bidi` — the handler receives an Enumerator of
-request Hashes and returns an Enumerable of response Hashes:
+Raise `Tonic::Rails::RpcError` to end a call with a status:
 
 ```ruby
-class ChatService
-  include Tonic::Rails::Base
-  service "chat.ChatService"
+raise Tonic::Rails::RpcError.new("name is required", code: :invalid_argument)
+```
 
-  rpc :Chat, Chat::Message, Chat::Message, stream: :bidi
+Codes are the standard gRPC names (`:not_found`, `:permission_denied`,
+`:unauthenticated`, `:unavailable`, and so on) or their numbers. The
+message goes to the client, so keep internal details out of it.
 
-  def chat(messages)
-    messages.lazy.map { |msg| { "text" => msg["text"].reverse } }
-  end
+Any other exception becomes `INTERNAL` with the message `internal error`.
+The real exception is logged and passed to `Rails.error.report`, so your
+error tracker sees it.
+
+### Metadata, deadlines and shutdown
+
+```ruby
+def get_item(request)
+  token = grpc_metadata["authorization"]   # request headers, lower-case
+  deadline_ms                                # ms left before the client's deadline, or nil
+  deadline_exceeded?                         # true once it has passed
+  cancelled?                                 # true while the server shuts down
 end
 ```
 
-### 3. Configure and start
+When the deadline passes, the client gets `DEADLINE_EXCEEDED` right away;
+check `deadline_exceeded?` in long loops to stop wasted work.
+
+### Interceptors
+
+Interceptors wrap every call, outermost first. Call `next_call` to
+continue, or raise to reject:
 
 ```ruby
-# config/initializers/tonic_rails.rb
 Tonic::Rails.configure do |config|
-  config.bind_address = "0.0.0.0:50051"
-  config.dispatch_threads = ENV.fetch("RAILS_MAX_THREADS", "4").to_i
-  config.auto_start = true  # start alongside Rails server
+  config.interceptors << lambda do |path, metadata, next_call|
+    unless valid_token?(metadata["authorization"])
+      raise Tonic::Rails::RpcError.new("invalid token", code: :unauthenticated)
+    end
+    next_call.call
+  end
 end
-
-# Register services
-Tonic::Rails.server.register(ProductService)
 ```
 
-Or start manually:
+## Testing handlers
+
+`Tonic::Rails::Testing` calls a handler in-process, with real protobuf
+encoding, no network and no native extension:
 
 ```ruby
-Tonic::Rails.server.start
+require "tonic/rails/testing"
+
+response = Tonic::Rails::Testing.call(ItemService, :GetItem, { id: 1 })
+expect(response.name).to eq("Widget")
+
+expect { Tonic::Rails::Testing.call(ItemService, :GetItem, { id: 0 }) }
+  .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:not_found) }
+
+# Streaming: pass an Array of requests, get an Array of responses
+Tonic::Rails::Testing.call(ItemService, :ImportItems, [{ name: "a" }, { name: "b" }])
 ```
 
 ## Configuration
 
+Set options in `config/application.rb` or an environment file:
+
+```ruby
+config.tonic_rails.bind_address = "0.0.0.0:50051"
+config.tonic_rails.dispatch_threads = ENV.fetch("RAILS_MAX_THREADS", 5).to_i
+```
+
+or with a block (which runs after, and wins over, `config.tonic_rails`):
+
+```ruby
+Tonic::Rails.configure do |config|
+  config.tls_cert_path = "/etc/tls/tls.crt"
+  config.tls_key_path = "/etc/tls/tls.key"
+end
+```
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `proto_dir` | `"protos"` | Directory scanned by `rpc_service` for `.proto` files |
-| `bind_address` | `0.0.0.0:50051` | Host and port to bind |
-| `dispatch_threads` | `4` | Ruby dispatch threads (set to `RAILS_MAX_THREADS`) |
-| `worker_threads` | num CPUs | Tokio worker threads for transport |
-| `max_message_size` | 4 MB | Max request/response size (also caps decompressed payload) |
-| `tls_cert_path` | nil | PEM certificate path for TLS |
-| `tls_key_path` | nil | PEM private key path for TLS |
-| `drain_timeout` | 10s | Graceful shutdown drain timeout |
-| `max_connections` | 64 | Max concurrent TCP connections (enforced via semaphore) |
-| `concurrency_limit_per_connection` | 32 | Max concurrent HTTP/2 streams per connection |
-| `auto_start` | false | Start alongside Rails server |
-| `log_requests` | false | Log every request (not just errors) |
-| `interceptors` | `[]` | Array of interceptor procs |
-| `compression` | false | Enable gRPC gzip compression (responses >1KB) |
-| `reflection` | false | Enable gRPC reflection (enable in development only) |
-| `keepalive_interval` | 15s | HTTP/2 keepalive ping interval |
-| `keepalive_timeout` | 5s | HTTP/2 keepalive ping timeout |
+| `bind_address` | `"0.0.0.0:50051"` | Address to listen on |
+| `dispatch_threads` | `4` | Ruby threads running handlers; match your database pool |
+| `dispatch_queue_size` | `128` | Calls that may wait for a thread; beyond this, `RESOURCE_EXHAUSTED` |
+| `worker_threads` | CPU count | Tokio threads for the transport |
+| `max_message_size` | 4 MiB | Request and response limit (also caps decompressed size) |
+| `max_connections` | `64` | Concurrent connections; `0` = unlimited |
+| `concurrency_limit_per_connection` | `32` | Concurrent streams per connection; `0` = unlimited |
+| `tls_cert_path`, `tls_key_path` | `nil` | PEM certificate and key; set both to enable TLS |
+| `tls_client_ca_path` | `nil` | PEM CA bundle; requires client certificates (mutual TLS) |
+| `drain_timeout` | `10` | Seconds to let in-flight calls finish on shutdown |
+| `keepalive_interval`, `keepalive_timeout` | `15`, `5` | HTTP/2 PING interval and timeout, seconds |
+| `compression` | `false` | gzip responses over 1 KiB for clients that accept it |
+| `reflection` | `false` | Serve `grpc.reflection.v1`; exposes your schema |
+| `interceptors` | `[]` | See [Interceptors](#interceptors) |
+| `log_requests` | `false` | Log every call to stderr (errors are always logged) |
+| `auto_start` | `false` | Start inside `rails server` (see below) |
 
-### Dispatch threads
+### Sizing threads
 
-`dispatch_threads` should match `RAILS_MAX_THREADS` so the dispatch thread
-pool stays in sync with the ActiveRecord connection pool. Each dispatch
-thread can run one Ruby handler at a time; during blocking I/O (DB queries),
-the GVL is released and another thread runs concurrently.
+Handlers run on `dispatch_threads` Ruby threads. Blocking I/O (database,
+HTTP) releases the GVL, so more threads means more concurrent I/O. CPU
+work does not parallelise within a process. Set threads to the
+concurrency your I/O needs, size the database pool to match, and add
+processes for CPU-heavy services: the listener uses `SO_REUSEPORT`, so
+several processes can bind the same port.
 
-For high-throughput I/O-bound workloads, 16 threads per process is the
-sweet spot. Use SO_REUSEPORT with multiple processes for higher aggregate
-throughput.
+### auto_start
 
-## Features
+`auto_start = true` starts the gRPC server in a background thread of
+`rails server` (never in consoles, rake tasks or tests). It's handy in
+development. In production prefer a dedicated `tonic_rails:serve`
+process: forking servers such as Puma in cluster mode would need to
+start one per worker.
 
-- **HTTP/2 transport**: tonic-based, with TLS, keepalive, and SO_REUSEPORT
-- **Health checks**: `grpc.health.v1.Health/Check` served natively in Rust
-- **Reflection**: `grpc.reflection.v1.ServerReflection` for `grpcurl` / client discovery
-- **Graceful shutdown**: drain timeout with in-flight request tracking
-- **Interceptors**: request middleware chain (auth, logging, tracing)
-- **Metadata**: gRPC metadata headers passed to handlers
-- **Deadlines**: per-request deadline propagation and enforcement
-- **Cancellation**: `Tonic::Rails.cancelled?` for graceful shutdown
-- **Compression**: gRPC frame-level gzip (responses >1KB when enabled)
-- **Streaming RPCs**: server (`stream: :server`), client (`stream: :client`),
-  and bidirectional (`stream: :bidi`) — incremental via bounded mpsc channel
-  with GVL-released backpressure
-- **Message size limits**: configurable max message size
-- **Stats**: connection count, request count, latency tracking
+## Operations
 
-### Proto compilation
+- **Health checks.** `grpc.health.v1.Health` reports `SERVING` for the
+  server (`""`) and every registered service, and flips to `NOT_SERVING`
+  as soon as shutdown begins. Point your load balancer or Kubernetes
+  gRPC probes at it.
+- **Graceful shutdown.** On SIGTERM or SIGINT the server stops
+  accepting connections, tells clients to go away (HTTP/2 GOAWAY), lets
+  in-flight calls finish for up to `drain_timeout` seconds, then exits.
+- **Load shedding.** When every dispatch thread is busy and the queue is
+  full, new calls fail fast with `RESOURCE_EXHAUSTED` instead of piling up.
+- **Stats.** `Tonic::Rails.server.stats` returns counters for totals,
+  successes, errors, cancellations, deadline and resource errors, active
+  connections and queued calls.
+- **Reflection.** Turn on `reflection` in development to use
+  [grpcurl](https://github.com/fullstorydev/grpcurl) without proto files.
 
-Generate Ruby protobuf classes from `.proto` files:
+## How it works
+
+```
+ client ──HTTP/2──▶ tonic (Rust, no GVL)
+                     ├─ TLS, flow control, keepalive, limits
+                     ├─ grpc.health.v1, grpc.reflection.v1
+                     └─ everything else ─▶ queue ─▶ Ruby dispatch thread
+                                                   (takes the GVL)
+                                                   decode → handler → encode
+```
+
+Rust never decodes your messages; it passes raw protobuf bytes to Ruby,
+where the `google-protobuf` C extension decodes them once. Routes come
+from the handlers you register, so nothing about your services is
+compiled into the extension.
+
+## Development
 
 ```sh
-rake tonic_rails:compile_protos          # uses app/protos → app/grpc
-PROTO_DIR=protos RUBY_OUT=app/grpc \
-  rake tonic_rails:compile_protos        # custom paths
+bundle install
+bundle exec rake compile   # build the extension (needs Rust)
+bundle exec rake           # Ruby specs + Rust unit tests
+bundle exec rubocop
+bundle exec rake cargo:lint
 ```
 
-Requires `protoc` (`brew install protobuf`).
-
-### Deadline propagation
-
-When a client sends a `grpc-timeout` header, the Rust layer injects
-`_timeout_ms` (remaining milliseconds) into the handler metadata.
-Check the remaining budget in your handler:
-
-```ruby
-def get_product(request)
-  return if cancelled?  # server shutting down
-  remaining = deadline_ms  # nil if no deadline set
-  # abort if deadline is close
-  raise Tonic::Rails::RpcError.new("deadline too tight", code: :deadline_exceeded) if remaining && remaining < 10
-  # ...
-end
-```
-
-## Error handling
-
-```ruby
-def get_product(request)
-  product = Product.find_by(id: request["id"])
-  raise Tonic::Rails::RpcError.new("product not found", code: :not_found) unless product
-  raise Tonic::Rails::RpcError.new("invalid id", code: :invalid_argument) if request["id"] <= 0
-  # ...
-end
-```
-
-Supported codes: `:ok`, `:cancelled`, `:unknown`, `:invalid_argument`,
-`:not_found`, `:already_exists`, `:permission_denied`, `:unauthenticated`,
-`:resource_exhausted`, `:failed_precondition`, `:aborted`, `:out_of_range`,
-`:unimplemented`, `:internal`, `:unavailable`, `:data_loss`.
-
-## Testing
-
-```sh
-bundle exec rspec
-```
-
-## Benchmarking
-
-See [PERF.md](PERF.md) for a detailed performance comparison against pure
-Rust tonic, including GVL overhead analysis.
-
-```sh
-# Ruby server
-SIMULATED_DB_LATENCY_MS=2 TONIC_RAILS_DISPATCH_THREADS=50 \
-  bundle exec ruby -Ibench -e 'require_relative "bench/bench_service"; Tonic::Rails.server.start'
-
-# Rust reference server
-cd bench/rust_bench && cargo build --release
-SIMULATED_DB_LATENCY_MS=2 ./target/release/tonic-bench-server
-
-# Go benchmark client
-cd bench/go_bench
-go run . -addr 127.0.0.1:50051 -rpc GetProduct -concurrency 50 -total 2000
-```
+The integration specs start real servers and call them with the official
+`grpc` gem; the reflection specs also need `grpcurl` on your PATH.
+Benchmarks live in [bench/](bench/) (see [PERF.md](PERF.md)). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for more.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
 
 [tonic]: https://github.com/hyperium/tonic
-[Magnus]: https://github.com/matsadler/magnus
-[rustup]: https://rustup.rs

@@ -1,23 +1,27 @@
 [package]
 name = "tonic-bench-rust"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+publish = false
+
+# Pure-Rust tonic implementation of bench.v1.BenchService, used as the
+# baseline for tonic-rails (see PERF.md).
 
 [[bin]]
 name = "tonic-bench-server"
 path = "src/main.rs"
 
 [dependencies]
-tonic = "0.12"
-tonic-reflection = "0.12"
-prost = "0.13"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [profile.release]
 opt-level = 3
-debug = true
+lto = true
+codegen-units = 1

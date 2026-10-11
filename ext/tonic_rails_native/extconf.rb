@@ -3,8 +3,7 @@
 require "mkmf"
 require "rb_sys/mkmf"
 
-# create_rust_makefile is the rb-sys helper that wires cargo into
-# Ruby's native extension build system.  It generates a Makefile
-# that invokes `cargo build --release` and copies the resulting
-# cdylib into the gem's lib directory.
-create_rust_makefile("tonic_rails_native")
+# Builds the Rust crate with cargo and installs the library as
+# lib/tonic/rails/tonic_rails_native.{so,bundle}, matching
+# `require "tonic/rails/tonic_rails_native"`.
+create_rust_makefile("tonic/rails/tonic_rails_native")

@@ -1,213 +1,414 @@
 # frozen_string_literal: true
 
-require "spec_helper"
-require "tonic/rails/server"
+require "grpc"
+require "grpc/health/v1/health_services_pb"
 require "open3"
-require "logger"
+require "openssl"
+require "tmpdir"
+require_relative "../fixtures/lib/echo_services_pb"
+require_relative "../support/integration_server"
 
-# Integration tests that start the actual gRPC server and make real
-# gRPC calls via grpcurl. These require:
-#   - The native extension to be compiled (rake compile)
-#   - grpcurl on PATH (brew install grpcurl)
-#   - google-protobuf gem for Ruby-side encode/decode
-#
-# The server is started on a random port in a background thread.
-# Each test runs grpcurl against it and checks the JSON response.
-
+# End-to-end tests: a real tonic-rails server, called with the official
+# gRPC Ruby client (C core) — an independent HTTP/2 + gRPC implementation.
 RSpec.describe "gRPC integration", :integration do
-  PROTO_DIR = File.expand_path("../../bench", __dir__)
-  PROTO_FILE = "shop.proto"
-  ADDR = "127.0.0.1"
-
   before(:all) do
-    skip "grpcurl not found" unless system("which grpcurl > /dev/null 2>&1")
-    skip "native extension not loaded" unless defined?(TonicRails::Native::Server)
+    skip "native extension not compiled (run `bundle exec rake compile`)" unless IntegrationServer.native_available?
+  end
 
-    require_relative "../../bench/shop_pb"
-    require_relative "../../bench/bench_service"
-    require_relative "../../bench/test_service_pb"
+  let(:request) { Echo::V1::EchoRequest }
 
-    # Handler for an underscore-named service — verifies that the
-    # generated wrapper type (TestMy_Service) and the Ruby DSL
-    # service "test.My_Service" work end-to-end.
-    class UnderscoreService
-      include Tonic::Rails::Base
-      service "test.My_Service"
-      rpc :Ping, Test::PingRequest, Test::PingResponse
-      def ping(request)
-        {"msg" => "pong: #{request['msg']}"}
+  def stub_for(handle, **opts)
+    Echo::V1::EchoService::Stub.new(handle[:address], opts.delete(:creds) || :this_channel_is_insecure, **opts)
+  end
+
+  def expect_status(code, message = nil, &block)
+    expect(&block).to raise_error(GRPC::BadStatus) do |error|
+      expect(error.code).to eq(code)
+      expect(error.details.dup.force_encoding(Encoding::UTF_8)).to eq(message) if message
+    end
+  end
+
+  context "with the default configuration" do
+    before(:all) do
+      @handle = IntegrationServer.start do |config|
+        config.interceptors = [
+          lambda do |_path, metadata, next_call|
+            raise Tonic::Rails::RpcError.new("bad token", code: :unauthenticated) if metadata["authorization"] == "deny"
+            raise "interceptor bug" if metadata["authorization"] == "crash"
+
+            next_call.call
+          end,
+        ]
       end
+      @stub = Echo::V1::EchoService::Stub.new(@handle[:address], :this_channel_is_insecure)
     end
 
-    @port = 50552 + rand(100)
-    @server = Tonic::Rails::Server.new(configuration: Tonic::Rails::Configuration.new.tap do |c|
-      c.bind_address = "#{ADDR}:#{@port}"
-      c.dispatch_threads = 2
-      c.log_requests = false
-      c.reflection = true  # enable for integration tests
-      c.logger = Logger.new(IO::NULL)
-    end)
-    @server.register(ProductService)
-    @server.register(UnderscoreService)
-    @server_thread = Thread.new { @server.start }
-    @server_thread.abort_on_exception = true
+    after(:all) { IntegrationServer.stop(@handle) }
 
-    # Wait for server to be ready (poll reflection list via grpcurl).
-    ready = 30.times.any? do
-      sleep 0.25
-      _output, status = Open3.capture2e(
-        "grpcurl", "-plaintext", "#{ADDR}:#{@port}", "list"
-      )
-      status.success?
-    end
-    raise "server did not start within 8s" unless ready
-  end
+    let(:stub) { @stub }
 
-  after(:all) do
-    if @server_thread
-      @server&.stop
-      @server_thread.join(5)
-    end
-  end
+    describe "unary" do
+      it "round-trips a request" do
+        detail = Echo::V1::Detail.new(mood: :MOOD_HAPPY, at: Google::Protobuf::Timestamp.new(seconds: 1))
+        response = stub.unary(request.new(message: "hello", detail: detail))
+        expect(response.message).to eq("hello")
+      end
 
-  def grpcurl(method, payload = "{}")
-    Open3.capture2e(
-      "grpcurl", "-plaintext", "-import-path", PROTO_DIR,
-      "-proto", PROTO_FILE, "-d", payload,
-      "#{ADDR}:#{@port}",
-      "shop.ProductService/#{method}"
-    )
-  end
+      it "passes metadata to the handler" do
+        response = stub.unary(request.new, metadata: { "x-request-id" => "abc", "x-trace-bin" => "\x00\x01".b })
+        expect(response.metadata["x-request-id"]).to eq("abc")
+        expect(response.metadata["x-trace-bin"]).to eq(["\x00\x01".b].pack("m0").delete("="))
+          .or eq(["\x00\x01".b].pack("m0"))
+      end
 
-  describe "unary RPC" do
-    it "handles GetProduct successfully" do
-      output, status = grpcurl("GetProduct", '{"id": 1}')
-      expect(status).to be_success
-      result = JSON.parse(output)
-      expect(result["id"]).to eq("1").or eq(1)
-      expect(result["title"]).to be_a(String)
-      expect(result["priceCents"]).to be_a(String).or be_an(Integer)
-    end
+      it "propagates the client deadline" do
+        response = stub.unary(request.new, deadline: Time.now + 5)
+        # The client rounds its timeout header up, so allow a little slack.
+        expect(response.deadline_ms).to be_between(3_000, 5_100)
+      end
 
-    it "returns NOT_FOUND for missing product" do
-      output, status = grpcurl("GetProduct", '{"id": 99999}')
-      expect(status).not_to be_success
-      expect(output).to match(/not found|NOT_FOUND|Code: 5/i)
-    end
-
-    it "handles HealthCheck" do
-      output, status = grpcurl("HealthCheck", "{}")
-      expect(status).to be_success
-      result = JSON.parse(output)
-      expect(result["healthy"]).to eq(true)
-    end
-  end
-
-  describe "native health check" do
-    it "responds to grpc.health.v1.Health/Check" do
-      # Use reflection (no -proto) so grpcurl knows about grpc.health.v1.Health.
-      output, status = Open3.capture2e(
-        "grpcurl", "-plaintext", "#{ADDR}:#{@port}",
-        "grpc.health.v1.Health/Check"
-      )
-      expect(status).to be_success
-      result = JSON.parse(output)
-      expect(result["status"]).to eq("SERVING")
-    end
-  end
-
-  describe "reflection" do
-    it "lists services via reflection" do
-      output, status = Open3.capture2e(
-        "grpcurl", "-plaintext", "#{ADDR}:#{@port}", "list"
-      )
-      expect(status).to be_success
-      expect(output).to include("shop.ProductService")
-      expect(output).to include("grpc.health.v1.Health")
-    end
-  end
-
-  describe "underscore-named service" do
-    it "routes to a Ruby handler despite underscore in service name" do
-      output, status = Open3.capture2e(
-        "grpcurl", "-plaintext", "-import-path", PROTO_DIR,
-        "-proto", "test_service.proto", "-d", '{"msg":"hello"}',
-        "#{ADDR}:#{@port}",
-        "test.My_Service/Ping"
-      )
-      expect(status).to be_success
-      result = JSON.parse(output)
-      expect(result["msg"]).to eq("pong: hello")
-    end
-
-    it "appears in reflection list" do
-      output, status = Open3.capture2e(
-        "grpcurl", "-plaintext", "#{ADDR}:#{@port}", "list"
-      )
-      expect(status).to be_success
-      expect(output).to include("test.My_Service")
-    end
-  end
-
-  describe "server-streaming RPC" do
-    # grpcurl pretty-prints each response message as multi-line JSON.
-    # Count JSON objects by scanning for "id" field occurrences.
-    def count_messages(output)
-      output.scan(/"id"\s*:/).length
-    end
-
-    def parse_all_messages(output)
-      # Each message is a separate JSON object; extract by counting
-      # top-level braces and parsing each object.
-      objects = []
-      depth = 0
-      start = nil
-      output.each_char.with_index do |ch, i|
-        if ch == "{"
-          depth += 1
-          start ||= i
-        elsif ch == "}"
-          depth -= 1
-          if depth == 0 && start
-            objects << JSON.parse(output[start..i])
-            start = nil
-          end
+      it "returns RpcError statuses with their message" do
+        expect_status(GRPC::Core::StatusCodes::NOT_FOUND, "failed with not_found") do
+          stub.unary(request.new(fail_with: "rpc:not_found"))
         end
       end
-      objects
+
+      it "sanitizes unexpected exceptions" do
+        expect_status(GRPC::Core::StatusCodes::INTERNAL, "internal error") do
+          stub.unary(request.new(fail_with: "crash"))
+        end
+      end
+
+      it "percent-encodes non-ASCII status messages" do
+        stub_class = Class.new(EchoHandler) do
+          def unary(_request) = raise(Tonic::Rails::RpcError.new("café ☕\nline", code: :aborted))
+        end
+        stub_const("NonAsciiHandler", stub_class)
+        allow(EchoHandler).to receive(:new).and_return(stub_class.new)
+        expect_status(GRPC::Core::StatusCodes::ABORTED, "café ☕\nline") { stub.unary(request.new) }
+      end
+
+      it "enforces the deadline" do
+        expect_status(GRPC::Core::StatusCodes::DEADLINE_EXCEEDED) do
+          stub.unary(request.new(sleep_ms: 1_000), deadline: Time.now + 0.2)
+        end
+      end
+
+      it "handles concurrent calls across dispatch threads" do
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        results = Array.new(8) { |i| Thread.new { stub.unary(request.new(message: i.to_s, sleep_ms: 200)).message } }.map(&:value)
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        expect(results).to match_array(%w[0 1 2 3 4 5 6 7])
+        # 4 dispatch threads, 8 × 200ms sleeps (GVL released) → ~400ms, not 1.6s.
+        expect(elapsed).to be < 1.2
+      end
     end
 
-    it "streams multiple products via StreamProducts" do
-      output, status = grpcurl("StreamProducts", '{"limit": 5}')
-      expect(status).to be_success
-      messages = parse_all_messages(output)
-      expect(messages.length).to eq(5)
-      expect(messages.first["id"]).to be_a(String).or be_an(Integer)
-      expect(messages.first["title"]).to be_a(String)
+    describe "interceptors" do
+      it "can reject calls" do
+        expect_status(GRPC::Core::StatusCodes::UNAUTHENTICATED, "bad token") do
+          stub.unary(request.new, metadata: { "authorization" => "deny" })
+        end
+      end
+
+      it "have their exceptions sanitized" do
+        expect_status(GRPC::Core::StatusCodes::INTERNAL, "internal error") do
+          stub.unary(request.new, metadata: { "authorization" => "crash" })
+        end
+      end
     end
 
-    it "streams >32 messages without dropping any (backpressure)" do
-      # The mpsc channel has capacity 32. With 50 messages, the channel
-      # fills and the handler blocks in stream_sender.send (GVL released)
-      # until the client consumes. This test verifies all messages arrive
-      # — none are dropped despite backpressure.
-      output, status = grpcurl("StreamProducts", '{"limit": 50}')
-      expect(status).to be_success
-      messages = parse_all_messages(output)
-      expect(messages.length).to eq(50)
-      # Verify ordering: IDs should be sequential
-      ids = messages.map { |m| m["id"].to_i }
-      expect(ids).to eq((1..50).to_a)
+    describe "server streaming" do
+      it "streams every message, beyond the channel buffer" do
+        responses = stub.server_stream(request.new(message: "s", count: 200)).to_a
+        expect(responses.map(&:index)).to eq((0...200).to_a)
+      end
+
+      it "supports empty streams" do
+        expect(stub.server_stream(request.new(count: 0)).to_a).to eq([])
+      end
+
+      it "survives a client cancelling mid-stream" do
+        call = stub.server_stream(request.new(count: 1_000, sleep_ms: 1), return_op: true)
+        enum = call.execute
+        enum.first(3)
+        call.cancel
+        expect(stub.unary(request.new(message: "still alive")).message).to eq("still alive")
+      end
     end
 
-    it "returns empty stream when limit is 0" do
-      # protobuf default for int32 is 0, so {"limit": 0} is the same
-      # as omitting the field. The handler defaults to 50 in that case.
-      # Use limit 1 to get a minimal stream instead.
-      output, status = grpcurl("StreamProducts", '{"limit": 1}')
-      expect(status).to be_success
-      messages = parse_all_messages(output)
-      expect(messages.length).to eq(1)
+    describe "client streaming" do
+      it "receives every request message" do
+        response = stub.client_stream(%w[a b c d].map { |m| request.new(message: m) })
+        expect(response.message).to eq("a,b,c,d")
+        expect(response.index).to eq(4)
+      end
+
+      it "handles many messages" do
+        response = stub.client_stream(Array.new(500) { |i| request.new(message: i.to_s) })
+        expect(response.index).to eq(500)
+      end
+    end
+
+    describe "bidi streaming" do
+      it "interleaves requests and responses" do
+        outbox = Queue.new
+        requests = Enumerator.new do |y|
+          while (message = outbox.pop) != :done
+            y << message
+          end
+        end
+        outbox << request.new(message: "first")
+        responses = stub.bidi(requests)
+
+        first = responses.next
+        expect(first.message).to eq("first") # answered before the client sent more
+        outbox << request.new(message: "second")
+        expect(responses.next.message).to eq("second")
+        outbox << :done
+        expect { responses.next }.to raise_error(StopIteration)
+      end
+    end
+
+    describe "transport behaviour" do
+      it "answers UNIMPLEMENTED for unknown methods" do
+        unknown = Class.new do
+          include GRPC::GenericService
+
+          self.marshal_class_method = :encode
+          self.unmarshal_class_method = :decode
+          self.service_name = "echo.v1.Missing"
+          rpc :Unary, Echo::V1::EchoRequest, Echo::V1::EchoResponse
+        end
+        client = unknown.rpc_stub_class.new(@handle[:address], :this_channel_is_insecure)
+        expect_status(GRPC::Core::StatusCodes::UNIMPLEMENTED) { client.unary(request.new) }
+      end
+
+      it "serves grpc.health.v1 for the whole server and each service" do
+        health = Grpc::Health::V1::Health::Stub.new(@handle[:address], :this_channel_is_insecure)
+        serving = :SERVING
+        expect(health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "")).status).to eq(serving)
+        expect(health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "echo.v1.EchoService")).status)
+          .to eq(serving)
+        expect_status(GRPC::Core::StatusCodes::NOT_FOUND) do
+          health.check(Grpc::Health::V1::HealthCheckRequest.new(service: "nope.Missing"))
+        end
+      end
+
+      it "does not expose reflection unless enabled" do
+        skip "grpcurl not installed" unless system("grpcurl", "-version", err: File::NULL, out: File::NULL)
+        output, status = Open3.capture2e("grpcurl", "-plaintext", @handle[:address], "list")
+        expect(status).not_to be_success
+        expect(output).to match(/Unimplemented|does not support the reflection API/i)
+      end
+
+      it "accepts gzip-compressed requests" do
+        compressed = Echo::V1::EchoService::Stub.new(
+          @handle[:address], :this_channel_is_insecure,
+          channel_args: { "grpc.default_compression_algorithm" => 2, "grpc.default_compression_level" => 3 }
+        )
+        response = compressed.unary(request.new(message: "z" * 10_000))
+        expect(response.message.size).to eq(10_000)
+      end
+
+      it "tracks request stats" do
+        stats = @handle[:server].stats
+        expect(stats[:total]).to be > 0
+        expect(stats[:successful]).to be > 0
+        expect(stats[:active_connections]).to be >= 1
+      end
+    end
+  end
+
+  context "with limits, compression and reflection" do
+    before(:all) do
+      @handle = IntegrationServer.start do |config|
+        config.max_message_size = 64 * 1024
+        config.compression = true
+        config.reflection = true
+      end
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    it "rejects oversized responses" do
+      expect_status(GRPC::Core::StatusCodes::RESOURCE_EXHAUSTED) do
+        stub_for(@handle).unary(request.new(pad_bytes: 100 * 1024))
+      end
+    end
+
+    it "rejects oversized requests" do
+      expect_status(GRPC::Core::StatusCodes::RESOURCE_EXHAUSTED) do
+        stub_for(@handle).unary(request.new(message: "x" * (100 * 1024)))
+      end
+    end
+
+    it "compresses large responses for clients that accept gzip" do
+      response = stub_for(@handle).unary(request.new(pad_bytes: 32 * 1024))
+      expect(response.padding.bytesize).to eq(32 * 1024)
+    end
+
+    it "serves reflection for registered services and their dependencies" do
+      skip "grpcurl not installed" unless system("grpcurl", "-version", err: File::NULL, out: File::NULL)
+      output, status = Open3.capture2e("grpcurl", "-plaintext", @handle[:address], "list")
+      expect(status).to be_success, output
+      expect(output.split).to include("echo.v1.EchoService", "grpc.health.v1.Health")
+
+      output, status = Open3.capture2e("grpcurl", "-plaintext", @handle[:address], "describe", "echo.v1.Detail")
+      expect(status).to be_success, output
+      expect(output).to include(".google.protobuf.Timestamp at")
+
+      output, status = Open3.capture2e(
+        "grpcurl", "-plaintext", "-d", '{"message":"via reflection"}', @handle[:address], "echo.v1.EchoService/Unary"
+      )
+      expect(status).to be_success, output
+      expect(output).to include("via reflection")
+    end
+  end
+
+  context "with a small dispatch pool" do
+    before(:all) do
+      @handle = IntegrationServer.start do |config|
+        config.dispatch_threads = 1
+        config.dispatch_queue_size = 1
+      end
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    it "sheds load with RESOURCE_EXHAUSTED when the queue is full" do
+      stub = stub_for(@handle)
+      threads = Array.new(6) do
+        Thread.new do
+          stub.unary(request.new(sleep_ms: 300))
+          :ok
+        rescue GRPC::ResourceExhausted
+          :shed
+        end
+      end
+      results = threads.map(&:value)
+      expect(results).to include(:ok, :shed)
+    end
+  end
+
+  describe "graceful shutdown" do
+    it "finishes in-flight requests, flips health, then refuses new connections" do
+      handle = IntegrationServer.start
+      stub = stub_for(handle)
+      in_flight = Thread.new { stub.unary(request.new(message: "drained", sleep_ms: 500)).message }
+      sleep 0.15
+
+      handle[:server].stop
+      expect(in_flight.value).to eq("drained")
+      handle[:thread].join(10)
+      expect(handle[:server]).not_to be_running
+
+      expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
+        stub_for(handle).unary(request.new, deadline: Time.now + 1)
+      end
+    ensure
+      IntegrationServer.stop(handle) if handle && handle[:thread].alive?
+    end
+
+    it "can be restarted" do
+      handle = IntegrationServer.start
+      IntegrationServer.stop(handle)
+      handle = IntegrationServer.start
+      expect(stub_for(handle).unary(request.new(message: "again")).message).to eq("again")
+    ensure
+      IntegrationServer.stop(handle)
+    end
+  end
+
+  describe "TLS" do
+    # A CA plus a leaf certificate for 127.0.0.1, and a client certificate.
+    before(:all) do
+      @dir = Dir.mktmpdir("tonic-rails-tls")
+      @ca_key = OpenSSL::PKey::EC.generate("prime256v1")
+      @ca = build_cert("tonic-rails test CA", @ca_key, nil, authority: true)
+      write("ca.pem", @ca.to_pem)
+
+      server_key = OpenSSL::PKey::EC.generate("prime256v1")
+      write("server.pem", build_cert("127.0.0.1", server_key, @ca, san: "IP:127.0.0.1,DNS:localhost").to_pem)
+      write("server.key", server_key.private_to_pem)
+
+      client_key = OpenSSL::PKey::EC.generate("prime256v1")
+      @client_cert = build_cert("client", client_key, @ca).to_pem
+      @client_key = client_key.private_to_pem
+    end
+
+    after(:all) { FileUtils.remove_entry(@dir) if @dir }
+
+    def self.serial
+      @serial = (@serial || 0) + 1
+    end
+
+    def write(name, contents)
+      File.write(File.join(@dir, name), contents)
+    end
+
+    def path(name) = File.join(@dir, name)
+
+    def build_cert(common_name, key, issuer, authority: false, san: nil)
+      cert = OpenSSL::X509::Certificate.new
+      cert.version = 2
+      cert.serial = self.class.serial
+      cert.subject = OpenSSL::X509::Name.parse("/CN=#{common_name}")
+      cert.issuer = issuer ? issuer.subject : cert.subject
+      cert.public_key = key
+      cert.not_before = Time.now - 60
+      cert.not_after = Time.now + 3600
+      ext = OpenSSL::X509::ExtensionFactory.new
+      ext.subject_certificate = cert
+      ext.issuer_certificate = issuer || cert
+      cert.add_extension(ext.create_extension("basicConstraints", authority ? "CA:TRUE" : "CA:FALSE", true))
+      cert.add_extension(ext.create_extension("keyUsage", authority ? "keyCertSign,cRLSign" : "digitalSignature", true))
+      cert.add_extension(ext.create_extension("subjectAltName", san)) if san
+      cert.sign(issuer ? @ca_key : key, OpenSSL::Digest.new("SHA256"))
+      cert
+    end
+
+    def tls_stub(handle, **creds_args)
+      creds = GRPC::Core::ChannelCredentials.new(File.read(path("ca.pem")), *creds_args.values_at(:key, :cert))
+      stub_for(handle, creds: creds)
+    end
+
+    it "serves over TLS" do
+      handle = IntegrationServer.start do |config|
+        config.tls_cert_path = path("server.pem")
+        config.tls_key_path = path("server.key")
+      end
+      expect(tls_stub(handle).unary(request.new(message: "secure")).message).to eq("secure")
+      expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
+        stub_for(handle).unary(request.new, deadline: Time.now + 1)
+      end
+    ensure
+      IntegrationServer.stop(handle)
+    end
+
+    it "requires client certificates with mutual TLS" do
+      handle = IntegrationServer.start do |config|
+        config.tls_cert_path = path("server.pem")
+        config.tls_key_path = path("server.key")
+        config.tls_client_ca_path = path("ca.pem")
+      end
+      response = tls_stub(handle, key: @client_key, cert: @client_cert).unary(request.new(message: "mtls"))
+      expect(response.message).to eq("mtls")
+      expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
+        tls_stub(handle).unary(request.new, deadline: Time.now + 1)
+      end
+    ensure
+      IntegrationServer.stop(handle)
+    end
+
+    it "refuses to start with an unreadable key instead of falling back to plaintext" do
+      write("bad.key", "not a key")
+      expect do
+        IntegrationServer.start do |config|
+          config.tls_cert_path = path("server.pem")
+          config.tls_key_path = path("bad.key")
+        end
+      end.to raise_error(RuntimeError, /TLS/)
     end
   end
 end
