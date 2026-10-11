@@ -7,6 +7,8 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-11
+
 ### Added
 
 - Client: opt-in retries, per client or per call (`retries: true` or a
@@ -184,7 +186,8 @@ First public release.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
   macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
-[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.3.0...v0.4.0
