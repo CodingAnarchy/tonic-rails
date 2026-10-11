@@ -6,7 +6,7 @@ approach.
 
 ## Setup
 
-You need Ruby 3.2+, a [Rust toolchain](https://rustup.rs) and, for the
+You need Ruby 3.3+, a [Rust toolchain](https://rustup.rs) and, for the
 reflection specs, [grpcurl](https://github.com/fullstorydev/grpcurl).
 
 ```sh

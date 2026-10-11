@@ -54,7 +54,7 @@ gem "tonic-rails"
 gem "google-protobuf"
 ```
 
-Requires Ruby 3.2+ and Rails 7.1+ (or just ActiveSupport, outside Rails).
+Requires Ruby 3.3+ and Rails 7.1+ (or just ActiveSupport, outside Rails).
 On platforms without a precompiled gem, installation builds the
 extension from source, which needs a [Rust toolchain](https://rustup.rs).
 

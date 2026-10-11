@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 env:
-  RUBY_VERSIONS: "3.2,3.3,3.4,4.0"
+  RUBY_VERSIONS: "3.3,3.4,4.0"
 
 jobs:
   source-gem:
@@ -87,7 +87,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, platform: x86_64-linux-gnu, ruby: "3.2" }
+          - { os: ubuntu-latest, platform: x86_64-linux-gnu, ruby: "3.3" }
           - { os: ubuntu-latest, platform: x86_64-linux-gnu, ruby: "4.0" }
           - { os: ubuntu-24.04-arm, platform: aarch64-linux-gnu, ruby: "3.4" }
           - { os: macos-latest, platform: arm64-darwin, ruby: "3.3" }

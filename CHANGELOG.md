@@ -46,7 +46,7 @@ First public release.
   as `INTERNAL: internal error`; details are logged and reported.
 - `grpc-message` is percent-encoded per the gRPC spec.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
-  macOS (x86_64, arm64), Ruby 3.2 to 4.0.
+  macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
 [Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/CodingAnarchy/tonic-rails/releases/tag/v0.1.0
