@@ -2,12 +2,23 @@ name: Release
 
 # Push a tag matching the gem version (e.g. v0.1.0) to build the source
 # gem plus precompiled native gems, smoke-test them, and publish to
-# RubyGems via Trusted Publishing.
+# RubyGems via Trusted Publishing.  Pull requests that touch the native
+# build (and manual runs) build and test the gems without publishing.
 on:
   push:
     tags: ["v*"]
-  # Manual runs build and test the gems without publishing.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.*"
+      - "Rakefile"
+      - "ext/**"
+      - "tonic-rails.gemspec"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
@@ -90,7 +101,8 @@ jobs:
           name: gem-${{ matrix.platform }}
       - name: Install without a Rust toolchain and load the extension
         run: |
-          gem install --no-document --local tonic-rails-*.gem || gem install --no-document tonic-rails-*.gem
+          gem install --no-document tonic-rails-*.gem
+          gem list tonic-rails
           ruby -e 'require "tonic-rails"; Tonic::Rails.native_extension!; s = TonicRails::Native::Server.new("127.0.0.1:0", 1024); puts "ok: #{s.class}"'
 
   publish:
