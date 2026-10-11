@@ -36,6 +36,12 @@ RSpec.describe "Signal handling", :integration do
     { pid: pid, address: "127.0.0.1:#{port}", output: output }
   end
 
+  def kill(server)
+    Process.kill(:KILL, server[:pid]) if server
+  rescue Errno::ESRCH
+    nil # already exited
+  end
+
   def stub_for(address)
     Echo::V1::EchoService::Stub.new(address, :this_channel_is_insecure)
   end
@@ -63,7 +69,7 @@ RSpec.describe "Signal handling", :integration do
       expect(status).to be_success
       expect(server[:output]).to include("shutting down", "exited cleanly")
     ensure
-      Process.kill(:KILL, server[:pid]) rescue nil # rubocop:disable Style/RescueModifier
+      kill(server)
     end
   end
 end
