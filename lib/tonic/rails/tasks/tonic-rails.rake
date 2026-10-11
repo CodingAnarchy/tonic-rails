@@ -21,10 +21,10 @@ namespace :tonic_rails do
     end
   end
 
-  desc "Generate Ruby protobuf classes (PROTO_DIR=app/protos RUBY_OUT=app/grpc; requires protoc)"
+  desc "Generate Ruby protobuf classes (PROTO_DIR=app/protos RUBY_OUT=lib/grpc; requires protoc)"
   task :compile_protos do
     proto_dir = ENV.fetch("PROTO_DIR", "app/protos")
-    ruby_out = ENV.fetch("RUBY_OUT", "app/grpc")
+    ruby_out = ENV.fetch("RUBY_OUT", "lib/grpc")
     protos = Dir.glob(File.join(proto_dir, "**", "*.proto"))
     abort "No .proto files found in #{proto_dir}/" if protos.empty?
     abort "protoc not found on PATH. Install the Protocol Buffers compiler." unless system("protoc", "--version", out: File::NULL)
