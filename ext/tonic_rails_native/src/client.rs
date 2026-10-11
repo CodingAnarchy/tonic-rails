@@ -117,6 +117,9 @@ impl Decoder for RawCodec {
 struct Outcome {
     code: Code,
     message: String,
+    /// The failure happened here (a broken connection, a timeout), not
+    /// on the server.
+    local: bool,
     details: Bytes,
     response: Option<Bytes>,
     headers: HeaderMap,
@@ -125,27 +128,32 @@ struct Outcome {
 
 impl Outcome {
     fn error(code: Code, message: impl Into<String>) -> Self {
-        Self::status(Status::new(code, message), HeaderMap::new())
+        Self {
+            local: true,
+            ..Self::status(Status::new(code, message), HeaderMap::new())
+        }
     }
 
     fn status(status: Status, headers: HeaderMap) -> Self {
         // A status with a source is a local transport failure, not one the
         // server sent.  The source holds the cause (e.g. "Connection
-        // refused"), and tonic leaves broken connections UNKNOWN where
-        // gRPC clients report UNAVAILABLE.
-        let (code, message) = match std::error::Error::source(&status) {
+        // refused"), and tonic reports broken connections as UNKNOWN or
+        // CANCELLED where gRPC clients report UNAVAILABLE.
+        let (code, message, local) = match std::error::Error::source(&status) {
             Some(source) => (
                 match status.code() {
-                    Code::Unknown => Code::Unavailable,
+                    Code::Unknown | Code::Cancelled => Code::Unavailable,
                     code => code,
                 },
                 append_causes(status.message().to_owned(), Some(source)),
+                true,
             ),
-            None => (status.code(), status.message().to_owned()),
+            None => (status.code(), status.message().to_owned(), false),
         };
         Self {
             code,
             message,
+            local,
             details: Bytes::copy_from_slice(status.details()),
             response: None,
             headers,
@@ -194,8 +202,8 @@ async fn call(
     let outcome = tokio::time::timeout(timeout, call).await;
     match outcome {
         // tonic's channel enforces the grpc-timeout header too, but ends
-        // the call as CANCELLED.
-        Ok(outcome) if !(outcome.code == Code::Cancelled && started.elapsed() >= timeout) => outcome,
+        // the call with its own status.
+        Ok(outcome) if !(outcome.local && started.elapsed() >= timeout) => outcome,
         _ => Outcome::error(Code::DeadlineExceeded, "deadline exceeded"),
     }
 }
@@ -244,6 +252,7 @@ async fn unary(
         Some(message) => Outcome {
             code: Code::Ok,
             message: String::new(),
+            local: false,
             details: Bytes::new(),
             response: Some(message),
             headers,
@@ -341,7 +350,9 @@ impl NativeChannel {
             let mut config = ClientTlsConfig::new();
             config = match ca {
                 Some(ca) => config.ca_certificate(Certificate::from_pem(ca)),
-                None => config.ca_certificate(Certificate::from_pem(system_roots().map_err(&argument_error)?)),
+                None => {
+                    config.ca_certificate(Certificate::from_pem(system_roots().map_err(&argument_error)?))
+                }
             };
             if let (Some(cert), Some(key)) = (cert, key) {
                 config = config.identity(Identity::from_pem(cert, key));
@@ -387,8 +398,12 @@ impl NativeChannel {
         metadata: RHash,
         timeout_ms: Option<u64>,
     ) -> Result<RArray, Error> {
-        let path = PathAndQuery::try_from(path)
-            .map_err(|e| Error::new(ruby.exception_arg_error(), format!("invalid gRPC method path: {e}")))?;
+        let path = PathAndQuery::try_from(path).map_err(|e| {
+            Error::new(
+                ruby.exception_arg_error(),
+                format!("invalid gRPC method path: {e}"),
+            )
+        })?;
         let metadata = header_map(ruby, metadata)?;
         let request = Bytes::copy_from_slice(unsafe { request.as_slice() });
         let runtime = runtime().map_err(|e| {
@@ -442,7 +457,12 @@ fn system_roots() -> Result<&'static [u8], String> {
 fn header_map(ruby: &Ruby, metadata: RHash) -> Result<HeaderMap, Error> {
     let mut headers = HeaderMap::with_capacity(metadata.len());
     metadata.foreach(|name: String, value: String| {
-        let invalid = || Error::new(ruby.exception_arg_error(), format!("invalid gRPC metadata {name:?}"));
+        let invalid = || {
+            Error::new(
+                ruby.exception_arg_error(),
+                format!("invalid gRPC metadata {name:?}"),
+            )
+        };
         let header = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
         let value = HeaderValue::from_str(&value).map_err(|_| invalid())?;
         headers.append(header, value);

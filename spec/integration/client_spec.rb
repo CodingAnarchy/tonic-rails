@@ -157,16 +157,12 @@ RSpec.describe Tonic::Rails::Client, :integration do
 
   describe "the GVL" do
     it "lets other threads run during a call" do
+      # Holding the GVL for the call would leave this thread no turns at all.
       ticks = 0
-      ticker = Thread.new do
-        loop do
-          ticks += 1
-          sleep 0.01
-        end
-      end
+      ticker = Thread.new { loop { ticks += 1 } }
       stub.unary(sleep_ms: 300)
       ticker.kill
-      expect(ticks).to be > 10
+      expect(ticks).to be > 1_000
     end
 
     it "is interrupted by Timeout and Thread#raise" do
@@ -174,6 +170,7 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect { Timeout.timeout(0.2) { stub.unary(sleep_ms: 5_000) } }.to raise_error(Timeout::Error)
 
       caller = Thread.new { stub.unary(sleep_ms: 5_000) }
+      caller.report_on_exception = false
       sleep 0.2
       caller.raise(ArgumentError, "stop")
       expect { caller.join }.to raise_error(ArgumentError, "stop")
