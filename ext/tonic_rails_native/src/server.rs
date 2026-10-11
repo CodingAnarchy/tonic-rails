@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use magnus::{
     Error, RArray, RHash, RString, Ruby, TryConvert, Value, gc, typed_data::DataTypeFunctions, value::Opaque,
 };
-use parking_lot::Mutex;
 use prost::Message;
 use tokio::runtime::Runtime;
 use tokio::sync::{Semaphore, watch};
@@ -37,6 +36,7 @@ use crate::dispatch::{DispatchInner, DispatchService};
 use crate::gvl::{self, Cancel, DispatchContext};
 use crate::log::{Level, LogEvent, LogSink};
 use crate::net::{LimitedIncoming, bind, listen, listen_inherited};
+use crate::sync::Mutex;
 
 /// The overall-server health entry (empty service name).
 const OVERALL: &str = "";

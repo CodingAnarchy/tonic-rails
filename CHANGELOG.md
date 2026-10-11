@@ -15,6 +15,17 @@ minor versions may contain breaking changes.
   specific setting wins: the call's `retries:`, then the method, then the
   service, then the client's `retries:`.
 
+### Fixed
+
+- Windows: the process could crash with a segfault under load (#41). The
+  extension's locks spun and then called `Sleep`, which the mingw linker
+  bound to the `Sleep` that Ruby's DLL exports instead of the system's,
+  and Ruby's version crashes on threads Ruby doesn't own. Locks now come
+  from Rust's standard library, which never calls `Sleep`, and CI checks
+  that the Windows build imports nothing but Ruby's C API from Ruby's
+  DLL. 0.6.0 and 0.7.0 crashed in about 1 in 5 runs of the test suite;
+  earlier versions could crash in the same way, but rarely.
+
 ## [0.7.0] - 2026-10-11
 
 ### Added

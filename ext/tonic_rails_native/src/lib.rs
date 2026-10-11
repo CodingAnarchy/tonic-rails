@@ -35,6 +35,7 @@ mod gvl;
 mod log;
 mod net;
 mod server;
+mod sync;
 
 use magnus::{Error, Ruby, function, method, prelude::*};
 

@@ -24,7 +24,6 @@ use bytes::{Buf, BufMut, Bytes};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use magnus::{Error, RArray, RHash, RString, Ruby, r_hash::ForEach};
-use parking_lot::Mutex;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,6 +33,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status};
 
 use crate::gvl::{Cancel, Wait, block_on, recv_blocking, without_gvl};
+use crate::sync::Mutex;
 
 // ─── Per-process runtime ──────────────────────────────────────────
 
