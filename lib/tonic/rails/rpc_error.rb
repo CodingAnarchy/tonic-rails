@@ -19,6 +19,8 @@ module Tonic
     # The message, metadata and details go to the client, so keep internal
     # details out of them.  Any other exception becomes INTERNAL with a
     # generic message and is logged server-side.
+    #
+    # Tonic::Rails::Client raises it too, for calls that fail.
     class RpcError < Error
       CODES = {
         ok: 0,
@@ -113,6 +115,65 @@ module Tonic
       def code_name
         CODE_NAMES.fetch(@code)
       end
+
+      # Unpacks the details of an encoded google.rpc.Status (from the
+      # grpc-status-details-bin trailer).  Details whose message type is
+      # loaded come back as that message; others stay Google::Protobuf::Any.
+      # @api private
+      # @return [Array<Google::Protobuf::AbstractMessage>]
+      def self.decode_details(bytes)
+        return [] if bytes.nil? || bytes.empty?
+
+        require "google/protobuf/well_known_types"
+        details = []
+        each_length_delimited_field(bytes.b) do |field, value|
+          details << unpack_detail(Google::Protobuf::Any.decode(value)) if field == 3
+        end
+        details
+      rescue Google::Protobuf::ParseError, ArgumentError
+        []
+      end
+
+      # Yields (field number, bytes) for each length-delimited field,
+      # skipping varints; raises ArgumentError on anything malformed.
+      def self.each_length_delimited_field(buf)
+        pos = 0
+        while pos < buf.bytesize
+          key, pos = read_varint(buf, pos)
+          case key & 7
+          when 0 then _, pos = read_varint(buf, pos)
+          when 2
+            length, pos = read_varint(buf, pos)
+            raise ArgumentError, "truncated google.rpc.Status" if pos + length > buf.bytesize
+
+            yield key >> 3, buf.byteslice(pos, length)
+            pos += length
+          else raise ArgumentError, "unexpected wire type in google.rpc.Status"
+          end
+        end
+      end
+      private_class_method :each_length_delimited_field
+
+      def self.read_varint(buf, pos)
+        value = 0
+        shift = 0
+        loop do
+          byte = buf.getbyte(pos) or raise ArgumentError, "truncated varint"
+          pos += 1
+          value |= (byte & 0x7f) << shift
+          return [value, pos] if byte < 0x80
+
+          shift += 7
+          raise ArgumentError, "varint too long" if shift > 63
+        end
+      end
+      private_class_method :read_varint
+
+      def self.unpack_detail(any)
+        type = Google::Protobuf::DescriptorPool.generated_pool.lookup(any.type_name)
+        type.is_a?(Google::Protobuf::Descriptor) ? any.unpack(type.msgclass) : any
+      end
+      private_class_method :unpack_detail
 
       # @api private
       def self.normalize_code(code)

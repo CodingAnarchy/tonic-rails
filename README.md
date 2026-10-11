@@ -44,6 +44,9 @@ end
   INTERNAL error (the details go to your logs and `Rails.error`).
   Reflection is off unless you turn it on. TLS problems stop the server
   instead of silently falling back to plaintext.
+- **A client too.** Call other gRPC services with deadlines that follow
+  your handler's, without the `grpc` gem and its fork crashes. See
+  [Calling other services](#calling-other-services).
 - **No Rust toolchain needed** on the platforms we ship precompiled gems
   for: Linux and macOS (x86_64 and arm64) and Windows (x64).
 
@@ -401,6 +404,163 @@ const item = await client.getItem({ id: 1n });
   warning). `grpc_web_allowed_headers` adds request headers beyond the
   standard ones (`authorization` is already allowed).
 
+## Calling other services
+
+tonic-rails includes a client for unary calls to other gRPC services, so
+an app that serves gRPC (or just calls it) doesn't need the `grpc` gem.
+It runs on the same Rust stack as the server, and it keeps working after
+`fork`. That matters because the `grpc` gem crashes or hangs in forked
+processes (Puma with `preload_app!`, Sidekiq swarm, Resque) unless you
+opt in to its Linux-only fork support and call `GRPC.prefork` and
+friends around every fork yourself.
+
+Create a client once and share it; it holds one HTTP/2 connection and is
+safe to use from any thread:
+
+```ruby
+# config/initializers/grpc_clients.rb
+ITEMS = Tonic::Rails::Client.new("items.internal:50051", deadline: 2)
+```
+
+Then get a stub for a service and call its methods, named in snake_case:
+
+```ruby
+items = ITEMS.stub("demo.v1.ItemService")
+
+item = items.get_item(Demo::V1::GetItemRequest.new(id: 1))  # a message
+item = items.get_item(id: 1)                                 # or its fields
+item = items.get_item({ id: 1 }, deadline: 0.5, metadata: { "x-request-id" => request.request_id })
+```
+
+Stubs are built from the protobuf descriptors in the `_pb.rb` files that
+`tonic_rails:compile_protos` generates, the same ones your handlers use.
+There's no `grpc_tools_ruby_protoc` step and no `_services_pb.rb`.
+Responses are protobuf messages.
+
+### Deadlines
+
+- `deadline:` on a call is seconds from now (`0.5`) or a `Time`. Without
+  one, the client's `deadline:` applies.
+- **Inside a handler, outgoing calls default to the time left on the
+  handler's own deadline**, so a service that's out of time doesn't keep
+  its dependencies working on an answer nobody will read. If the client
+  also has a default deadline, the earlier of the two wins. A deadline on
+  the call itself always wins.
+- When a deadline passes, the call raises `DEADLINE_EXCEEDED`, and the
+  server sees the call cancelled.
+
+Set a deadline. Without one, a call to a server that never answers waits
+forever (or until `Timeout` interrupts it, which also works).
+
+### Errors
+
+A call that fails raises `Tonic::Rails::RpcError`, the same class your
+handlers raise:
+
+```ruby
+begin
+  items.get_item(id: 1)
+rescue Tonic::Rails::RpcError => e
+  e.code_name  # :not_found, :unavailable, :deadline_exceeded, ...
+  e.message    # the server's status message
+  e.details    # rich error details (google.rpc.Status), as messages
+  e.metadata   # trailing metadata
+end
+```
+
+Rich error details come back as their message class when its `_pb.rb` is
+loaded, and as `Google::Protobuf::Any` otherwise. A server that can't be
+reached raises `UNAVAILABLE`.
+
+If a handler lets the error propagate, its caller receives the same
+status, message, details and trailing metadata. Rescue it and raise your
+own error when those are internal.
+
+### Metadata
+
+`metadata:` on a call, and on the client for every call, works like
+response metadata in handlers: `-bin` names take binary values. To read
+what the server sent back, pass `return_call: true`:
+
+```ruby
+call = items.get_item({ id: 1 }, return_call: true)
+call.response   # the message
+call.headers    # response headers, -bin values decoded
+call.trailers   # trailing metadata
+```
+
+### TLS
+
+TLS is on unless you turn it off, and plaintext needs an explicit
+`tls: false`:
+
+```ruby
+Tonic::Rails::Client.new("items.internal:50051")                           # system root certificates
+Tonic::Rails::Client.new("items.internal:50051", tls_ca_path: "ca.pem")    # your own CA instead
+Tonic::Rails::Client.new("items.internal:50051", tls_ca_path: "ca.pem",
+                         tls_cert_path: "client.pem", tls_key_path: "client.key")  # mutual TLS
+Tonic::Rails::Client.new("localhost:50051", tls: false)                    # plaintext
+```
+
+`tls_server_name:` checks the server's certificate against another name
+than the host you connect to. Unreadable certificates or keys raise when
+the client is created, not on the first call.
+
+### Options
+
+| Option | Default | |
+|---|---|---|
+| `tls` | `true` | `false` for plaintext |
+| `tls_ca_path` | system roots | CA certificates (PEM) to trust instead |
+| `tls_cert_path`, `tls_key_path` | none | client certificate and key (PEM), for mutual TLS |
+| `tls_server_name` | the host | name to verify the server's certificate against |
+| `deadline` | none | seconds each call may take, unless the call sets its own |
+| `metadata` | `{}` | sent with every call |
+| `max_message_size` | 4 MiB | largest message sent or received |
+| `connect_timeout` | 5 | seconds to wait for a connection |
+
+### Fork safety
+
+A client created before `fork` works in both processes, on Linux and
+macOS, with nothing to call. Each process opens its own connection on
+its first call, and a child never touches the threads or sockets it
+inherited from its parent. Create clients in initializers, before Puma or
+Sidekiq forks, and use them anywhere.
+
+On macOS, also create the first client that uses the system's root
+certificates before forking. Loading them goes through macOS's security
+APIs, which abort in a process forked from a multi-threaded one. Loaded
+once, they're kept and inherited, so clients created later in children
+are fine. Linux has no such limit.
+
+### Migrating from the grpc gem
+
+Call sites barely change; how you build the stub does:
+
+```ruby
+# Before: grpc gem
+stub = Demo::V1::ItemService::Stub.new("items.internal:50051", GRPC::Core::ChannelCredentials.new)
+item = stub.get_item(Demo::V1::GetItemRequest.new(id: 1), deadline: Time.now + 2, metadata: { "x-id" => "1" })
+
+# After: tonic-rails
+stub = Tonic::Rails::Client.new("items.internal:50051").stub("demo.v1.ItemService")
+item = stub.get_item(Demo::V1::GetItemRequest.new(id: 1), deadline: Time.now + 2, metadata: { "x-id" => "1" })
+```
+
+- `stub` also accepts the grpc gem's service class
+  (`Demo::V1::ItemService::Service`), which helps while both gems are
+  installed.
+- `deadline:` takes a `Time`, as before, or seconds.
+- `return_op: true` becomes `return_call: true`, which returns the
+  response with its headers and trailers instead of an operation.
+- `GRPC::BadStatus` subclasses become one `Tonic::Rails::RpcError`:
+  `rescue GRPC::NotFound` becomes `rescue Tonic::Rails::RpcError => e`
+  and a check of `e.code_name == :not_found`. The `raise_grpc_error`
+  matcher and `assert_grpc_error` accept both.
+- `:this_channel_is_insecure` becomes `tls: false`.
+- Only unary calls are supported so far. Stubs refuse streaming methods
+  with a `NotImplementedError`; keep the grpc gem for those for now.
+
 ## Testing handlers
 
 `Tonic::Rails::Testing` calls a handler in-process, with real protobuf
@@ -633,6 +793,9 @@ end
 When a call fails, `event.payload[:exception_object]` is the
 `Tonic::Rails::RpcError` sent to the client. If a handler raised something
 unexpected, that error's `cause` is the original exception.
+
+Calls made with `Tonic::Rails::Client` publish `request_rpc.tonic_rails`,
+with the same payload plus `:address`, the server called.
 
 ## How it works
 

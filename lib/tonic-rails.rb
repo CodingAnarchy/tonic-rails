@@ -21,6 +21,7 @@ require "tonic/rails/health"
 require "tonic/rails/reflection"
 require "tonic/rails/cluster"
 require "tonic/rails/server"
+require "tonic/rails/client"
 
 module Tonic
   module Rails

@@ -20,7 +20,7 @@ use magnus::{
     Error, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach, typed_data::DataTypeFunctions,
     value::Opaque,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rb_sys::{RB_NOGVL_INTR_FAIL, rb_nogvl, rb_thread_call_with_gvl};
 use tokio::sync::{Notify, mpsc};
 
@@ -100,25 +100,40 @@ where
 
 /// Minimal single-future executor that parks the current (non-tokio)
 /// thread.  tokio's channel and `Notify` futures are runtime-agnostic.
+///
+/// It parks on a pthread condition variable rather than
+/// `std::thread::park`, which on macOS uses libdispatch: libdispatch
+/// traps in the child of a multi-threaded process, and the client blocks
+/// here in processes forked after it made calls.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
-    struct ThreadWaker(std::thread::Thread);
-    impl Wake for ThreadWaker {
+    #[derive(Default)]
+    struct Signal {
+        woken: Mutex<bool>,
+        condvar: Condvar,
+    }
+    impl Wake for Signal {
         fn wake(self: Arc<Self>) {
-            self.0.unpark();
+            self.wake_by_ref();
         }
         fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
+            *self.woken.lock() = true;
+            self.condvar.notify_one();
         }
     }
 
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let signal = Arc::new(Signal::default());
+    let waker = Waker::from(signal.clone());
     let mut cx = Context::from_waker(&waker);
     let mut fut = std::pin::pin!(fut);
     loop {
         if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
             return value;
         }
-        std::thread::park();
+        let mut woken = signal.woken.lock();
+        while !*woken {
+            signal.condvar.wait(&mut woken);
+        }
+        *woken = false;
     }
 }
 

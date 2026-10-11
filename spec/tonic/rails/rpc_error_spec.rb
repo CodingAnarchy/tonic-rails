@@ -43,6 +43,20 @@ RSpec.describe Tonic::Rails::RpcError do
     end
   end
 
+  describe ".decode_details" do
+    it "unpacks the details of an encoded google.rpc.Status" do
+      unknown = Google::Protobuf::Any.new(type_url: "type.googleapis.com/acme.Unknown", value: "\x08\x01".b)
+      status = described_class.new("bad", details: [Echo::V1::Detail.new(mood: :MOOD_HAPPY), unknown]).status_proto
+      expect(described_class.decode_details(status)).to eq([Echo::V1::Detail.new(mood: :MOOD_HAPPY), unknown])
+    end
+
+    it "returns nothing for missing or malformed details" do
+      expect(described_class.decode_details(nil)).to eq([])
+      expect(described_class.decode_details("\x1a\x7f".b)).to eq([])
+      expect(described_class.decode_details("\xff".b)).to eq([])
+    end
+  end
+
   it "is a Tonic::Rails::Error" do
     expect(described_class.new("x")).to be_a(Tonic::Rails::Error)
   end

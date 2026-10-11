@@ -20,6 +20,7 @@
 //! Modules:
 //! - [`framing`]  — gRPC wire format (frames, gzip, timeouts, trailers)
 //! - [`body`]     — response bodies and request stats
+//! - [`client`]   — `TonicRails::Native::Channel`, for outgoing calls
 //! - [`dispatch`] — the fallback tower service that queues RPCs for Ruby
 //! - [`gvl`]      — GVL release/acquire and the Ruby stream objects
 //! - [`log`]      — transport log events for Ruby's logger
@@ -27,6 +28,7 @@
 //! - [`server`]   — `TonicRails::Native::Server`
 
 mod body;
+mod client;
 mod dispatch;
 mod framing;
 mod gvl;
@@ -36,6 +38,7 @@ mod server;
 
 use magnus::{Error, Ruby, function, method, prelude::*};
 
+use client::NativeChannel;
 use gvl::{RequestReader, StreamSender};
 use server::NativeServer;
 
@@ -94,6 +97,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     reader.undef_default_alloc_func();
     reader.define_method("next", method!(RequestReader::next, 0))?;
     reader.define_method("error", method!(RequestReader::error, 0))?;
+
+    let channel = native.define_class("Channel", ruby.class_object())?;
+    channel.define_singleton_method("new", function!(NativeChannel::new, 4))?;
+    channel.define_method("unary", method!(NativeChannel::unary, 4))?;
 
     Ok(())
 }

@@ -24,17 +24,32 @@ module Tonic
     module Instrumentation
       EVENT = "process_rpc.tonic_rails"
 
+      # Outgoing calls made with Tonic::Rails::Client publish
+      # "request_rpc.tonic_rails", with the same payload plus :address,
+      # the server called.
+      REQUEST_EVENT = "request_rpc.tonic_rails"
+
       module_function
 
       # @api private
-      def instrument(path, metadata)
+      def instrument(path, metadata, &)
+        publish(EVENT, path, metadata, &)
+      end
+
+      # @api private
+      def instrument_request(path, address, metadata, &)
+        publish(REQUEST_EVENT, path, metadata, address: address, &)
+      end
+
+      # @api private
+      def publish(event, path, metadata, **extra)
         # Without subscribers, skip building the payload: this runs on
         # every RPC.
-        return yield unless ActiveSupport::Notifications.notifier.listening?(EVENT)
+        return yield unless ActiveSupport::Notifications.notifier.listening?(event)
 
         service, rpc = path.delete_prefix("/").split("/", 2)
-        payload = { path: path, service: service, rpc: rpc, metadata: metadata, code: nil, status: nil }
-        ActiveSupport::Notifications.instrument(EVENT, payload) do
+        payload = { path: path, service: service, rpc: rpc, metadata: metadata, code: nil, status: nil, **extra }
+        ActiveSupport::Notifications.instrument(event, payload) do
           result = yield
           payload[:code] = 0
           payload[:status] = :ok
