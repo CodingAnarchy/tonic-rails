@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
         with:
           ruby-version: "3.4"
           bundler-cache: true
@@ -63,7 +63,7 @@ jobs:
           - x86_64-linux-musl
     steps:
       - uses: actions/checkout@v7
-      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@ec90b4aa48795518d79be3f5cc478d1d7ccd02a8 # v1
         with:
           ruby-version: "3.4"
           # Gems built on the runner would be mounted into the container,
@@ -104,7 +104,7 @@ jobs:
           - { os: macos-latest, platform: arm64-darwin, ruby: "4.0" }
           - { os: windows-latest, platform: x64-mingw-ucrt, ruby: "3.4" }
     steps:
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
         with:
           ruby-version: ${{ matrix.ruby }}
       - uses: actions/download-artifact@v8
@@ -132,10 +132,10 @@ jobs:
           pattern: gem-*
           path: pkg
           merge-multiple: true
-      - uses: ruby/setup-ruby@v1
+      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
         with:
           ruby-version: "3.4"
-      - uses: rubygems/configure-rubygems-credentials@v2.1.0
+      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
       - name: Push gems
         run: |
           ls -l pkg
