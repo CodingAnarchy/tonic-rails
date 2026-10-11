@@ -52,6 +52,10 @@ class EchoHandler
     trailing_metadata["x-echo-trailer"] = "t1"
   end
 
+  def whoami
+    [peer.ip, peer.certificate&.subject&.to_s].compact.join(" ")
+  end
+
   def work(request)
     sleep(request.sleep_ms / 1000.0) if request.sleep_ms.positive?
     case request.fail_with
@@ -73,7 +77,7 @@ class EchoHandler
 
   def response(request, index: 0)
     Echo::V1::EchoResponse.new(
-      message: request.message,
+      message: request.message == "whoami" ? whoami : request.message,
       index: index,
       metadata: grpc_metadata.reject { |k, _| k.start_with?(":") },
       deadline_ms: deadline_ms || -1,

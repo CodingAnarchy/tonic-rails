@@ -180,6 +180,10 @@ module Tonic
       # @return [String]
       attr_reader :current_rpc
 
+      # The client: address, and certificate with mutual TLS.
+      # @return [Tonic::Rails::Peer]
+      attr_reader :peer
+
       # The decoded request: a message (or Hash), or for client-streaming
       # RPCs an Enumerator of them.  Also passed to the handler method.
       attr_reader :request
@@ -230,12 +234,13 @@ module Tonic
       # (`#push`) for server-streaming RPCs.
       # @return [String, nil] the encoded unary response, or nil when
       #   messages were streamed through `sender`
-      def call_rpc(rpc_name, metadata:, reader:, sender: nil, timeout_ms: nil)
+      def call_rpc(rpc_name, metadata:, reader:, sender: nil, timeout_ms: nil, peer: nil)
         spec = self.class.grpc_rpcs[rpc_name.to_s]
         raise RpcError.new("method not implemented", code: :unimplemented) unless spec
         raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented) unless respond_to?(spec[:handler])
 
         @current_rpc = rpc_name.to_s
+        @peer = peer || Peer.new
         @grpc_metadata = metadata
         @grpc_sender = sender
         @grpc_headers_sent = false

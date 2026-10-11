@@ -38,6 +38,8 @@ Metrics/ClassLength:
   Max: 250
 Metrics/ModuleLength:
   Max: 150
+Metrics/ParameterLists:
+  CountKeywordArgs: false
 Metrics/CyclomaticComplexity:
   Max: 15
 Metrics/MethodLength:

@@ -14,6 +14,9 @@ minor versions may contain breaking changes.
   accessors.
 - `rescue_from` (ActiveSupport::Rescuable) with a `code:` shorthand that maps
   an exception class to a gRPC status.
+- `peer` in handlers: the client's address and, with mutual TLS, its
+  certificate (`peer.certificate`, an `OpenSSL::X509::Certificate`).
+  `Testing.call`/`invoke` accept `peer:`.
 
 ## [0.2.0] - 2026-10-11
 

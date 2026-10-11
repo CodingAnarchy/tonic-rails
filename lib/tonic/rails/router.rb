@@ -38,6 +38,7 @@ module Tonic
           reader: call[:reader],
           sender: call[:sender],
           timeout_ms: call[:timeout_ms],
+          peer: Peer.new(call[:peer_address], call[:peer_certificates] || []),
         )
       end
 

@@ -369,6 +369,15 @@ pub struct DispatchContext {
     pub request_rx: mpsc::Receiver<Vec<u8>>,
     pub request_error: Arc<RequestError>,
     pub log: LogSink,
+    pub peer: Peer,
+}
+
+/// The client connection: remote address and, with mutual TLS, its
+/// certificate chain (DER, leaf first).
+#[derive(Default)]
+pub struct Peer {
+    pub address: Option<String>,
+    pub certificates: Vec<Vec<u8>>,
 }
 
 /// Bounds on how long one thread keeps the GVL to drain a busy queue.
@@ -441,6 +450,7 @@ fn run_handler(ctx: DispatchContext) {
         request_rx,
         request_error,
         log,
+        peer,
     } = ctx;
 
     let trailers = Arc::new(Mutex::new(Metadata::new()));
@@ -454,6 +464,7 @@ fn run_handler(ctx: DispatchContext) {
         request_rx,
         request_error,
         trailers.clone(),
+        &peer,
     );
     let end = StreamMessage::End {
         status: result.err().map(|e| error_status(&e, &log)),
@@ -474,6 +485,7 @@ fn call_handler(
     request_rx: mpsc::Receiver<Vec<u8>>,
     request_error: Arc<RequestError>,
     trailers: Arc<Mutex<Metadata>>,
+    peer: &Peer,
 ) -> Result<(), Error> {
     let md = ruby.hash_new_capa(metadata.len());
     for (k, v) in metadata {
@@ -495,6 +507,16 @@ fn call_handler(
     )?;
     if let Some(ms) = timeout_ms {
         call.aset(ruby.to_symbol("timeout_ms"), ms as u64)?;
+    }
+    if let Some(address) = &peer.address {
+        call.aset(ruby.to_symbol("peer_address"), ruby.str_new(address))?;
+    }
+    if !peer.certificates.is_empty() {
+        let certificates = ruby.ary_new_capa(peer.certificates.len());
+        for der in &peer.certificates {
+            certificates.push(ruby.str_from_slice(der))?;
+        }
+        call.aset(ruby.to_symbol("peer_certificates"), certificates)?;
     }
 
     let callback = ruby.get_inner(callback);

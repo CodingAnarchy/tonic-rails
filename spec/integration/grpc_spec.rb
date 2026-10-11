@@ -61,6 +61,10 @@ RSpec.describe "gRPC integration", :integration do
           .or eq(["\x00\x01".b].pack("m0"))
       end
 
+      it "exposes the client address to handlers" do
+        expect(stub.unary(request.new(message: "whoami")).message).to eq("127.0.0.1")
+      end
+
       it "propagates the client deadline" do
         response = stub.unary(request.new, deadline: Time.now + 5)
         # The client rounds its timeout header up, so allow a little slack.
@@ -482,8 +486,9 @@ RSpec.describe "gRPC integration", :integration do
         config.tls_key_path = path("server.key")
         config.tls_client_ca_path = path("ca.pem")
       end
-      response = tls_stub(handle, key: @client_key, cert: @client_cert).unary(request.new(message: "mtls"))
-      expect(response.message).to eq("mtls")
+      client = tls_stub(handle, key: @client_key, cert: @client_cert)
+      expect(client.unary(request.new(message: "mtls")).message).to eq("mtls")
+      expect(client.unary(request.new(message: "whoami")).message).to eq("127.0.0.1 /CN=client")
       expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
         tls_stub(handle).unary(request.new, deadline: Time.now + 1)
       end

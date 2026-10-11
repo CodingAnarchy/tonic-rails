@@ -282,6 +282,8 @@ end
 ```ruby
 def get_item(request)
   token = grpc_metadata["authorization"]   # request headers, lower-case
+  peer.ip                                    # client address ("10.0.4.17")
+  peer.certificate&.subject                  # client certificate, with mutual TLS
   deadline_ms                                # ms left before the client's deadline, or nil
   deadline_exceeded?                         # true once it has passed
   cancelled?                                 # true while the server shuts down
