@@ -28,8 +28,8 @@ module Tonic
       config.after_initialize do
         configuration = Tonic::Rails.configuration
         # Only inside an actual web server process — not consoles, rake
-        # tasks, or test runs.  Forking servers (Puma cluster mode) must
-        # instead start the server per worker, e.g. in `on_worker_boot`.
+        # tasks, or test runs.  With Puma, prefer `plugin :tonic_rails`
+        # (lib/puma/plugin/tonic_rails.rb), which also covers cluster mode.
         if configuration.auto_start && defined?(::Rails::Server)
           server = Tonic::Rails.server
           thread = Thread.new do
