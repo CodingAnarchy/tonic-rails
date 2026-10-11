@@ -351,7 +351,7 @@ impl NativeChannel {
             config = match ca {
                 Some(ca) => config.ca_certificate(Certificate::from_pem(ca)),
                 None => {
-                    config.ca_certificate(Certificate::from_pem(system_roots().map_err(&argument_error)?))
+                    config.ca_certificate(Certificate::from_pem(system_roots().map_err(argument_error)?))
                 }
             };
             if let (Some(cert), Some(key)) = (cert, key) {
