@@ -22,6 +22,7 @@ module Tonic
         @state = :stopped
         @stop_signal = nil
         @stop_requested = false
+        @health = Health.new(configuration, @router)
         @lock = Mutex.new
       end
 
@@ -58,6 +59,7 @@ module Tonic
           @native = build_native_server
           @native.start_server
           log_pump = spawn_log_pump
+          @health.attach(@native)
           @state = :running
 
           request_log = subscribe_request_logger
@@ -67,10 +69,12 @@ module Tonic
           yield self if block_given?
 
           wait_for_stop(workers)
+          @health.detach
           shutdown(workers)
         ensure
           ActiveSupport::Notifications.unsubscribe(request_log) if request_log
           previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
+          @health.detach
           @native&.stop_server
           stop_log_pump(log_pump)
           @native = nil
@@ -89,6 +93,25 @@ module Tonic
 
       def running?
         @state == :running
+      end
+
+      # Mark the whole server, or the given services (fully-qualified
+      # names), SERVING in grpc.health.v1.  Takes effect immediately when
+      # running, otherwise when the server starts.
+      #
+      # With `config.health_check`, a service reports SERVING only while the
+      # check passes *and* it's marked serving here.
+      def serving!(*services)
+        @health.mark(services, true)
+        self
+      end
+
+      # Mark the whole server, or the given services, NOT_SERVING (e.g. for
+      # maintenance), so load balancers and readiness probes route around
+      # this instance.  Calls are still served.
+      def not_serving!(*services)
+        @health.mark(services, false)
+        self
       end
 
       # @return [Hash{Symbol=>Integer}] request and connection counters

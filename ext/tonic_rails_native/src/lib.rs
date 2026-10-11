@@ -71,6 +71,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     class.define_method("start_server", method!(NativeServer::start_server, 0))?;
     class.define_method("serve_worker", method!(NativeServer::serve_worker, 0))?;
+    class.define_method("set_health", method!(NativeServer::set_health, 2))?;
     class.define_method("begin_shutdown", method!(NativeServer::begin_shutdown, 0))?;
     class.define_method("wait_for_drain", method!(NativeServer::wait_for_drain, 1))?;
     class.define_method("stop_workers", method!(NativeServer::stop_workers, 0))?;

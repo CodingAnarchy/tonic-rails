@@ -45,6 +45,14 @@ RSpec.describe Tonic::Rails::Configuration do
     end
   end
 
+  it "validates the health check" do
+    config.health_check = "yes"
+    expect { config.validate! }.to raise_error(ArgumentError, /health_check/)
+    config.health_check = -> { true }
+    config.health_check_interval = 0
+    expect { config.validate! }.to raise_error(ArgumentError, /health_check_interval/)
+  end
+
   it "requires callable interceptors" do
     config.interceptors = [Object.new]
     expect { config.validate! }.to raise_error(ArgumentError, /interceptors/)

@@ -17,6 +17,10 @@ minor versions may contain breaking changes.
 - `peer` in handlers: the client's address and, with mutual TLS, its
   certificate (`peer.certificate`, an `OpenSSL::X509::Certificate`).
   `Testing.call`/`invoke` accept `peer:`.
+- App-controlled health: `config.health_check` (polled every
+  `health_check_interval` seconds inside the Rails executor) and
+  `Tonic::Rails.server.serving!` / `not_serving!` for the whole server or
+  individual services, so readiness probes reflect real dependency health.
 
 ## [0.2.0] - 2026-10-11
 
