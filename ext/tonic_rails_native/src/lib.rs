@@ -60,7 +60,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "set_dispatch_queue_size",
         method!(NativeServer::set_dispatch_queue_size, 1),
     )?;
-    class.define_method("set_log_requests", method!(NativeServer::set_log_requests, 1))?;
     class.define_method("set_compression", method!(NativeServer::set_compression, 1))?;
     class.define_method("set_reflection", method!(NativeServer::set_reflection, 1))?;
     class.define_method("set_routes", method!(NativeServer::set_routes, 1))?;

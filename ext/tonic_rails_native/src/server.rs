@@ -187,10 +187,6 @@ impl NativeServer {
         self.options.lock().dispatch_queue_size = size.max(1);
     }
 
-    pub fn set_log_requests(&self, enabled: bool) {
-        self.stats.log_requests.store(enabled, Ordering::Relaxed);
-    }
-
     pub fn set_compression(&self, enabled: bool) {
         self.compression.store(enabled, Ordering::Relaxed);
     }

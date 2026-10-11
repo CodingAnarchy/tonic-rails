@@ -47,7 +47,8 @@ module Tonic
       # Concurrent HTTP/2 streams per connection.  0 = unlimited.  Default 32.
       attr_accessor :concurrency_limit_per_connection
 
-      # Log every request, not just errors, to stderr.  Default false.
+      # Log one line per RPC (path, status, duration) through `logger`.
+      # Unexpected exceptions are always logged.  Default false.
       attr_accessor :log_requests
 
       # Callables wrapping every RPC, outermost first:

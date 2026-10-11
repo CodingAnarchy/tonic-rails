@@ -317,7 +317,7 @@ end
 | `compression` | `false` | gzip responses over 1 KiB for clients that accept it |
 | `reflection` | `false` | Serve `grpc.reflection.v1`; exposes your schema |
 | `interceptors` | `[]` | See [Interceptors](#interceptors) |
-| `log_requests` | `false` | Log every call to stderr (errors are always logged) |
+| `log_requests` | `false` | Log one line per call through `logger` (unexpected exceptions are always logged) |
 | `auto_start` | `false` | Start inside `rails server` (see below) |
 
 ### Sizing threads
@@ -348,11 +348,38 @@ start one per worker.
   in-flight calls finish for up to `drain_timeout` seconds, then exits.
 - **Load shedding.** When every dispatch thread is busy and the queue is
   full, new calls fail fast with `RESOURCE_EXHAUSTED` instead of piling up.
+- **Instrumentation.** Every RPC publishes a `process_rpc.tonic_rails`
+  event through `ActiveSupport::Notifications`, so APM agents,
+  OpenTelemetry and your own subscribers can trace calls. See
+  [Instrumentation](#instrumentation).
+- **Request logs.** With `log_requests = true`, each RPC logs one line
+  through your logger: `gRPC /demo.v1.ItemService/GetItem OK in 1.4ms`.
 - **Stats.** `Tonic::Rails.server.stats` returns counters for totals,
   successes, errors, cancellations, deadline and resource errors, active
   connections and queued calls.
 - **Reflection.** Turn on `reflection` in development to use
   [grpcurl](https://github.com/fullstorydev/grpcurl) without proto files.
+
+## Instrumentation
+
+Every RPC is wrapped in an `ActiveSupport::Notifications` event, inside the
+Rails executor, so subscribers see the same context as your handler:
+
+```ruby
+ActiveSupport::Notifications.subscribe("process_rpc.tonic_rails") do |event|
+  event.payload[:path]      # "/demo.v1.ItemService/GetItem"
+  event.payload[:service]   # "demo.v1.ItemService"
+  event.payload[:rpc]       # "GetItem"
+  event.payload[:metadata]  # request metadata
+  event.payload[:status]    # :ok, :not_found, :internal, ...
+  event.payload[:code]      # numeric gRPC status
+  event.duration            # milliseconds
+end
+```
+
+When a call fails, `event.payload[:exception_object]` is the
+`Tonic::Rails::RpcError` sent to the client. If a handler raised something
+unexpected, that error's `cause` is the original exception.
 
 ## How it works
 

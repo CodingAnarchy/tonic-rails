@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -30,12 +30,13 @@ pub struct ServerStats {
     pub deadline_exceeded: AtomicUsize,
     pub resource_exhausted: AtomicUsize,
     pub unimplemented: AtomicUsize,
-    /// Log every request (including OK) to stderr.  Errors are always logged.
-    pub log_requests: AtomicBool,
 }
 
 impl ServerStats {
-    pub fn record(&self, path: &str, code: u32, message: &str, start: Instant) {
+    /// Count a finished call.  `transport` marks outcomes decided here in
+    /// Rust (rejections, deadlines, limits) rather than by the Ruby handler;
+    /// only those are logged, since Ruby instruments and logs its own calls.
+    pub fn record(&self, path: &str, code: u32, message: &str, start: Instant, transport: bool) {
         let counter = match Code::from_i32(code as i32) {
             Code::Ok => &self.successful,
             Code::Cancelled => &self.cancelled,
@@ -55,8 +56,7 @@ impl ServerStats {
             _ => {}
         }
 
-        let is_error = !matches!(Code::from_i32(code as i32), Code::Ok | Code::Cancelled);
-        if is_error || self.log_requests.load(Ordering::Relaxed) {
+        if transport && code != Code::Ok as u32 {
             let path = sanitize_for_log(path);
             let dur_us = start.elapsed().as_micros();
             if message.is_empty() {
@@ -113,10 +113,16 @@ pub struct ResponseBody {
 }
 
 impl ResponseBody {
-    fn finish(&mut self, code: Code, message: &str) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+    fn finish(
+        &mut self,
+        code: Code,
+        message: &str,
+        transport: bool,
+    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
         self.receiver = None;
         self.finished = true;
-        self.stats.record(&self.path, code as u32, message, self.start);
+        self.stats
+            .record(&self.path, code as u32, message, self.start, transport);
         Poll::Ready(Some(Ok(Frame::trailers(status_trailers(code as u32, message)))))
     }
 }
@@ -141,23 +147,26 @@ impl Body for ResponseBody {
                     return self.finish(
                         Code::ResourceExhausted,
                         "response message exceeds max_message_size",
+                        true,
                     );
                 }
                 let compress = self.compress && bytes.len() > COMPRESSION_THRESHOLD;
                 return Poll::Ready(Some(Ok(Frame::data(frame(&bytes, compress)))));
             }
-            Poll::Ready(Some(StreamMessage::End(None))) => return self.finish(Code::Ok, ""),
+            Poll::Ready(Some(StreamMessage::End(None))) => return self.finish(Code::Ok, "", false),
             Poll::Ready(Some(StreamMessage::End(Some((code, message))))) => {
-                return self.finish(Code::from_i32(code as i32), &message);
+                return self.finish(Code::from_i32(code as i32), &message, false);
             }
-            Poll::Ready(None) => return self.finish(Code::Internal, "handler ended without a response"),
+            Poll::Ready(None) => {
+                return self.finish(Code::Internal, "handler ended without a response", true);
+            }
             Poll::Pending => {}
         }
 
         if let Some(deadline) = self.deadline.as_mut()
             && deadline.as_mut().poll(cx).is_ready()
         {
-            return self.finish(Code::DeadlineExceeded, "deadline exceeded");
+            return self.finish(Code::DeadlineExceeded, "deadline exceeded", true);
         }
         Poll::Pending
     }
@@ -173,12 +182,6 @@ impl Drop for ResponseBody {
         // (RST_STREAM / disconnect) — count it as cancelled.
         if !self.finished {
             self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
-            if self.stats.log_requests.load(Ordering::Relaxed) {
-                eprintln!(
-                    "tonic-rails: path={} code=1 message=cancelled by client",
-                    sanitize_for_log(&self.path)
-                );
-            }
         }
     }
 }

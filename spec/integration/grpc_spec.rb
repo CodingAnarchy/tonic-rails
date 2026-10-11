@@ -211,6 +211,20 @@ RSpec.describe "gRPC integration", :integration do
         expect(response.message.size).to eq(10_000)
       end
 
+      it "publishes an ActiveSupport::Notifications event per RPC" do
+        events = []
+        subscription = ActiveSupport::Notifications.subscribe("process_rpc.tonic_rails") { |e| events << e }
+        stub.unary(request.new(message: "observed"), metadata: { "x-trace" => "t1" })
+        expect { stub.unary(request.new(fail_with: "rpc:already_exists")) }.to raise_error(GRPC::AlreadyExists)
+        expect { stub.unary(request.new(fail_with: "crash")) }.to raise_error(GRPC::Internal)
+        ActiveSupport::Notifications.unsubscribe(subscription)
+
+        expect(events.map { |e| e.payload[:status] }).to eq(%i[ok already_exists internal])
+        expect(events.first.payload).to include(path: "/echo.v1.EchoService/Unary", rpc: "Unary")
+        expect(events.first.payload[:metadata]).to include("x-trace" => "t1")
+        expect(events.last.payload[:exception_object].cause.message).to eq("secret internal detail")
+      end
+
       it "tracks request stats" do
         before = @handle[:server].stats
         stub.unary(request.new(message: "counted"))
@@ -268,6 +282,25 @@ RSpec.describe "gRPC integration", :integration do
       )
       expect(status).to be_success, output
       expect(output).to include("via reflection")
+    end
+  end
+
+  context "with request logging" do
+    before(:all) do
+      @log = StringIO.new
+      @handle = IntegrationServer.start do |config|
+        config.log_requests = true
+        config.logger = Logger.new(@log)
+      end
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    it "logs one line per RPC through the configured logger" do
+      stub_for(@handle).unary(request.new(message: "logged"))
+      expect { stub_for(@handle).unary(request.new(fail_with: "rpc:not_found")) }.to raise_error(GRPC::NotFound)
+      expect(@log.string).to match(%r{gRPC /echo\.v1\.EchoService/Unary OK in \d+\.\dms})
+      expect(@log.string).to match(%r{gRPC /echo\.v1\.EchoService/Unary NOT_FOUND in \d+\.\dms: failed with not_found})
     end
   end
 
