@@ -1,91 +1,135 @@
 # Performance
 
-How tonic-rails compares with a pure-Rust tonic server running the same
-handlers, and what that means for sizing a deployment.
+How tonic-rails compares with the alternatives a Rails team would
+actually reach for, and with a pure-Rust ceiling.
 
-## Setup
+**In short:** inside a Rails app, tonic-rails served light RPCs at
+**5–6× the throughput of an equivalent Rails JSON endpoint** and
+**1.4–3× the official `grpc` gem**. For server streaming it was **4–7×**
+the `grpc` gem. As handlers do more work per call, the transport matters
+less and the servers converge, because the handler itself becomes the
+bottleneck.
 
-- **Service**: `bench.v1.BenchService` (`bench/protos/bench.proto`). Each
-  request describes the work to do (simulated I/O calls, records to return,
-  payload size, CPU iterations), so one service covers every workload shape.
-- **tonic-rails**: `bench/bench_server.rb`, handlers in Ruby using
-  `request_format :message`, 16 dispatch threads unless noted.
-- **Rust baseline**: `bench/rust_bench`, the same handlers on tonic 0.14
-  with prost, default tokio worker threads, same HTTP/2 flow-control windows.
-- **Client**: `bench/go_bench`, grpc-go over one persistent HTTP/2
-  connection, 50 requests in flight, 20,000 requests per scenario after a
-  200-request warm-up.
-- **Machine**: Apple M5 (10 cores), macOS, Ruby 3.4, everything on loopback.
+## What was compared
 
-Laptop benchmarks are noisy. The table shows the range seen across
-three to five runs; CPU-bound Ruby scenarios varied by up to 2× between
-runs, so treat single numbers as indicative, not precise.
+Every server does exactly the same work per request: the code lives in
+`bench/bench_work.rb`, with the Rust server mirroring it. Only the
+transport differs.
+
+| Server | What it is |
+|--------|------------|
+| **tonic-rails in Rails** | tonic-rails serving gRPC from inside a production-style Rails app; every RPC runs in the Rails executor, as in a real app |
+| **tonic-rails** | the same handlers on tonic-rails as a plain Ruby process (no Rails) |
+| **grpc gem** | the official `grpc` gem (gRPC C core), the usual way to serve gRPC from Ruby |
+| **Rails JSON** | a vanilla Rails API-only app on Puma: a controller builds Hashes and renders JSON over HTTP/1.1 |
+| **Rust tonic** | the same handlers in pure Rust on tonic; the ceiling, not an alternative |
+
+Each server runs as a single process. The Ruby servers use 50 handler
+threads (matching the 50 requests in flight) and YJIT, which Rails turns
+on by default. The `grpc` gem needs at least as many threads as in-flight
+requests: when every thread is busy it rejects new calls with
+`RESOURCE_EXHAUSTED` instead of queueing them.
+
+The client is `bench/go_bench`. It keeps 50 requests in flight and sends
+20,000 per scenario after a warm-up, over one HTTP/2 connection for gRPC
+or 50 keep-alive HTTP/1.1 connections for the JSON API.
 
 ## Results (requests/second)
 
-| Scenario | Work per request | tonic-rails | Rust tonic | Ruby / Rust |
-|----------|------------------|------------:|-----------:|------------:|
-| `ping` | empty request and response | 63k–70k | 77k–90k | ~0.8 |
-| `small` | one small record | 51k–66k | 74k–84k | ~0.75 |
-| `io` | one 2 ms I/O call | 6.2k | 12.7k–13.0k | 0.5 (thread-bound, see below) |
-| `io`, 64 threads | one 2 ms I/O call | 14.8k–18.5k | 12.7k–13.0k | ≥1 |
-| `multi_io` | three 5 ms I/O calls, 10 records | 790–890 | 2.5k | 0.35 (thread-bound) |
-| `multi_io`, 64 threads | | 2.6k–2.8k | 2.5k | ~1 |
-| `mixed` | 2 ms I/O + light CPU + 20 records | 2.2k–3.0k | 12.2k–13.3k | ~0.2 |
-| `large` | 100 records, ~35 KB response | 2.1k–4.2k | 26k–37k | ~0.1 |
-| `cpu` | 20k-iteration integer loop | 1.2k–1.9k | 38k–57k | ~0.03 |
-| `stream` | server stream of 100 records | 2.4k–3.5k | 22k–29k | ~0.12 |
-| `upload` | client stream of 100 records | 2.3k–4.5k | 8.3k–9.7k | ~0.4 |
+Machine: Apple M5 (10 cores), macOS, Ruby 3.4 with YJIT, everything on
+loopback. Each cell is the range across two full runs.
 
-`ping` p50 latency is about 0.6 ms for both servers at this concurrency.
+| Scenario | Work per request | tonic-rails in Rails | tonic-rails | grpc gem | Rails JSON | Rust tonic |
+|----------|------------------|---------------------:|------------:|---------:|-----------:|-----------:|
+| `ping` | empty request and response | 26k–31k | 42k–44k | 10k–19k | 5.2k–5.3k | 88k–89k |
+| `small` | one small record | 23k–28k | 30k–32k | 9k–17k | 5.0k–5.1k | 88k–89k |
+| `io` | one 2 ms I/O call | 17k | 16k–18k | 10k–12k | 3.8k–4.7k | 13k |
+| `multi_io` | three 5 ms I/O calls, 10 records | 2.6k–2.7k | 2.6k–2.8k | 2.3k–2.4k | 2.6k | 2.5k |
+| `mixed` | 2 ms I/O, light CPU, 20 records | 7.6k–8.4k | 7.4k–9.9k | 6.5k–6.7k | 3.7k–3.8k | 12k–13k |
+| `large` | 100 records, ~35 KB response | 3.4k–3.8k | 3.4k–4.2k | 3.3k–3.6k | 3.0k | 42k |
+| `cpu` | 20k-iteration integer loop | 6.1k–6.2k | 6.4k–7.2k | 5.5k–5.8k | 3.1k–3.2k | 63k–64k |
+| `stream` | server stream of 100 records | 2.1k–3.2k | 2.8k–3.4k | 0.43k–0.49k ¹ | n/a | 32k |
+| `upload` | client stream of 100 records | 3.2k–4.5k | 4.0k–4.7k | 1.6k | n/a | 11k |
+
+¹ The `grpc` gem also rejected a few streaming calls with
+`RESOURCE_EXHAUSTED` even with 50 threads: a stream holds its thread for
+the whole call.
+
+How tonic-rails in Rails compares:
+
+| Scenario | vs Rails JSON | vs grpc gem |
+|----------|--------------:|------------:|
+| `ping`, `small` | 4.6–6× | 1.4–3× |
+| `io` | 3.7–4.6× | 1.4–1.8× |
+| `mixed` | 2–2.3× | 1.1–1.3× |
+| `cpu` | ~2× | ~1.1× |
+| `large` | 1.1–1.3× | ~1.05× |
+| `multi_io` | ~1× | ~1.1× |
+| `stream` | n/a | 4–7× |
+| `upload` | n/a | 2–2.8× |
+
+The laptop is noisy: the `grpc` gem's light-call numbers varied almost
+2× between runs, and every cell above is a range for that reason. Treat
+the ratios as indicative rather than precise.
 
 ## What the numbers say
 
-**Transport and dispatch overhead are small.** `ping` and `small` measure
-the HTTP/2 stack, the hop into Ruby, protobuf decode/encode and the hop
-back. tonic-rails reaches roughly 75–80% of pure Rust. Everything below
-the Ruby handler is the same tonic/hyper code.
+**The transport is where tonic-rails wins.** `ping`, `small` and `io`
+spend most of their time in the server machinery rather than in the
+handler. Against Rails JSON, tonic-rails skips Rack, routing, parameter
+parsing and JSON, and multiplexes over one HTTP/2 connection. Against the
+`grpc` gem, it keeps HTTP/2 and its connection handling in Rust, outside
+the GVL, and queues calls instead of rejecting them.
 
-**I/O-bound handlers scale with dispatch threads, not the GVL.** Ruby
-releases the GVL while sleeping or waiting on a socket, so a handler
-blocked on a database does not stop the others. With 16 threads and
-2 ms of I/O per call the ceiling is 16 / 2 ms = 8,000 rps, and tonic-rails
-gets 6,200. With 64 threads it matches or beats the Rust server: tokio's
-timer has 1 ms granularity, so the Rust handler's "2 ms" sleep often lasts
-3 ms. Size `dispatch_threads` to your I/O concurrency, and your database
-pool to match (`RAILS_MAX_THREADS`).
+**Heavier handlers converge.** In `multi_io` each call sleeps 15 ms, so
+with 50 requests in flight no server can exceed about 50 ÷ 15 ms ≈ 3,300
+calls/s, and all five, Rust included, land at 2.3k–2.8k. In `large` the
+time goes into building 100 protobuf messages in Ruby, which every Ruby
+server pays. tonic-rails is never
+slower, but if your handlers are dominated by slow queries or heavy object
+construction, expect a modest gain, not a multiple.
 
-**CPU-bound and allocation-heavy handlers are bounded by Ruby.** Building
-100 protobuf messages (`large`, `stream`) or running a tight loop (`cpu`)
-happens under the GVL, one thread at a time per process. That is the cost
-of running business logic in Ruby, and no transport can remove it. Scale
-out with more processes: the listener sets `SO_REUSEPORT`, so several
-processes can bind the same port and the kernel spreads connections
-across them (one GVL each). The multi-process case is not part of the
-numbers above.
+**Streaming is a large win over the `grpc` gem.** tonic-rails pushes
+streamed messages through a bounded buffer, while the transport runs in
+Rust. The `grpc` gem ties up a thread per stream and pays more per
+message.
 
-**Streaming is incremental.** Each streamed response message is pushed
-to the client as the handler yields it, with a bounded buffer (32
-messages) that applies backpressure to the handler. Peak memory is a few
-messages, not the whole stream.
+**The Rails executor costs something on very cheap calls.** Running each
+RPC inside the executor (connection pool check-in, CurrentAttributes
+reset, and so on) takes `ping` from 42–44k to 26–31k calls/s, roughly
+10–20 µs per call. It disappears into the noise once a handler does any
+real work, and it's what makes Rails code safe to call from handlers.
+
+**Rust is the ceiling, not a competitor.** For trivial handlers the pure
+Rust server is 2–3× faster again, and for CPU-bound or allocation-heavy
+work it's 10× or more, because Ruby runs the handler. tonic-rails narrows
+the gap where the transport dominates, not where Ruby does.
+
+**I/O-bound handlers scale with threads.** Ruby releases the GVL while a
+handler waits on I/O, so `dispatch_threads` sets how much I/O can overlap.
+With 16 threads tonic-rails served `io` at 6.2k calls/s; with 50 it served
+16–18k, above the Rust server. That last result is partly an artifact:
+tokio's 1 ms timer granularity stretches the Rust handler's 2 ms sleep.
+For CPU-light, very cheap calls, fewer threads do slightly better: with 16
+threads (and YJIT off) tonic-rails served `ping` at 63–70k calls/s,
+because fewer threads compete for the GVL. Scale CPU-heavy services with
+processes rather than threads; the listener uses `SO_REUSEPORT`, so
+several processes can share a port.
 
 ## Design choices that matter for throughput
 
 - **Raw-byte passthrough.** Rust never decodes protobuf; Ruby's
-  `google-protobuf` C extension does it once. There is no double decode.
+  `google-protobuf` C extension does it once.
 - **`request_format :message`.** Handlers receive the decoded message
-  instead of a Hash, which skips a `to_h` conversion per request (the
-  Hash format remains the default for convenience).
+  instead of a Hash, which skips a `to_h` conversion per request.
 - **GVL batching.** A dispatch thread that holds the GVL keeps going with
   requests already queued, for up to 16 requests or 500 µs, instead of
-  releasing and re-acquiring the GVL for each one. This raised `ping` and
-  `small` throughput by 40–60%. The time bound means only cheap requests
-  are batched, so CPU-heavy handlers keep fair GVL hand-offs and stable
-  tail latency. (An unbounded batch pushed `cpu` p99 from ~30 ms to
-  ~150 ms.)
+  releasing and re-acquiring it for each one. This raised `ping` and
+  `small` throughput by 40–60%. The time bound keeps CPU-heavy handlers
+  handing the GVL off fairly, so tail latency stays stable.
 - **Event-driven waits.** Request and response channels block on wakers,
-  not polling, and release the GVL only when they actually have to wait.
-- **Dispatch before reading the body.** The handler starts as soon as
+  not polling, and release the GVL only when they actually wait.
+- **Dispatch before reading the body.** A handler starts as soon as the
   headers arrive and reads request messages as they stream in, which is
   what lets bidirectional streams interleave.
 
@@ -93,12 +137,13 @@ messages, not the whole stream.
 
 ```sh
 bundle exec rake compile
-bench/run_bench.sh                                   # all scenarios, both servers
-CONCURRENCY=100 TOTAL=50000 SCENARIOS="ping io" bench/run_bench.sh
-DISPATCH_THREADS=64 SERVERS=ruby SCENARIOS=io bench/run_bench.sh
+DISPATCH_THREADS=50 bench/run_bench.sh               # every server and scenario
+SERVERS="rails-grpc rails-json" SCENARIOS="ping io" bench/run_bench.sh
 (cd bench/go_bench && go run . -list)                # scenario descriptions
 ```
 
-Requires Go, Rust and `protoc`. `bench/go_bench/health_bench` measures the
-native `grpc.health.v1` endpoint, and `bench/rust_bench`'s `sleep_bench`
-shows the tokio timer granularity mentioned above.
+`SERVERS` accepts `ruby` (tonic-rails), `rails-grpc` (tonic-rails in
+Rails), `grpc-gem`, `rails-json` and `rust`. `RUBY_YJIT_ENABLE=0` turns
+YJIT off. Requires Go, Rust and `protoc`. `bench/go_bench/health_bench`
+measures the native `grpc.health.v1` endpoint, and `bench/rust_bench`'s
+`sleep_bench` shows the tokio timer granularity mentioned above.

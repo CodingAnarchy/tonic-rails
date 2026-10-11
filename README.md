@@ -30,10 +30,11 @@ end
 
 ## Why tonic-rails
 
-- **Fast where it counts.** Transport overhead is small: an empty RPC
-  runs at roughly 75–80% of a pure-Rust tonic server's throughput. I/O-bound
-  handlers scale with dispatch threads because Ruby releases the GVL
-  while waiting. See [PERF.md](PERF.md).
+- **Fast where it counts.** Inside a Rails app, light RPCs ran at 5–6×
+  the throughput of an equivalent Rails JSON endpoint and 1.4–3× the
+  official `grpc` gem, and server streaming at 4–7× the `grpc` gem.
+  Handlers dominated by slow queries or heavy object building see smaller
+  gains. See [PERF.md](PERF.md).
 - **All four RPC kinds.** Unary, server streaming, client streaming and
   bidirectional streaming, with backpressure in both directions.
 - **Production defaults.** Graceful draining on SIGTERM, health checks
