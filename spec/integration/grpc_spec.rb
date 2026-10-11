@@ -314,6 +314,30 @@ RSpec.describe "gRPC integration", :integration do
     end
   end
 
+  context "with max_connection_age" do
+    before(:all) do
+      @handle = IntegrationServer.start do |config|
+        config.max_connection_age = 0.3
+        config.max_connection_age_grace = 2
+      end
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    it "recycles connections, and clients reconnect transparently" do
+      stub = stub_for(@handle)
+      expect(stub.unary(request.new(message: "first")).message).to eq("first")
+      sleep 1
+      expect(stub.unary(request.new(message: "second")).message).to eq("second")
+      expect(@handle[:server].stats[:connections]).to be >= 2
+    end
+
+    it "lets in-flight calls on an aged connection finish within the grace period" do
+      stub = stub_for(@handle)
+      expect(stub.unary(request.new(message: "slow", sleep_ms: 800)).message).to eq("slow")
+    end
+  end
+
   context "with app-controlled health" do
     before(:all) do
       # A shared object: examples get copies of before(:all) ivars.

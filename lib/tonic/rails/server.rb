@@ -120,7 +120,7 @@ module Tonic
         return native.stats if native
 
         { total: 0, successful: 0, errors: 0, cancelled: 0, deadline_exceeded: 0,
-          resource_exhausted: 0, unimplemented: 0, active_connections: 0, queued: 0 }
+          resource_exhausted: 0, unimplemented: 0, active_connections: 0, connections: 0, queued: 0 }
       end
 
       private
@@ -134,15 +134,20 @@ module Tonic
           native.set_tls(config.tls_cert_path, config.tls_key_path)
           native.set_tls_client_ca(config.tls_client_ca_path) if config.tls_client_ca_path
         end
+        apply_connection_settings(native, config)
+        native.set_compression(config.compression ? true : false)
+        native.set_reflection(config.reflection ? true : false)
+        native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names)) if config.reflection
+        native
+      end
+
+      def apply_connection_settings(native, config)
         native.set_max_connections(config.max_connections)
         native.set_concurrency_limit_per_connection(config.concurrency_limit_per_connection)
         native.set_worker_threads(config.worker_threads || 0)
         native.set_keepalive(config.keepalive_interval.to_f, config.keepalive_timeout.to_f)
         native.set_dispatch_queue_size(config.dispatch_queue_size)
-        native.set_compression(config.compression ? true : false)
-        native.set_reflection(config.reflection ? true : false)
-        native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names)) if config.reflection
-        native
+        native.set_connection_age(config.max_connection_age.to_f, config.max_connection_age_grace.to_f)
       end
 
       # The proc the transport calls for every RPC:

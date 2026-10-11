@@ -36,6 +36,8 @@ RSpec.describe Tonic::Rails::Configuration do
     max_connections: [-1],
     worker_threads: [0],
     drain_timeout: [-1, "10"],
+    max_connection_age: [0, -5, "60"],
+    max_connection_age_grace: [0],
   }.each do |name, values|
     values.each do |value|
       it "rejects #{name} = #{value.inspect}" do

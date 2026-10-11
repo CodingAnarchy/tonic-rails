@@ -66,6 +66,15 @@ module Tonic
       # API schema; keep it off in production.  Default false.
       attr_accessor :reflection
 
+      # Seconds after which a connection is asked to close (HTTP/2 GOAWAY),
+      # so long-lived clients reconnect and rebalance across instances
+      # (e.g. pods added by a scale-up).  nil = never.  Default nil.
+      attr_accessor :max_connection_age
+
+      # Seconds an aged connection gets to finish in-flight calls before it
+      # is closed forcibly.  nil = wait indefinitely.  Default nil.
+      attr_accessor :max_connection_age_grace
+
       # HTTP/2 PING interval and ack timeout, in seconds.  Defaults 15 / 5.
       attr_accessor :keepalive_interval, :keepalive_timeout
 
@@ -105,6 +114,8 @@ module Tonic
         @keepalive_interval = 15
         @keepalive_timeout = 5
         @reload_handlers = false
+        @max_connection_age = nil
+        @max_connection_age_grace = nil
         @health_check = nil
         @health_check_interval = 5
       end
@@ -122,6 +133,7 @@ module Tonic
         non_negative_integer!(:concurrency_limit_per_connection)
         positive_integer!(:worker_threads) unless worker_threads.nil?
         %i[drain_timeout keepalive_interval keepalive_timeout].each { |name| non_negative_number!(name) }
+        %i[max_connection_age max_connection_age_grace].each { |name| positive_number!(name) unless public_send(name).nil? }
 
         raise ArgumentError, "max_message_size must be at most 4 GiB" if max_message_size > 0xFFFF_FFFF
         raise ArgumentError, "tls_cert_path and tls_key_path must be set together" if tls_cert_path.nil? != tls_key_path.nil?
@@ -158,6 +170,14 @@ module Tonic
 
         raise ArgumentError,
               "#{name} must be a non-negative Integer, got #{value.inspect}"
+      end
+
+      def positive_number!(name)
+        value = public_send(name)
+        return if value.is_a?(Numeric) && value.positive?
+
+        raise ArgumentError,
+              "#{name} must be a positive number, got #{value.inspect}"
       end
 
       def non_negative_number!(name)

@@ -43,6 +43,8 @@ struct Options {
     tls_client_ca: Option<String>,
     max_connections: usize,
     concurrency_limit_per_connection: usize,
+    max_connection_age: Option<Duration>,
+    max_connection_age_grace: Option<Duration>,
     worker_threads: Option<usize>,
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
@@ -59,6 +61,8 @@ impl Default for Options {
             tls_client_ca: None,
             max_connections: 64,
             concurrency_limit_per_connection: 32,
+            max_connection_age: None,
+            max_connection_age_grace: None,
             worker_threads: None,
             keepalive_interval: Duration::from_secs(15),
             keepalive_timeout: Duration::from_secs(5),
@@ -92,6 +96,8 @@ pub struct NativeServer {
     stats: Arc<ServerStats>,
     compression: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    /// Connections accepted since start (for stats).
+    accepted_connections: Arc<AtomicUsize>,
     /// Transport log events waiting for Ruby (`next_log_events`).
     log_rx: crossbeam_channel::Receiver<LogEvent>,
 }
@@ -144,6 +150,7 @@ impl NativeServer {
             }),
             compression: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            accepted_connections: Arc::new(AtomicUsize::new(0)),
             log_rx,
         })
     }
@@ -189,6 +196,15 @@ impl NativeServer {
         let mut options = self.options.lock();
         options.keepalive_interval = secs(interval);
         options.keepalive_timeout = secs(timeout);
+    }
+
+    /// Close connections (GOAWAY) after `age` seconds, so long-lived
+    /// clients reconnect and rebalance; force-close `grace` seconds later.
+    /// 0 disables either.
+    pub fn set_connection_age(&self, age: f64, grace: f64) {
+        let mut options = self.options.lock();
+        options.max_connection_age = (age > 0.0).then(|| secs(age));
+        options.max_connection_age_grace = (grace > 0.0).then(|| secs(grace));
     }
 
     pub fn set_dispatch_queue_size(&self, size: usize) {
@@ -336,6 +352,12 @@ impl NativeServer {
             .http2_max_pending_accept_reset_streams(Some(64))
             .initial_stream_window_size(window)
             .initial_connection_window_size(window.saturating_mul(2));
+        if let Some(age) = options.max_connection_age {
+            builder = builder.max_connection_age(age);
+        }
+        if let Some(grace) = options.max_connection_age_grace {
+            builder = builder.max_connection_age_grace(grace);
+        }
         if options.concurrency_limit_per_connection > 0 {
             let limit = options.concurrency_limit_per_connection;
             builder = builder
@@ -357,6 +379,7 @@ impl NativeServer {
             inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
             semaphore: Arc::new(Semaphore::new(permits)),
             active: this.active_connections.clone(),
+            accepted: this.accepted_connections.clone(),
             log: this.stats.log.clone(),
         };
 
@@ -559,6 +582,7 @@ impl NativeServer {
                 "active_connections",
                 this.active_connections.load(Ordering::Relaxed),
             ),
+            ("connections", this.accepted_connections.load(Ordering::Relaxed)),
             ("queued", queued),
         ] {
             hash.aset(ruby.to_symbol(key), value)?;

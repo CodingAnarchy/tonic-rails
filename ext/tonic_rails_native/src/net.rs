@@ -112,6 +112,7 @@ pub struct LimitedIncoming<S> {
     pub inner: S,
     pub semaphore: Arc<Semaphore>,
     pub active: Arc<AtomicUsize>,
+    pub accepted: Arc<AtomicUsize>,
     pub log: LogSink,
 }
 
@@ -133,6 +134,7 @@ where
                 Ok(permit) => {
                     configure_accepted(&stream);
                     self.active.fetch_add(1, Ordering::Relaxed);
+                    self.accepted.fetch_add(1, Ordering::Relaxed);
                     return Poll::Ready(Some(Ok(LimitedConn {
                         inner: stream,
                         _permit: permit,
