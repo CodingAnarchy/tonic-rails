@@ -30,7 +30,7 @@ jobs:
   source-gem:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
@@ -41,7 +41,7 @@ jobs:
           version=$(ruby -Ilib -e 'require "tonic/rails/version"; print Tonic::Rails::VERSION')
           test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
       - run: gem build tonic-rails.gemspec
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gem-ruby
           path: "*.gem"
@@ -61,7 +61,7 @@ jobs:
           - x86_64-linux-gnu
           - x86_64-linux-musl
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
           ruby-version: "3.4"
@@ -82,7 +82,7 @@ jobs:
           # were built; the crate (and tonic 0.14) need edition 2024 / Rust
           # 1.88+, so install current stable for the image's target first.
           pre-script: rustup toolchain install stable --profile minimal --target "$RUST_TARGET" && rustup default stable
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gem-${{ matrix.platform }}
           path: ${{ steps.cross-gem.outputs.gem-path }}
@@ -105,7 +105,7 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: gem-${{ matrix.platform }}
       - name: Install without a Rust toolchain and load the extension
@@ -123,8 +123,8 @@ jobs:
       contents: write # GitHub release
       id-token: write # RubyGems Trusted Publishing
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: gem-*
           path: pkg
@@ -132,7 +132,7 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
-      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Push gems
         run: |
           ls -l pkg
