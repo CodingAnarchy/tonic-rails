@@ -65,11 +65,12 @@ module Tonic
       #   request; an Array of them for client- and bidi-streaming RPCs
       # @param metadata [Hash{String=>String}]
       # @param timeout_ms [Integer, nil] simulated client deadline
+      # @param peer [Tonic::Rails::Peer, nil] simulated client (address, certificates)
       # @return [Google::Protobuf::AbstractMessage, Array] the response, or
       #   an Array of responses for server- and bidi-streaming RPCs
       # @raise [RpcError] when the handler ends the call with a status
-      def call(service_class, rpc_name, request, metadata: {}, timeout_ms: nil)
-        invoke(service_class, rpc_name, request, metadata: metadata, timeout_ms: timeout_ms).response
+      def call(service_class, rpc_name, request, metadata: {}, timeout_ms: nil, peer: nil)
+        invoke(service_class, rpc_name, request, metadata: metadata, timeout_ms: timeout_ms, peer: peer).response
       end
 
       # Like #call, but returns a Result with the response metadata too:
@@ -80,7 +81,7 @@ module Tonic
       #   result.trailers["x-cost-ms"]   # => "3"
       #
       # @return [Result]
-      def invoke(service_class, rpc_name, request, metadata: {}, timeout_ms: nil)
+      def invoke(service_class, rpc_name, request, metadata: {}, timeout_ms: nil, peer: nil)
         spec = service_class.grpc_rpcs.fetch(rpc_name.to_s) do
           raise ArgumentError, "#{service_class} has no RPC #{rpc_name}"
         end
@@ -95,6 +96,7 @@ module Tonic
           reader: reader,
           sender: sender,
           timeout_ms: timeout_ms,
+          peer: peer,
         )
 
         response = if spec[:response_stream]

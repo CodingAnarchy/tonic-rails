@@ -21,10 +21,11 @@ use magnus::{Value, value::Opaque};
 use tokio::sync::mpsc;
 use tonic::Code;
 use tonic::body::Body as TonicBody;
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 
 use crate::body::{ErrorBody, ResponseBody, ServerStats};
 use crate::framing::{MessageReader, append_metadata, parse_grpc_timeout};
-use crate::gvl::{DispatchContext, RequestError, StreamMessage};
+use crate::gvl::{DispatchContext, Peer, RequestError, StreamMessage};
 use crate::log::Level;
 
 /// Messages buffered per direction before backpressure applies.
@@ -166,6 +167,7 @@ impl DispatchInner {
             request_rx,
             request_error: request_error.clone(),
             log: self.stats.log.clone(),
+            peer: peer_of(&req),
         });
 
         match self.request_tx.try_send(ctx) {
@@ -238,6 +240,26 @@ impl DispatchInner {
             );
         }
         response
+    }
+}
+
+/// The client's address and, if it presented one over TLS, its
+/// certificate chain.  tonic records both on the request.
+fn peer_of<B>(req: &Request<B>) -> Peer {
+    let address = req
+        .extensions()
+        .get::<TcpConnectInfo>()
+        .and_then(TcpConnectInfo::remote_addr)
+        .map(|addr| addr.to_string());
+    let certificates = req
+        .extensions()
+        .get::<TlsConnectInfo<TcpConnectInfo>>()
+        .and_then(TlsConnectInfo::peer_certs)
+        .map(|chain| chain.iter().map(|der| der.to_vec()).collect())
+        .unwrap_or_default();
+    Peer {
+        address,
+        certificates,
     }
 }
 
