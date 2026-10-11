@@ -7,8 +7,14 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-11
+
 ### Added
 
+- Generators: `rails g tonic_rails:install` (initializer, proto and
+  generated-code directories, Puma plugin) and `rails g tonic_rails:service
+  Item GetItem ListItems:server` (proto, handler with a stub per RPC,
+  registration, and an RSpec or Minitest test).
 - Controller-style callbacks for handlers: `before_rpc`, `after_rpc` and
   `around_rpc` with `only:` / `except:`, plus `current_rpc` and `request`
   accessors.
@@ -17,20 +23,21 @@ minor versions may contain breaking changes.
 - `peer` in handlers: the client's address and, with mutual TLS, its
   certificate (`peer.certificate`, an `OpenSSL::X509::Certificate`).
   `Testing.call`/`invoke` accept `peer:`.
-- Generators: `rails g tonic_rails:install` (initializer, proto and
-  generated-code directories, Puma plugin) and `rails g tonic_rails:service
-  Item GetItem ListItems:server` (proto, handler with a stub per RPC,
-  registration, and an RSpec or Minitest test).
-- `tonic_rails:compile_protos` checks for protoc 22 or newer and explains the
-  problem, instead of generating code google-protobuf 4 can't load.
-- Test helpers: the `raise_grpc_error(code).with_message(...)` RSpec matcher
-  (`require "tonic/rails/testing/rspec"`) and `assert_grpc_error` for Minitest
-  (`Tonic::Rails::Testing::Assertions`). Both accept `Tonic::Rails::RpcError`
-  and the grpc gem's `GRPC::BadStatus`.
 - App-controlled health: `config.health_check` (polled every
   `health_check_interval` seconds inside the Rails executor) and
   `Tonic::Rails.server.serving!` / `not_serving!` for the whole server or
   individual services, so readiness probes reflect real dependency health.
+- Test helpers: the `raise_grpc_error(code).with_message(...)` RSpec matcher
+  (`require "tonic/rails/testing/rspec"`) and `assert_grpc_error` for Minitest
+  (`Tonic::Rails::Testing::Assertions`). Both accept `Tonic::Rails::RpcError`
+  and the grpc gem's `GRPC::BadStatus`.
+
+### Changed
+
+- `tonic_rails:compile_protos` requires protoc 22 or newer and says so,
+  instead of generating code google-protobuf 4 can't load (older protoc,
+  such as Ubuntu's 3.21 package, emits a Ruby DSL that google-protobuf 4
+  removed).
 
 ## [0.2.0] - 2026-10-11
 
@@ -109,6 +116,7 @@ First public release.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
   macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
-[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodingAnarchy/tonic-rails/releases/tag/v0.1.0
