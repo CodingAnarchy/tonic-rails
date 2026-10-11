@@ -7,35 +7,41 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-11
+
 ### Added
 
+- Instrumentation: every RPC publishes a `process_rpc.tonic_rails`
+  ActiveSupport::Notifications event (path, service, rpc, metadata, status,
+  code) for APM agents, OpenTelemetry and custom subscribers. With no
+  subscribers it costs nothing measurable.
 - Response metadata: handlers set `response_metadata` (headers) and
   `trailing_metadata` (trailers, sent on success or failure).
 - Rich errors: `RpcError.new(..., metadata:, details:)` sends trailing
   metadata and a `google.rpc.Status` with packed details in
-  `grpc-status-details-bin`.
-- Windows: precompiled `x64-mingw-ucrt` gems and Windows CI.
-- Puma plugin (`plugin :tonic_rails` in `config/puma.rb`) runs the gRPC
-  server as a child process of Puma in single and cluster mode, with
-  graceful stop/restart and shutdown if either side dies.
-- `Tonic::Rails::Testing.invoke` returns the response together with response
+  `grpc-status-details-bin`, which official gRPC clients decode.
+- Puma plugin: `plugin :tonic_rails` in `config/puma.rb` runs the gRPC
+  server as a child process of Puma, in single and cluster mode, with
+  graceful stop and restart, and a shutdown if either side dies.
+- Windows: precompiled `x64-mingw-ucrt` gems, tested in CI.
+- `Tonic::Rails::Testing.invoke` returns the response together with its
   headers and trailers.
-- `process_rpc.tonic_rails` ActiveSupport::Notifications event for every RPC,
-  with path, service, rpc, metadata, status and code (for APM agents,
-  OpenTelemetry and custom subscribers).
 
 ### Changed
 
 - Response headers are sent with the handler's first output instead of
   before the handler runs, so handlers can set them. The client deadline
   applies while waiting.
-- `log_requests` now logs one line per RPC through the configured (Rails)
+- `log_requests` logs one line per RPC through the configured (Rails)
   logger instead of stderr.
 - Transport events from the native extension (rejected calls, expired
-  deadlines, refused connections, faults) now go through the configured
-  (Rails) logger, with severities, instead of stderr. Handler outcomes such
-  as a `NOT_FOUND` raised by a handler are no longer logged by the transport
-  at all; use `log_requests` or the instrumentation event for those.
+  deadlines, refused connections, faults) go through the configured (Rails)
+  logger with severities instead of stderr. Handler outcomes, such as a
+  `NOT_FOUND` raised by a handler, are no longer logged by the transport;
+  use `log_requests` or the instrumentation event for those.
+- `Server#stop` signals shutdown through a queue instead of a pipe, so
+  signal handling works the same on every platform.
+- Dependencies: magnus 0.9, google-protobuf 4.36.
 
 ## [0.1.0] - 2026-10-10
 
@@ -78,5 +84,6 @@ First public release.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
   macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
-[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CodingAnarchy/tonic-rails/releases/tag/v0.1.0
