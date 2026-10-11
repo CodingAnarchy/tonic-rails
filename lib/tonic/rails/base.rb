@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "active_support/callbacks"
+require "active_support/rescuable"
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/hash/keys"
 require "active_support/core_ext/string/inflections"
@@ -25,8 +27,17 @@ module Tonic
     # is set (fastest), or string-keyed Hashes by default.  Handlers may
     # return either a protobuf message or a Hash; streaming handlers
     # return any Enumerable of them.
+    #
+    # Like controllers, handlers get callbacks and exception mapping:
+    #
+    #   before_rpc :authenticate, except: :Health
+    #   rescue_from ActiveRecord::RecordNotFound, code: :not_found
+    #   rescue_from Pundit::NotAuthorizedError, with: :forbidden
     module Base
       def self.included(base)
+        base.include(ActiveSupport::Callbacks)
+        base.include(ActiveSupport::Rescuable)
+        base.define_callbacks(:rpc)
         base.extend(ClassMethods)
         base.class_attribute :grpc_service_name, instance_writer: false
         base.class_attribute :grpc_rpcs, instance_writer: false, default: {}
@@ -34,6 +45,20 @@ module Tonic
       end
 
       module ClassMethods
+        private
+
+        def add_rpc_callback(kind, methods, only, except, block)
+          only &&= rpc_name_matcher(only)
+          except &&= rpc_name_matcher(except)
+          condition = lambda do |handler|
+            name = handler.current_rpc.underscore
+            (only.nil? || only.include?(name)) && (except.nil? || !except.include?(name))
+          end
+          (methods + [block].compact).each { |callback| set_callback(:rpc, kind, callback, if: condition) }
+        end
+
+        public
+
         # @param name [String] fully-qualified service name, e.g. "shop.ProductService"
         def service(name)
           self.grpc_service_name = name.to_s
@@ -97,6 +122,51 @@ module Tonic
           end
         end
 
+        # Run a method or block before each RPC.  Raising (e.g. an RpcError)
+        # stops the call.  The decoded `request` is available.
+        # @param only [Symbol, String, Array] RPC names to apply to
+        # @param except [Symbol, String, Array] RPC names to skip
+        def before_rpc(*methods, only: nil, except: nil, &block)
+          add_rpc_callback(:before, methods, only, except, block)
+        end
+
+        # Run after each RPC that completes without raising (for streaming
+        # responses, after the last message is sent).
+        def after_rpc(*methods, only: nil, except: nil, &block)
+          add_rpc_callback(:after, methods, only, except, block)
+        end
+
+        # Wrap each RPC; the method or block must yield to run it.
+        def around_rpc(*methods, only: nil, except: nil, &block)
+          add_rpc_callback(:around, methods, only, except, block)
+        end
+
+        # Map exceptions raised during an RPC (including callbacks) to a
+        # gRPC status.  Same as ActiveSupport::Rescuable, plus a `code:`
+        # shorthand:
+        #
+        #   rescue_from ActiveRecord::RecordNotFound, code: :not_found
+        #   rescue_from Stale, code: :aborted, message: "please retry"
+        #   rescue_from Denied, with: :deny            # def deny(e) = raise RpcError...
+        #
+        # With `code:`, the client receives `message` (a String, or a Proc
+        # given the exception), defaulting to the exception's own message.
+        # Handlers given via `with:` or a block must raise an RpcError.
+        def rescue_from(*klasses, with: nil, code: nil, message: nil, &)
+          return super(*klasses, with: with, &) unless code
+
+          RpcError.normalize_code(code) # fail at definition time on typos
+          super(*klasses) do |exception|
+            text = message.respond_to?(:call) ? message.call(exception) : (message || exception.message)
+            raise RpcError.new(text, code: code)
+          end
+        end
+
+        # @api private
+        def rpc_name_matcher(names)
+          Array(names).map { |name| name.to_s.underscore }
+        end
+
         # @api private  Called by Server#register.
         def register_on(router)
           raise NotConfiguredError, "#{self} has no service name; call `service` or `rpc_service`" unless grpc_service_name
@@ -105,6 +175,14 @@ module Tonic
           router.add(self)
         end
       end
+
+      # The RPC being handled, as named in the .proto (e.g. "GetItem").
+      # @return [String]
+      attr_reader :current_rpc
+
+      # The decoded request: a message (or Hash), or for client-streaming
+      # RPCs an Enumerator of them.  Also passed to the handler method.
+      attr_reader :request
 
       # gRPC request metadata (lower-case header names).  Binary (`-bin`)
       # values are base64-encoded, as sent on the wire.
@@ -157,23 +235,39 @@ module Tonic
         raise RpcError.new("method not implemented", code: :unimplemented) unless spec
         raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented) unless respond_to?(spec[:handler])
 
+        @current_rpc = rpc_name.to_s
         @grpc_metadata = metadata
         @grpc_sender = sender
         @grpc_headers_sent = false
         @grpc_deadline_at = timeout_ms && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + (timeout_ms / 1000.0))
 
-        result = public_send(spec[:handler], build_request(reader, spec))
-        respond(result, spec, sender)
+        @request = build_request(reader, spec)
+        response = nil
+        run_callbacks(:rpc) { response = respond(public_send(spec[:handler], @request), spec, sender) }
+        response
       rescue RpcError
         raise
       rescue StandardError => e
-        Tonic::Rails.log_exception(e, "#{self.class}##{rpc_name}")
-        raise RpcError.new("internal error", code: :internal)
+        rescue_exception(e)
       ensure
         attach_trailing_metadata
       end
 
       private
+
+      # rescue_from handlers must raise; anything they don't handle (or a
+      # handler that returns normally) becomes a logged INTERNAL error.
+      def rescue_exception(exception)
+        if rescue_with_handler(exception)
+          Tonic::Rails.log_exception(
+            TypeError.new("rescue_from handler for #{exception.class} returned instead of raising an RpcError"),
+            "#{self.class}##{current_rpc}",
+          )
+        else
+          Tonic::Rails.log_exception(exception, "#{self.class}##{current_rpc}")
+        end
+        raise RpcError.new("internal error", code: :internal)
+      end
 
       def build_request(reader, spec)
         unless spec[:request_stream]

@@ -7,6 +7,14 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Controller-style callbacks for handlers: `before_rpc`, `after_rpc` and
+  `around_rpc` with `only:` / `except:`, plus `current_rpc` and `request`
+  accessors.
+- `rescue_from` (ActiveSupport::Rescuable) with a `code:` shorthand that maps
+  an exception class to a gRPC status.
+
 ## [0.2.0] - 2026-10-11
 
 ### Added
