@@ -365,6 +365,30 @@ result.headers["x-cache"]    # => "hit"
 result.trailers["x-cost-ms"] # => "3"
 ```
 
+Matchers for gRPC statuses work with `Testing.call` and with the official
+`grpc` client's errors:
+
+```ruby
+# spec/rails_helper.rb
+require "tonic/rails/testing/rspec"
+
+expect { Tonic::Rails::Testing.call(ItemService, :GetItem, { id: 0 }) }
+  .to raise_grpc_error(:not_found).with_message(/0/)
+```
+
+```ruby
+# Minitest
+require "tonic/rails/testing/minitest"
+
+class ItemServiceTest < ActiveSupport::TestCase
+  include Tonic::Rails::Testing::Assertions
+
+  test "missing items" do
+    assert_grpc_error(:not_found) { Tonic::Rails::Testing.call(ItemService, :GetItem, { id: 0 }) }
+  end
+end
+```
+
 ## Configuration
 
 Set options in `config/application.rb` or an environment file:

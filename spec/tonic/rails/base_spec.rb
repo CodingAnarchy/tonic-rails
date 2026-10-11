@@ -137,12 +137,12 @@ RSpec.describe Tonic::Rails::Base do
       svc = hash_service do
         def unary(_request) = "not a message"
       end
-      expect { testing.call(svc, :Unary, {}) }.to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code).to eq(13) }
+      expect { testing.call(svc, :Unary, {}) }.to raise_grpc_error(13)
     end
 
     it "returns UNIMPLEMENTED when the handler method is missing" do
       expect { testing.call(hash_service, :Unary, {}) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:unimplemented) }
+        .to raise_grpc_error(:unimplemented)
     end
   end
 
@@ -155,7 +155,7 @@ RSpec.describe Tonic::Rails::Base do
 
     it "maps undecodable request bytes to INVALID_ARGUMENT" do
       expect { EchoHandler.new.call_rpc("Unary", metadata: {}, reader: reader("\xFF\xFF\xFF".b)) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:invalid_argument) }
+        .to raise_grpc_error(:invalid_argument)
     end
 
     it "requires a request message for unary RPCs" do
@@ -173,12 +173,12 @@ RSpec.describe Tonic::Rails::Base do
       def closed.push(_bytes) = raise(IOError, "closed")
       bytes = request_class.encode(request_class.new(count: 3))
       expect { EchoHandler.new.call_rpc("ServerStream", metadata: {}, reader: reader(bytes), sender: closed) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:cancelled) }
+        .to raise_grpc_error(:cancelled)
     end
 
     it "returns UNIMPLEMENTED for undeclared RPCs" do
       expect { EchoHandler.new.call_rpc("Nope", metadata: {}, reader: reader) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:unimplemented) }
+        .to raise_grpc_error(:unimplemented)
     end
   end
 
@@ -207,7 +207,7 @@ RSpec.describe Tonic::Rails::Base do
         def server_stream(_request) = 42
       end
       expect { testing.call(svc, :ServerStream, {}) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:internal) }
+        .to raise_grpc_error(:internal)
     end
 
     it "keeps messages already sent when the handler fails midway" do
@@ -289,7 +289,7 @@ RSpec.describe Tonic::Rails::Base do
         end
       end
       expect { testing.call(svc, :Unary, {}) }
-        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:internal) }
+        .to raise_grpc_error(:internal)
     end
   end
 

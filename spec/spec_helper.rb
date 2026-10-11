@@ -3,6 +3,7 @@
 require "logger"
 require "tonic-rails"
 require "tonic/rails/testing"
+require "tonic/rails/testing/rspec"
 require_relative "fixtures/lib/echo_handler"
 
 RSpec.configure do |config|
