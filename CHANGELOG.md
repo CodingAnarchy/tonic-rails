@@ -7,6 +7,24 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Client: opt-in retries, per client or per call (`retries: true` or a
+  Hash of `max_attempts`, `codes`, `initial_backoff`, `max_backoff` and
+  `multiplier`), following gRPC's retry design. Only calls the server
+  never started on are retried: a failed connection, or a status sent
+  without response headers. Waits are random with exponential caps, stop
+  before the deadline and follow `grpc-retry-pushback-ms`. Each retry is
+  logged, and `request_rpc.tonic_rails` reports `:attempts`. Closes #39.
+
+### Changed
+
+- The server answers calls it turns away before a handler runs (shutting
+  down, dispatch queue full, malformed requests) with a Trailers-Only
+  response: the status in the headers and no body. Clients that follow
+  gRPC's retry rules can tell those calls never started and retry them
+  safely.
+
 ## [0.6.0] - 2026-10-11
 
 ### Added

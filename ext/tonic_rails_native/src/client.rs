@@ -124,6 +124,9 @@ struct Outcome {
     /// The failure happened here (a broken connection, a timeout), not
     /// on the server.
     local: bool,
+    /// Response headers arrived, so the server has started on the call
+    /// and retrying it could repeat its work.
+    committed: bool,
     details: Bytes,
     response: Option<Bytes>,
     headers: HeaderMap,
@@ -136,6 +139,7 @@ impl Outcome {
             code: Code::Ok,
             message: String::new(),
             local: false,
+            committed: true,
             details: Bytes::new(),
             response,
             headers,
@@ -146,11 +150,13 @@ impl Outcome {
     fn error(code: Code, message: impl Into<String>) -> Self {
         Self {
             local: true,
-            ..Self::status(Status::new(code, message), HeaderMap::new())
+            ..Self::status(Status::new(code, message), None)
         }
     }
 
-    fn status(status: Status, headers: HeaderMap) -> Self {
+    /// `headers` are the response headers, if they arrived before the
+    /// status.
+    fn status(status: Status, headers: Option<HeaderMap>) -> Self {
         // A status with a source is a local transport failure, not one the
         // server sent.  The source holds the cause (e.g. "Connection
         // refused"), and tonic reports broken connections as UNKNOWN or
@@ -170,24 +176,26 @@ impl Outcome {
             code,
             message,
             local,
+            committed: headers.is_some(),
             details: Bytes::copy_from_slice(status.details()),
             response: None,
-            headers,
+            headers: headers.unwrap_or_default(),
             trailers: status.metadata().clone().into_headers(),
         }
     }
 
-    /// `[code, message, response, headers, trailers, details]`, with
-    /// metadata as `[name, value]` pairs in wire form (`-bin` values
+    /// `[code, message, response, headers, trailers, details, committed]`,
+    /// with metadata as `[name, value]` pairs in wire form (`-bin` values
     /// base64-encoded).
     fn into_ruby(self, ruby: &Ruby) -> Result<RArray, Error> {
-        let result = ruby.ary_new_capa(6);
+        let result = ruby.ary_new_capa(7);
         result.push(self.code as u32)?;
         result.push(ruby.str_new(&self.message))?;
         result.push(self.response.map(|bytes| ruby.str_from_slice(&bytes)))?;
         result.push(metadata_pairs(ruby, &self.headers)?)?;
         result.push(metadata_pairs(ruby, &self.trailers)?)?;
         result.push((!self.details.is_empty()).then(|| ruby.str_from_slice(&self.details)))?;
+        result.push(self.committed)?;
         Ok(result)
     }
 }
@@ -252,8 +260,10 @@ async fn start(args: CallArgs) -> Result<(HeaderMap, Streaming<Bytes>), Box<Outc
             let (headers, stream, _) = response.into_parts();
             Ok((headers.into_headers(), stream))
         }
-        // Includes trailers-only responses, whose status comes in the headers.
-        Err(status) => Err(Box::new(Outcome::status(status, HeaderMap::new()))),
+        // Includes trailers-only responses, whose status comes in the
+        // headers.  They don't commit the call: gRPC retries treat a server
+        // that answers with only a status as not having started on it.
+        Err(status) => Err(Box::new(Outcome::status(status, None))),
     }
 }
 
@@ -261,7 +271,7 @@ async fn start(args: CallArgs) -> Result<(HeaderMap, Streaming<Bytes>), Box<Outc
 async fn finish(stream: &mut Streaming<Bytes>, headers: &HeaderMap) -> Result<HeaderMap, Box<Outcome>> {
     match stream.trailers().await {
         Ok(trailers) => Ok(trailers.map(MetadataMap::into_headers).unwrap_or_default()),
-        Err(status) => Err(Box::new(Outcome::status(status, headers.clone()))),
+        Err(status) => Err(Box::new(Outcome::status(status, Some(headers.clone())))),
     }
 }
 
@@ -272,7 +282,7 @@ async fn unary(args: CallArgs) -> Outcome {
     };
     let message = match stream.message().await {
         Ok(message) => message,
-        Err(status) => return Outcome::status(status, headers),
+        Err(status) => return Outcome::status(status, Some(headers)),
     };
     let trailers = match finish(&mut stream, &headers).await {
         Ok(trailers) => trailers,
@@ -300,7 +310,7 @@ async fn server_stream(args: CallArgs, tx: mpsc::Sender<Bytes>) -> Outcome {
                 }
             }
             Ok(None) => break,
-            Err(status) => return Outcome::status(status, headers),
+            Err(status) => return Outcome::status(status, Some(headers)),
         }
     }
     match finish(&mut stream, &headers).await {

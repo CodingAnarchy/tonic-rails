@@ -14,6 +14,9 @@ module Tonic
     #   item = items.get_item({ id: 1 }, deadline: 0.5, metadata: { "x-request-id" => request_id })
     #   items.list_items(category: "books").each { |item| ... }
     #
+    # Retries are opt-in: `retries: true` (or a Hash; see RetryPolicy) on
+    # the client or a call retries calls the server never started on.
+    #
     # Stubs are built from the protobuf descriptors that
     # `tonic_rails:compile_protos` (protoc --ruby_out) generates; no
     # `_services_pb.rb` is needed.  A failed call raises
@@ -29,11 +32,19 @@ module Tonic
 
       DEFAULT_MAX_MESSAGE_SIZE = 4 * 1024 * 1024
 
+      # Trailer a server sends to ask for a retry after so many
+      # milliseconds, or (with a negative value) for none.
+      RETRY_PUSHBACK = "grpc-retry-pushback-ms"
+      private_constant :RETRY_PUSHBACK
+
       # @return [String] "host:port"
       attr_reader :address
 
       # @return [Numeric, nil] default deadline in seconds
       attr_reader :deadline
+
+      # @return [RetryPolicy, nil] how calls are retried, unless they say otherwise
+      attr_reader :retries
 
       # @param address [String] "host:port"
       # @param tls [Boolean] false for plaintext, which must be explicit
@@ -48,9 +59,13 @@ module Tonic
       # @param metadata [Hash] sent with every call (see Tonic::Rails::Metadata)
       # @param max_message_size [Integer] largest message sent or received, in bytes
       # @param connect_timeout [Numeric] seconds to wait for a connection
+      # @param retries [RetryPolicy, Hash, Boolean] retry calls the server
+      #   never started on (see RetryPolicy); off by default
+      # @param logger [Logger, nil] where retries are logged; defaults to
+      #   Tonic::Rails.configuration.logger
       def initialize(address, tls: true, tls_ca_path: nil, tls_cert_path: nil, tls_key_path: nil,
                      tls_server_name: nil, deadline: nil, metadata: {}, max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-                     connect_timeout: 5)
+                     connect_timeout: 5, retries: false, logger: nil)
         Tonic::Rails.native_extension!
         validate_address!(address)
         validate_tls!(tls, tls_cert_path, tls_key_path)
@@ -62,6 +77,8 @@ module Tonic
 
         @address = address
         @deadline = deadline
+        @retries = RetryPolicy.from(retries)
+        @logger = logger
         @metadata = Metadata.encode(metadata)
         @stubs = {}
         tls_options = [read_pem(tls_ca_path, "CA"), read_pem(tls_cert_path, "certificate"),
@@ -106,14 +123,16 @@ module Tonic
 
       # Make a unary call.  Stubs call this; use them instead.
       # @api private
-      def unary(path, input, output, request, deadline: nil, metadata: {}, return_call: false)
-        message = request_message(path, input, request)
+      def unary(path, input, output, request, deadline: nil, metadata: {}, return_call: false, retries: nil)
+        bytes = input.encode(request_message(path, input, request))
         metadata = call_metadata(metadata)
-        timeout_ms = remaining_ms(deadline_at(deadline))
+        deadline_at = deadline_at(deadline)
+        policy = retry_policy(retries)
 
-        Instrumentation.instrument_request(path, address, metadata) do
-          code, error_message, response, headers, trailers, details =
-            @native.unary(path, input.encode(message), metadata, timeout_ms)
+        Instrumentation.instrument_request(path, address, metadata) do |payload|
+          code, error_message, response, headers, trailers, details = with_retries(path, policy, deadline_at, payload) do
+            @native.unary(path, bytes, metadata, remaining_ms(deadline_at))
+          end
           headers = decode_metadata(headers)
           trailers = decode_metadata(trailers)
           check_status!(code, error_message, trailers, details)
@@ -125,28 +144,25 @@ module Tonic
 
       # Start a server-streaming call.  Stubs call this; use them instead.
       # @api private
-      def server_streaming(path, input, output, request, deadline: nil, metadata: {})
-        message = request_message(path, input, request)
+      def server_streaming(path, input, output, request, deadline: nil, metadata: {}, retries: nil)
+        bytes = input.encode(request_message(path, input, request))
         metadata = call_metadata(metadata)
         # Fixed now, so the stream keeps the deadline of the RPC this
         # thread is handling even if it's read later.
         deadline_at = deadline_at(deadline)
+        policy = retry_policy(retries)
 
         ServerStream.new(path) do |stream, block|
-          timeout_ms = remaining_ms(deadline_at)
-          Instrumentation.instrument_request(path, address, metadata) do
-            native = @native.server_streaming(path, input.encode(message), metadata, timeout_ms)
-            begin
-              while (bytes = native.next)
-                block.call(decode_response(output, bytes, path))
-              end
-              code, error_message, _, headers, trailers, details = native.result
-              trailers = decode_metadata(trailers)
-              stream.finish(decode_metadata(headers), trailers)
-              check_status!(code, error_message, trailers, details)
-            ensure
-              native.close
+          Instrumentation.instrument_request(path, address, metadata) do |payload|
+            # A message arrives only after the response headers, which
+            # commit the call, so an attempt that yielded anything is never
+            # retried.
+            code, error_message, _, headers, trailers, details = with_retries(path, policy, deadline_at, payload) do
+              read_stream(@native.server_streaming(path, bytes, metadata, remaining_ms(deadline_at)), output, path, &block)
             end
+            trailers = decode_metadata(trailers)
+            stream.finish(decode_metadata(headers), trailers)
+            check_status!(code, error_message, trailers, details)
           end
         end
       end
@@ -222,6 +238,75 @@ module Tonic
         (remaining * 1000).ceil
       end
 
+      def retry_policy(retries)
+        retries.nil? ? @retries : RetryPolicy.from(retries)
+      end
+
+      # Yield each message of a native stream, then return its result.
+      def read_stream(native, output, path)
+        while (bytes = native.next)
+          yield decode_response(output, bytes, path)
+        end
+        native.result
+      ensure
+        native.close
+      end
+
+      # Run attempts of a call (the block returns a native result) until one
+      # succeeds or shouldn't be retried; return its result.
+      def with_retries(path, policy, deadline_at, payload)
+        attempt = 1
+        loop do
+          payload[:attempts] = attempt if payload
+          result = yield
+          delay = retry_delay(policy, attempt, result, deadline_at)
+          if delay.nil?
+            log_gave_up(path, attempt, result) if attempt > 1 && !result[0].zero?
+            return result
+          end
+
+          log_retry(path, attempt, policy.max_attempts, result, delay)
+          sleep(delay)
+          attempt += 1
+        end
+      end
+
+      # Seconds to wait before retrying, or nil not to retry.  The server
+      # can ask for a delay, or for no retry, with grpc-retry-pushback-ms.
+      def retry_delay(policy, attempt, result, deadline_at)
+        code, _, _, _, trailers, _, committed = result
+        return if policy.nil? || code.zero? || committed || attempt >= policy.max_attempts || !policy.retry?(code)
+
+        pushback = trailers.assoc(RETRY_PUSHBACK)&.last
+        delay = if pushback.nil? then policy.backoff(attempt)
+        elsif pushback.match?(/\A\d+\z/) then pushback.to_i / 1000.0
+        end
+        return if delay.nil?
+        return if deadline_at && Process.clock_gettime(Process::CLOCK_MONOTONIC) + delay >= deadline_at
+
+        delay
+      end
+
+      def logger
+        @logger || Tonic::Rails.configuration.logger
+      end
+
+      def log_retry(path, attempt, max_attempts, result, delay)
+        logger&.warn(format("tonic-rails: %<path>s failed with %<status>s (attempt %<attempt>d of %<max>d); " \
+                            "retrying in %<ms>dms", path: path, status: status_text(result), attempt: attempt,
+                                                    max: max_attempts, ms: (delay * 1000).round))
+      end
+
+      def log_gave_up(path, attempts, result)
+        logger&.warn("tonic-rails: #{path} failed with #{status_text(result)} after #{attempts} attempts")
+      end
+
+      def status_text(result)
+        code, message = result
+        text = RpcError::CODE_NAMES.fetch(code, code).to_s.upcase
+        message.empty? ? text : "#{text}: #{message}"
+      end
+
       def check_status!(code, message, trailers, details)
         return if code.zero?
 
@@ -282,16 +367,18 @@ module Tonic
             input = method.input_type.msgclass
             output = method.output_type.msgclass
             if method.server_streaming
-              define_method(name) do |request = nil, deadline: nil, metadata: {}, **fields|
+              define_method(name) do |request = nil, deadline: nil, metadata: {}, retries: nil, **fields|
                 request = rpc_request(name, request, fields)
-                @client.server_streaming(path, input, output, request, deadline: deadline, metadata: metadata)
+                @client.server_streaming(path, input, output, request, deadline: deadline, metadata: metadata,
+                                                                       retries: retries)
               end
             else
               # `get_item(id: 1)` works as well as `get_item({ id: 1 })`.
-              define_method(name) do |request = nil, deadline: nil, metadata: {}, return_call: false, **fields|
+              define_method(name) do |request = nil, deadline: nil, metadata: {}, return_call: false, retries: nil,
+                                      **fields|
                 request = rpc_request(name, request, fields)
                 @client.unary(path, input, output, request, deadline: deadline, metadata: metadata,
-                                                            return_call: return_call)
+                                                            return_call: return_call, retries: retries)
               end
             end
           end
@@ -369,3 +456,5 @@ module Tonic
     end
   end
 end
+
+require "tonic/rails/client/retry_policy"

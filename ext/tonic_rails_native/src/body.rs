@@ -12,7 +12,6 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use http::HeaderMap;
 use http_body::{Body, Frame};
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
@@ -68,35 +67,6 @@ impl ServerStats {
             };
             self.log.log(Level::for_code(code), &line);
         }
-    }
-}
-
-/// Trailers-only error response for requests rejected before dispatch.
-pub struct ErrorBody {
-    trailers: Option<HeaderMap>,
-}
-
-impl ErrorBody {
-    pub fn new(code: Code, message: &str) -> Self {
-        Self {
-            trailers: Some(status_trailers(code as u32, message)),
-        }
-    }
-}
-
-impl Body for ErrorBody {
-    type Data = Bytes;
-    type Error = Status;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
-        Poll::Ready(self.trailers.take().map(|t| Ok(Frame::trailers(t))))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.trailers.is_none()
     }
 }
 
@@ -232,6 +202,7 @@ impl Drop for ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderMap;
     use std::task::Waker;
 
     type PolledFrame = Poll<Option<Result<Frame<Bytes>, Status>>>;
@@ -260,16 +231,6 @@ mod tests {
             Poll::Ready(Some(Ok(frame))) => frame.into_trailers().expect("trailers frame"),
             _ => panic!("expected trailers"),
         }
-    }
-
-    #[test]
-    fn error_body_yields_trailers_once() {
-        let mut body = ErrorBody::new(Code::NotFound, "missing");
-        let t = trailers(poll(&mut body));
-        assert_eq!(t["grpc-status"], "5");
-        assert_eq!(t["grpc-message"], "missing");
-        assert!(matches!(poll(&mut body), Poll::Ready(None)));
-        assert!(body.is_end_stream());
     }
 
     #[test]

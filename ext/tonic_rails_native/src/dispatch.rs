@@ -23,8 +23,8 @@ use tonic::Code;
 use tonic::body::Body as TonicBody;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 
-use crate::body::{ErrorBody, ResponseBody, ServerStats};
-use crate::framing::{MessageReader, append_metadata, parse_grpc_timeout};
+use crate::body::{ResponseBody, ServerStats};
+use crate::framing::{MessageReader, append_metadata, parse_grpc_timeout, status_trailers};
 use crate::gvl::{DispatchContext, Peer, RequestError, StreamMessage};
 use crate::log::Level;
 
@@ -84,9 +84,16 @@ fn grpc_response(body: TonicBody, compressed: bool) -> Response<TonicBody> {
 }
 
 impl DispatchInner {
+    /// A Trailers-Only response (the status in the headers, no body) for a
+    /// call rejected before it reached a handler.  Clients may retry those
+    /// safely, and gRPC retries count on the form to tell them apart.
     fn reject(&self, path: &str, start: Instant, code: Code, message: &str) -> Response<TonicBody> {
         self.stats.record(path, code as u32, message, start, true);
-        grpc_response(TonicBody::new(ErrorBody::new(code, message)), false)
+        let mut response = grpc_response(TonicBody::empty(), false);
+        response
+            .headers_mut()
+            .extend(status_trailers(code as u32, message));
+        response
     }
 
     async fn handle(&self, req: Request<axum::body::Body>) -> Response<TonicBody> {
