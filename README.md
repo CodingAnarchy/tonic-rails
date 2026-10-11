@@ -507,6 +507,68 @@ If a handler lets the error propagate, its caller receives the same
 status, message, details and trailing metadata. Rescue it and raise your
 own error when those are internal.
 
+### Retries
+
+Retries are off unless you turn them on, for a client or a single call:
+
+```ruby
+ITEMS = Tonic::Rails::Client.new("items.internal:50051", deadline: 2, retries: true)
+
+items.get_item({ id: 1 }, retries: false)                    # not this call
+items.get_item({ id: 1 }, retries: { max_attempts: 5 })      # or differently
+```
+
+`retries: true` tries a call up to 3 times when it fails with
+`UNAVAILABLE`. A Hash changes any of these:
+
+| Field | Default | |
+|---|---|---|
+| `max_attempts` | 3 | attempts in all, from 2 to 5 |
+| `codes` | `[:unavailable]` | status codes worth retrying |
+| `initial_backoff` | 0.1 | seconds; the cap on the first wait |
+| `max_backoff` | 1 | seconds; the cap on any wait |
+| `multiplier` | 2 | how much the cap grows per attempt |
+
+The rules come from gRPC's own retry design, so they avoid the usual
+mistakes of a hand-written retry loop:
+
+- **A call is retried only if the server never started on it.** That
+  means the connection failed (refused, reset, a pod restarting), or the
+  server answered with only a status and no response headers. Servers do
+  that when they turn a call away before any handler runs: a
+  tonic-rails server that's shutting down or whose queue is full, or a
+  proxy with no healthy backend. Once response headers arrive, the call
+  is never repeated, even if it then fails with a code you listed.
+- **Waits are random.** Each one is anywhere from zero up to a cap that
+  starts at `initial_backoff` and grows by `multiplier` per attempt, up to
+  `max_backoff`. Clients that failed together don't retry together.
+- **The deadline covers every attempt.** If the next attempt couldn't
+  start before the deadline, the client stops and raises the last
+  failure.
+- **The server can steer.** A `grpc-retry-pushback-ms` trailer sets the
+  wait, and a negative one stops retries.
+- A server stream is retried only before its first message.
+
+Which calls are safe to retry? With the default `[:unavailable]`, nearly
+all of them. By gRPC convention, `UNAVAILABLE` means the call can be tried
+again, and from a tonic-rails server it's retried only when no handler
+ran. For a tonic-rails server, `:resource_exhausted` is worth adding too:
+a full dispatch queue returns it before any handler runs.
+
+Take more care with codes a handler might raise after doing some work,
+like `:aborted`. A tonic-rails server sends headers before it runs a
+handler, so those calls still won't be retried. Other servers may answer
+with only a status after a handler ran, so list those codes only for
+methods that are safe to run twice.
+
+Each retry is logged as a warning, through the client's `logger:` (by
+default `Tonic::Rails.configuration.logger`, which is the Rails logger in
+a Rails app):
+
+```
+tonic-rails: /demo.v1.ItemService/GetItem failed with UNAVAILABLE: ... (attempt 1 of 3); retrying in 64ms
+```
+
 ### Metadata
 
 `metadata:` on a call, and on the client for every call, works like
@@ -549,6 +611,8 @@ the client is created, not on the first call.
 | `metadata` | `{}` | sent with every call |
 | `max_message_size` | 4 MiB | largest message sent or received |
 | `connect_timeout` | 5 | seconds to wait for a connection |
+| `retries` | `false` | retry calls the server never started on; see [Retries](#retries) |
+| `logger` | `Tonic::Rails.configuration.logger` | where retries are logged |
 
 ### Fork safety
 
@@ -830,7 +894,8 @@ When a call fails, `event.payload[:exception_object]` is the
 unexpected, that error's `cause` is the original exception.
 
 Calls made with `Tonic::Rails::Client` publish `request_rpc.tonic_rails`,
-with the same payload plus `:address`, the server called. For a
+with the same payload plus `:address`, the server called, and
+`:attempts`, how many times it was tried. For a
 server-streaming call, the event covers the whole stream, including the
 time your block spends on each message.
 

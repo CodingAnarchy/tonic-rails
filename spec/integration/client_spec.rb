@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "logger"
+require "stringio"
 require "timeout"
 require_relative "../fixtures/lib/counting_stream_handler"
 require_relative "../fixtures/lib/echo_handler"
@@ -252,6 +254,111 @@ RSpec.describe Tonic::Rails::Client, :integration do
     end
   end
 
+  describe "retries" do
+    let(:log) { StringIO.new }
+    let(:logger) { Logger.new(log, formatter: ->(_, _, _, message) { "#{message}\n" }) }
+
+    def refused = "127.0.0.1:#{IntegrationServer.free_port}"
+
+    def attempts_of
+      attempts = []
+      subscription = ActiveSupport::Notifications.subscribe("request_rpc.tonic_rails") do |event|
+        attempts << event.payload[:attempts]
+      end
+      yield
+      attempts
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+
+    def echo(address, **options)
+      described_class.new(address, tls: false, logger: logger, **options).stub("echo.v1.EchoService")
+    end
+
+    it "is off unless asked for" do
+      attempts = attempts_of { expect_rpc_error(:unavailable) { echo(refused).unary({}) } }
+      expect(attempts).to eq([1])
+      expect(log.string).to be_empty
+    end
+
+    it "retries a call that never reached the server, and logs each attempt" do
+      stub = echo(refused, retries: { max_attempts: 3, initial_backoff: 0.01 })
+      attempts = attempts_of { expect_rpc_error(:unavailable) { stub.unary({}) } }
+      expect(attempts).to eq([3])
+      expect(log.string.lines).to match(
+        [
+          %r{\Atonic-rails: /echo.v1.EchoService/Unary failed with UNAVAILABLE: .+ \(attempt 1 of 3\); retrying in \d+ms\n},
+          /\(attempt 2 of 3\)/,
+          %r{\Atonic-rails: /echo.v1.EchoService/Unary failed with UNAVAILABLE: .+ after 3 attempts\n},
+        ],
+      )
+    end
+
+    it "retries calls the server rejected before a handler ran" do
+      busy = IntegrationServer.start do |config|
+        config.dispatch_threads = 1
+        config.dispatch_queue_size = 1
+      end
+      blockers = Array.new(2) do
+        thread = Thread.new { echo(busy[:address]).unary(sleep_ms: 300) }
+        sleep 0.05
+        thread
+      end
+
+      expect_rpc_error(:resource_exhausted, /dispatch queue full/) { echo(busy[:address]).unary({}) }
+      retrying = echo(busy[:address], retries: { codes: [:resource_exhausted], max_attempts: 5, initial_backoff: 1,
+                                                 multiplier: 1, max_backoff: 1 })
+      attempts = attempts_of { expect(retrying.unary(message: "made it").message).to eq("made it") }
+      expect(attempts.first).to be > 1
+      blockers.each(&:join)
+    ensure
+      IntegrationServer.stop(busy) if busy
+    end
+
+    it "never repeats a call that reached a handler" do
+      stub = echo(address, retries: { max_attempts: 5, initial_backoff: 0.01 })
+      attempts = attempts_of { expect_rpc_error(:unavailable) { stub.unary(fail_with: "rpc:unavailable") } }
+      expect(attempts).to eq([1])
+    end
+
+    it "stops before the deadline and raises the last failure" do
+      stub = echo(refused, retries: { max_attempts: 5, initial_backoff: 1, multiplier: 1, max_backoff: 1 })
+      started = monotonic
+      expect_rpc_error(:unavailable) { stub.unary({}, deadline: 0.3) }
+      expect(monotonic - started).to be < 0.5
+    end
+
+    it "can be set or turned off per call" do
+      stub = echo(refused, retries: { max_attempts: 3, initial_backoff: 0.01 })
+      attempts = attempts_of do
+        expect_rpc_error(:unavailable) { stub.unary({}, retries: false) }
+        expect_rpc_error(:unavailable) { echo(refused).unary({}, retries: { max_attempts: 2, initial_backoff: 0.01 }) }
+      end
+      expect(attempts).to eq([1, 2])
+    end
+
+    it "follows the server's grpc-retry-pushback-ms" do
+      client = described_class.new(address, tls: false, retries: true)
+      delay = lambda do |pushback, attempt: 1|
+        trailers = pushback ? [["grpc-retry-pushback-ms", pushback]] : []
+        client.send(:retry_delay, client.retries, attempt, [14, "", nil, [], trailers, nil, false], nil)
+      end
+
+      expect(delay.call("250")).to eq(0.25)
+      expect(delay.call("-1")).to be_nil
+      expect(delay.call("soon")).to be_nil
+      expect(delay.call(nil)).to be_between(0, 0.1)
+      expect(delay.call(nil, attempt: 3)).to be_nil
+    end
+
+    it "retries a server stream that failed before any message" do
+      stub = echo(refused, retries: { max_attempts: 2, initial_backoff: 0.01 })
+      attempts = attempts_of { expect_rpc_error(:unavailable) { stub.server_stream(count: 2).to_a } }
+      expect(attempts).to eq([2])
+      expect(echo(address, retries: true).server_stream(count: 2).map(&:index)).to eq([0, 1])
+    end
+  end
+
   describe "the GVL" do
     it "lets other threads run during a call" do
       # Holding the GVL for the call would leave this thread no turns at all.
@@ -394,7 +501,7 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(events.map(&:payload)).to match(
         [
           a_hash_including(path: "/echo.v1.EchoService/Unary", service: "echo.v1.EchoService", rpc: "Unary",
-                           address: address, code: 0, status: :ok),
+                           address: address, code: 0, status: :ok, attempts: 1),
           a_hash_including(code: 5, status: :not_found),
           a_hash_including(path: "/echo.v1.EchoService/ServerStream", code: 0, status: :ok),
         ],
