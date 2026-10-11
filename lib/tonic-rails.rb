@@ -19,6 +19,7 @@ require "tonic/rails/instrumentation"
 require "tonic/rails/base"
 require "tonic/rails/health"
 require "tonic/rails/reflection"
+require "tonic/rails/cluster"
 require "tonic/rails/server"
 
 module Tonic

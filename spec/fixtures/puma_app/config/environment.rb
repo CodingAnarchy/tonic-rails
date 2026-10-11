@@ -16,6 +16,7 @@ class PumaPluginApp < Rails::Application
   config.hosts.clear
   config.tonic_rails.bind_address = ENV.fetch("GRPC_BIND")
   config.tonic_rails.drain_timeout = 2
+  config.tonic_rails.processes = Integer(ENV.fetch("GRPC_PROCESSES", "1"))
   config.to_prepare { Tonic::Rails.server.register(EchoHandler) }
 
   routes.append { get "/up", to: proc { [200, {}, ["ok"]] } }

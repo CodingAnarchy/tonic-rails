@@ -36,8 +36,9 @@ module Tonic
       # Start serving and block until stopped.
       # @param install_signal_handlers [Boolean] trap TERM and INT to stop.
       #   Pass false when embedding in a process that owns its signals.
-      # @yield once the server is accepting connections
-      def start(install_signal_handlers: true)
+      # @yield once the server is accepting connections (with
+      #   `processes > 1`, once every worker is)
+      def start(install_signal_handlers: true, &)
         @lock.synchronize do
           raise Error, "server is already running" unless @state == :stopped
 
@@ -50,38 +51,29 @@ module Tonic
 
           @configuration.validate!
           Tonic::Rails.native_extension!
-          Tonic::Rails._set_shutting_down(false)
           # A Queue rather than a self-pipe: pushing to it is safe from trap
           # handlers, and unlike pipes it can be waited on with a timeout
           # on every platform (Windows select() only handles sockets).
           @stop_signal = Thread::Queue.new
           stop if @stop_requested # requested while we were starting up
-          @native = build_native_server
-          @native.start_server
-          log_pump = spawn_log_pump
-          @health.attach(@native)
-          @state = :running
-
-          request_log = subscribe_request_logger
-          previous_handlers = install_signal_handlers ? trap_signals : {}
-          workers = Array.new(@configuration.dispatch_threads) { |i| spawn_worker(i) }
-          log_startup
-          yield self if block_given?
-
-          wait_for_stop(workers)
-          @health.detach
-          shutdown(workers)
+          if @configuration.multi_process?
+            run_cluster(install_signal_handlers, &)
+          else
+            serve(install_signal_handlers: install_signal_handlers, &)
+          end
         ensure
-          ActiveSupport::Notifications.unsubscribe(request_log) if request_log
-          previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
-          @health.detach
-          @native&.stop_server
-          stop_log_pump(log_pump)
-          @native = nil
           @stop_signal = nil
-          Tonic::Rails._set_shutting_down(false)
           @state = :stopped
         end
+      end
+
+      # @api private
+      # The body of a worker process in multi-process mode (see Cluster):
+      # serve on the listening socket the parent bound.
+      def run_worker(listener, index, &)
+        @worker_index = index
+        @configuration.on_worker_boot&.call(index)
+        serve(install_signal_handlers: true, listener: listener, &)
       end
 
       # Request a graceful stop.  Safe to call from signal handlers and
@@ -124,6 +116,55 @@ module Tonic
       end
 
       private
+
+      def run_cluster(install_signal_handlers)
+        @state = :running
+        Cluster.new(self, @configuration, @stop_signal).run(install_signal_handlers: install_signal_handlers) do
+          log_startup
+          yield self if block_given?
+        end
+      end
+
+      def serve(install_signal_handlers:, listener: nil)
+        Tonic::Rails._set_shutting_down(false)
+        @native = build_native_server
+        @native.set_listener_fd(listener.fileno) if listener
+        @native.start_server
+        # The transport holds its own copy now; let go of ours, so the
+        # socket closes once every worker has stopped accepting.
+        listener&.close
+        log_pump = spawn_log_pump
+        @health.attach(@native)
+        @state = :running
+
+        request_log = subscribe_request_logger
+        previous_handlers = install_signal_handlers ? trap_signals : {}
+        workers = Array.new(@configuration.dispatch_threads) { |i| spawn_worker(i) }
+        log_startup unless worker?
+        yield self if block_given?
+
+        wait_for_stop(workers)
+        @health.detach
+        shutdown(workers)
+      ensure
+        ActiveSupport::Notifications.unsubscribe(request_log) if request_log
+        previous_handlers&.each { |signal, handler| Signal.trap(signal, handler || "DEFAULT") }
+        @health.detach
+        @native&.stop_server
+        stop_log_pump(log_pump)
+        @native = nil
+        Tonic::Rails._set_shutting_down(false)
+      end
+
+      # True in a worker process of a multi-process server, whose parent
+      # logs startup and shutdown for all of them.
+      def worker?
+        !@worker_index.nil?
+      end
+
+      def worker_label
+        worker? ? "worker #{@worker_index}: " : ""
+      end
 
       def build_native_server
         config = @configuration
@@ -267,13 +308,15 @@ module Tonic
 
       def shutdown(workers)
         logger = @configuration.logger
+        # In a worker, the parent logs shutdown once for all of them.
+        lifecycle = worker? ? nil : logger
         @state = :stopping
         Tonic::Rails._set_shutting_down(true)
-        logger&.info("tonic-rails: shutting down, draining for up to #{@configuration.drain_timeout}s")
+        lifecycle&.info("tonic-rails: shutting down, draining for up to #{@configuration.drain_timeout}s")
 
         @native.begin_shutdown
         unless @native.wait_for_drain(@configuration.drain_timeout.to_f)
-          logger&.warn("tonic-rails: drain timeout expired; closing remaining connections")
+          logger&.warn("tonic-rails: #{worker_label}drain timeout expired; closing remaining connections")
         end
         @native.stop_workers
         workers.each do |worker|
@@ -281,7 +324,7 @@ module Tonic
         rescue Exception # rubocop:disable Lint/RescueException
           # Already logged by the worker.
         end
-        logger&.info("tonic-rails: stopped")
+        lifecycle&.info("tonic-rails: stopped")
       end
 
       def log_grpc_web(logger, config)
@@ -306,10 +349,9 @@ module Tonic
         end
         logger.info("tonic-rails: reflection enabled") if config.reflection
         log_grpc_web(logger, config)
-        logger.info(
-          "tonic-rails: serving #{@router.service_names.join(', ')} on #{config.bind_address} " \
-          "(#{config.dispatch_threads} dispatch threads)",
-        )
+        threads = "#{config.dispatch_threads} dispatch threads"
+        threads = "#{config.processes} processes × #{threads} each" if config.multi_process?
+        logger.info("tonic-rails: serving #{@router.service_names.join(', ')} on #{config.bind_address} (#{threads})")
       end
     end
   end

@@ -26,6 +26,22 @@ module Tonic
       # (RAILS_MAX_THREADS).  Default 4.
       attr_accessor :dispatch_threads
 
+      # Server processes.  Ruby runs one thread at a time per process, so a
+      # CPU-bound service uses one core however many dispatch threads it
+      # has; N processes use N.  Above 1, the app is loaded once and forked
+      # into N workers that share the listening socket, supervised by the
+      # process that started the server.  Unix only.  Default 1.
+      attr_accessor :processes
+
+      # Called in each worker process after it's forked, with the worker's
+      # index (multi-process mode only), to reopen connections that can't
+      # be shared across fork:
+      #
+      #   config.on_worker_boot = ->(index) { Redis.current.disconnect! }
+      #
+      # Active Record reconnects by itself.  Default nil.
+      attr_accessor :on_worker_boot
+
       # RPCs that may wait for a free dispatch thread.  Beyond this the
       # server answers RESOURCE_EXHAUSTED immediately.  Default 128.
       attr_accessor :dispatch_queue_size
@@ -110,6 +126,8 @@ module Tonic
         @logger = Logger.new($stdout)
         @worker_threads = nil
         @dispatch_threads = 4
+        @processes = 1
+        @on_worker_boot = nil
         @dispatch_queue_size = 128
         @tls_cert_path = nil
         @tls_key_path = nil
@@ -132,6 +150,10 @@ module Tonic
         @health_check_interval = 5
       end
 
+      def multi_process?
+        processes.is_a?(Integer) && processes > 1
+      end
+
       def tls?
         !tls_cert_path.nil? && !tls_key_path.nil?
       end
@@ -140,6 +162,7 @@ module Tonic
       def validate!
         positive_integer!(:dispatch_threads)
         positive_integer!(:dispatch_queue_size)
+        positive_integer!(:processes)
         positive_integer!(:max_message_size)
         non_negative_integer!(:max_connections)
         non_negative_integer!(:concurrency_limit_per_connection)
@@ -152,11 +175,19 @@ module Tonic
 
         validate_callables!
         validate_grpc_web!
+        validate_processes!
 
         self
       end
 
       private
+
+      def validate_processes!
+        return unless multi_process?
+        return if Process.respond_to?(:fork)
+
+        raise ArgumentError, "processes > 1 needs fork(), which this platform lacks; run one server process per core instead"
+      end
 
       def validate_grpc_web!
         %i[grpc_web_origins grpc_web_allowed_headers grpc_web_exposed_headers].each do |name|
@@ -169,6 +200,7 @@ module Tonic
 
       def validate_callables!
         raise ArgumentError, "health_check must respond to #call" if health_check && !health_check.respond_to?(:call)
+        raise ArgumentError, "on_worker_boot must respond to #call" if on_worker_boot && !on_worker_boot.respond_to?(:call)
         unless health_check_interval.is_a?(Numeric) && health_check_interval.positive?
           raise ArgumentError, "health_check_interval must be a positive number, got #{health_check_interval.inspect}"
         end

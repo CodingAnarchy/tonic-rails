@@ -32,6 +32,7 @@ RSpec.describe Tonic::Rails::Configuration do
   {
     dispatch_threads: [0, -1, 1.5, nil],
     dispatch_queue_size: [0],
+    processes: [0, -1, 1.5, nil],
     max_message_size: [0, 2**33],
     max_connections: [-1],
     worker_threads: [0],
@@ -59,6 +60,31 @@ RSpec.describe Tonic::Rails::Configuration do
     config.grpc_web_origins = ["https://app.example.com"]
     config.grpc_web_exposed_headers = [:x_id]
     expect { config.validate! }.to raise_error(ArgumentError, /grpc_web_exposed_headers/)
+  end
+
+  it "runs one process by default" do
+    allow(Process).to receive(:respond_to?).and_call_original
+    allow(Process).to receive(:respond_to?).with(:fork).and_return(true)
+    expect(config.processes).to eq(1)
+    expect(config).not_to be_multi_process
+    config.processes = 4
+    expect(config).to be_multi_process
+    expect(config.validate!).to be(config)
+  end
+
+  it "refuses multiple processes without fork" do
+    allow(Process).to receive(:respond_to?).and_call_original
+    allow(Process).to receive(:respond_to?).with(:fork).and_return(false)
+    expect(config.validate!).to be(config)
+    config.processes = 2
+    expect { config.validate! }.to raise_error(ArgumentError, /processes > 1 needs fork/)
+  end
+
+  it "requires a callable on_worker_boot" do
+    config.on_worker_boot = "reconnect"
+    expect { config.validate! }.to raise_error(ArgumentError, /on_worker_boot/)
+    config.on_worker_boot = ->(_index) {}
+    expect(config.validate!).to be(config)
   end
 
   it "requires callable interceptors" do

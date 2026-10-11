@@ -31,6 +31,11 @@ module Tonic
         # tasks, or test runs.  With Puma, prefer `plugin :tonic_rails`
         # (lib/puma/plugin/tonic_rails.rb), which also covers cluster mode.
         if configuration.auto_start && defined?(::Rails::Server)
+          if configuration.multi_process?
+            raise Error, "auto_start can't run multiple processes (processes = #{configuration.processes}); " \
+                         "use `plugin :tonic_rails` in config/puma.rb or `bin/rails tonic_rails:serve`"
+          end
+
           server = Tonic::Rails.server
           thread = Thread.new do
             Thread.current.name = "tonic-rails"

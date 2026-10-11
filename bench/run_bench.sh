@@ -2,7 +2,8 @@
 #
 # Benchmark tonic-rails against its baselines, across every scenario of
 # the Go client.  All servers do the same work (bench/bench_work.rb, mirrored
-# in Rust) with the same thread count, one process each.
+# in Rust) with the same thread count, one process each (tonic-rails can
+# run more with PROCESSES).
 #
 # Servers (SERVERS):
 #   ruby        tonic-rails, plain Ruby
@@ -24,6 +25,10 @@
 #   DISPATCH_THREADS  handler threads for every Ruby server (default 16).
 #                     The grpc gem rejects calls when all threads are busy
 #                     instead of queueing, so give it >= CONCURRENCY.
+#   PROCESSES         server processes for tonic-rails (default 1)
+#   CONNECTIONS       gRPC connections the client spreads calls over
+#                     (default 1).  A multi-process server balances
+#                     connections, not calls, so use at least PROCESSES.
 #   RUBY_YJIT_ENABLE  YJIT for the Ruby servers (default 1, as Rails enables
 #                     it by default; set 0 to compare without)
 #   SERVERS           space-separated list (default: all)
@@ -36,6 +41,8 @@ TOTAL="${TOTAL:-5000}"
 SCENARIOS="${SCENARIOS:-ping small io multi_io large cpu mixed stream upload}"
 SERVERS="${SERVERS:-ruby rails-grpc grpc-gem rails-json rust}"
 export DISPATCH_THREADS="${DISPATCH_THREADS:-16}"
+export PROCESSES="${PROCESSES:-1}"
+CONNECTIONS="${CONNECTIONS:-1}"
 export RUBY_YJIT_ENABLE="${RUBY_YJIT_ENABLE:-1}"
 
 RUBY_ADDR=127.0.0.1:50061
@@ -74,7 +81,8 @@ run_server() {
       continue # streaming has no plain-HTTP equivalent
     fi
     # A scenario with errors still prints its results; keep going.
-    "$CLIENT" -protocol "$protocol" -addr "$addr" -scenario "$scenario" -concurrency "$CONCURRENCY" -total "$TOTAL" || true
+    "$CLIENT" -protocol "$protocol" -addr "$addr" -scenario "$scenario" -concurrency "$CONCURRENCY" -total "$TOTAL" \
+      -connections "$CONNECTIONS" || true
   done
   kill "${pids[${#pids[@]}-1]}" 2>/dev/null || true
 }
@@ -84,12 +92,12 @@ for server in $SERVERS; do
     ruby)
       BIND=$RUBY_ADDR bundle exec ruby bench/bench_server.rb &
       pids+=($!)
-      run_server "tonic-rails, $DISPATCH_THREADS dispatch threads" $RUBY_ADDR
+      run_server "tonic-rails, $PROCESSES process(es) × $DISPATCH_THREADS dispatch threads" $RUBY_ADDR
       ;;
     rails-grpc)
       WITH_RAILS=1 BIND=$RAILS_GRPC_ADDR bundle exec ruby bench/bench_server.rb &
       pids+=($!)
-      run_server "tonic-rails in a Rails app, $DISPATCH_THREADS dispatch threads" $RAILS_GRPC_ADDR
+      run_server "tonic-rails in a Rails app, $PROCESSES process(es) × $DISPATCH_THREADS dispatch threads" $RAILS_GRPC_ADDR
       ;;
     grpc-gem)
       BIND=$GRPC_GEM_ADDR bundle exec ruby bench/grpc_gem_server.rb &

@@ -113,8 +113,49 @@ tokio's 1 ms timer granularity stretches the Rust handler's 2 ms sleep.
 For CPU-light, very cheap calls, fewer threads do slightly better: with 16
 threads (and YJIT off) tonic-rails served `ping` at 63–70k calls/s,
 because fewer threads compete for the GVL. Scale CPU-heavy services with
-processes rather than threads; the listener uses `SO_REUSEPORT`, so
-several processes can share a port.
+processes rather than threads: see [Multiple processes](#multiple-processes).
+
+## Multiple processes
+
+Everything above is one process, where Ruby runs one thread at a time.
+`config.processes` (0.5.0) forks the server into several workers that
+share the port, so Ruby code runs on several cores at once. Same
+machine and client as above, with the client spreading its calls over 8
+HTTP/2 connections, 50 dispatch threads per process, two runs each:
+
+| Scenario | 1 process | 4 processes | 8 processes | 4 vs 1 | 8 vs 1 |
+|----------|----------:|------------:|------------:|-------:|-------:|
+| `cpu` | 6.7k | 17.6k–18.4k | 28.8k–31.3k | 2.6–2.8× | 4.3–4.7× |
+| `large` | 3.8k | 9.2k–9.4k | 13.9k–14.8k | ~2.4× | 3.6–3.9× |
+| `mixed` | 8.7k–8.8k | 16.8k–17.0k | 16.9k–17.4k | ~1.9× | ~2× |
+| `ping` | 29k | 59k–64k | 46k–49k | 2–2.2× | 1.6–1.7× |
+| `small` | 26k | 59k–61k | 51k–53k | 2.3× | ~2× |
+| `stream` | 2.4k–3.2k | 8.2k–8.4k | 7.7k–8.1k | 2.6–3.4× | 2.4–3.3× |
+| `io` | 17.3k–17.6k | 18.6k–18.9k | 18.4k–19.0k | ~1.1× | ~1.1× |
+
+Those are for tonic-rails in Rails. Without Rails, `cpu` went from
+7.1k to 19.9k–20.1k with 4 processes and 31k–32k with 8.
+
+**CPU-bound work scales with cores.** `cpu` and `large` spend their time
+running Ruby, and grow with every process added. Four processes don't
+quite reach 4× because the machine also runs the load generator, and the
+M5 has 4 performance cores and 6 efficiency cores: past 4 processes,
+work lands on the slower cores.
+
+**I/O-bound work doesn't need it.** `io` sleeps 2 ms per call, so 50
+calls in flight cap it at 25k calls/s however many cores it has; one
+process with enough threads is already close. `mixed` doubles and then
+stops, at the same kind of limit.
+
+**Light calls gain less from more processes than cores.** `ping` and
+`small` peak at 4 processes. The client, eight server processes and their
+transport threads then compete for the same cores.
+
+Workers share one listening socket, and each HTTP/2 connection stays with
+the worker that accepted it. A client with a single connection is served
+by a single worker however many there are, which is why this run uses 8
+connections. Many clients, or a client-side connection pool, spread the
+load.
 
 ## Design choices that matter for throughput
 
@@ -143,7 +184,9 @@ SERVERS="rails-grpc rails-json" SCENARIOS="ping io" bench/run_bench.sh
 ```
 
 `SERVERS` accepts `ruby` (tonic-rails), `rails-grpc` (tonic-rails in
-Rails), `grpc-gem`, `rails-json` and `rust`. `RUBY_YJIT_ENABLE=0` turns
+Rails), `grpc-gem`, `rails-json` and `rust`. For the multi-process table:
+`PROCESSES=4 CONNECTIONS=8 DISPATCH_THREADS=50 TOTAL=20000 SERVERS="ruby
+rails-grpc" bench/run_bench.sh`. `RUBY_YJIT_ENABLE=0` turns
 YJIT off. Requires Go, Rust and `protoc`. `bench/go_bench/health_bench`
 measures the native `grpc.health.v1` endpoint, and `bench/rust_bench`'s
 `sleep_bench` shows the tokio timer granularity mentioned above.

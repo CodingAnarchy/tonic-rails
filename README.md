@@ -470,6 +470,8 @@ end
 |--------|---------|-------------|
 | `bind_address` | `"0.0.0.0:50051"` | Address to listen on |
 | `dispatch_threads` | `4` | Ruby threads running handlers; match your database pool |
+| `processes` | `1` | Server processes sharing the port (see [Threads or processes](#threads-or-processes)); Unix only |
+| `on_worker_boot` | `nil` | Callable run in each worker process after fork, given its index |
 | `dispatch_queue_size` | `128` | Calls that may wait for a thread; beyond this, `RESOURCE_EXHAUSTED` |
 | `worker_threads` | CPU count | Tokio threads for the transport |
 | `max_message_size` | 4 MiB | Request and response limit (also caps decompressed size) |
@@ -490,14 +492,60 @@ end
 | `log_requests` | `false` | Log one line per call through `logger` (unexpected exceptions are always logged) |
 | `auto_start` | `false` | Start in a thread of `rails server`; for development (see [auto_start](#auto_start)) |
 
-### Sizing threads
+### Threads or processes
 
 Handlers run on `dispatch_threads` Ruby threads. Blocking I/O (database,
-HTTP) releases the GVL, so more threads means more concurrent I/O. CPU
-work does not parallelise within a process. Set threads to the
-concurrency your I/O needs, size the database pool to match, and add
-processes for CPU-heavy services: the listener uses `SO_REUSEPORT`, so
-several processes can bind the same port.
+HTTP) releases Ruby's global VM lock, so more threads means more
+concurrent I/O. Ruby code itself runs one thread at a time per process,
+though: a service that spends its time in Ruby (building large
+responses, serializing, computing) tops out at one core however many
+threads it has.
+
+So:
+
+- **Mostly waiting on I/O?** Add threads. They're cheap, and one process
+  goes a long way. Size the database pool to match.
+- **Mostly running Ruby?** Add processes. `processes = 4` runs four
+  copies of the server on the same port and uses four cores.
+
+```ruby
+config.tonic_rails.processes = ENV.fetch("GRPC_PROCESSES", 4).to_i
+config.tonic_rails.dispatch_threads = 5 # per process
+```
+
+Most services mix both. A reasonable start is one process per core and
+a handful of threads in each. Every process has its own database pool,
+so the database sees up to `processes × dispatch_threads` connections.
+
+With `processes` above 1, `bin/rails tonic_rails:serve` loads the app
+once and forks the workers, which share memory until they write to it.
+The process you started supervises them:
+
+- Workers share one listening socket, and a worker with fewer open
+  connections picks up new ones first. gRPC clients keep connections
+  open and send every call over them, so a single client connection
+  is served by a single worker: spread load with several connections
+  or several clients.
+- If a worker dies, it's logged and replaced.
+- SIGTERM or SIGINT to the supervisor drains every worker (health
+  reports `NOT_SERVING`, in-flight calls finish) and it exits once all
+  have stopped. Workers stop on their own if the supervisor disappears.
+- If a worker fails while starting (a bad configuration, say), the
+  server doesn't start.
+
+Active Record reconnects in each worker by itself. Reopen anything else
+that can't be shared across `fork` in `on_worker_boot`:
+
+```ruby
+config.tonic_rails.on_worker_boot = ->(index) { MyQueueClient.reconnect! }
+```
+
+Health checks, `health_check`, `serving!`, `not_serving!` and `stats`
+work per worker: calling `serving!` or `not_serving!` in the supervisor
+after the server has started doesn't reach the workers.
+
+Multi-process mode needs `fork()`, so it isn't available on Windows. Run
+one server process per core there, each on its own port.
 
 ### Running with Puma
 
@@ -513,7 +561,8 @@ web workers. It starts after Puma boots and drains gracefully when Puma
 stops or restarts. If the gRPC process dies, Puma shuts down too, so your
 supervisor restarts both. It works with `rails server`, plain `puma`, and
 `preload_app!`. (Not on Windows, which has no `fork()`: run
-`tonic_rails:serve` as its own process there.)
+`tonic_rails:serve` as its own process there.) With `processes` above 1,
+that child process supervises the gRPC workers.
 
 For larger deployments, a dedicated `bin/rails tonic_rails:serve` process
 (scaled separately) is still the most flexible option.
@@ -523,7 +572,7 @@ For larger deployments, a dedicated `bin/rails tonic_rails:serve` process
 `auto_start = true` starts the gRPC server in a background thread of
 `rails server` (never in consoles, rake tasks or tests). It's handy in
 development; in production use the Puma plugin or a dedicated process.
-Don't combine it with the plugin.
+Don't combine it with the plugin, and it can't run multiple `processes`.
 
 ## Operations
 
