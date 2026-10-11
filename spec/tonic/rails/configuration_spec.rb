@@ -63,6 +63,8 @@ RSpec.describe Tonic::Rails::Configuration do
   end
 
   it "runs one process by default" do
+    allow(Process).to receive(:respond_to?).and_call_original
+    allow(Process).to receive(:respond_to?).with(:fork).and_return(true)
     expect(config.processes).to eq(1)
     expect(config).not_to be_multi_process
     config.processes = 4
