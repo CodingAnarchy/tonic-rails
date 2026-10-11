@@ -236,6 +236,47 @@ Any other exception becomes `INTERNAL` with the message `internal error`.
 The real exception is logged and passed to `Rails.error.report`, so your
 error tracker sees it.
 
+### Callbacks and rescue_from
+
+Handlers get controller-style callbacks and exception mapping:
+
+```ruby
+class ItemService
+  include Tonic::Rails::Base
+  rpc_service "demo.v1.ItemService"
+
+  before_rpc :authenticate, except: :ListItems
+  around_rpc :with_tenant
+  after_rpc { StatsD.increment("grpc.#{current_rpc}") }
+
+  rescue_from ActiveRecord::RecordNotFound, code: :not_found
+  rescue_from ActiveRecord::RecordInvalid, code: :invalid_argument, message: ->(e) { e.record.errors.full_messages.join(", ") }
+  rescue_from Pundit::NotAuthorizedError, with: :forbidden
+
+  private
+
+  def authenticate
+    @user = User.from_token(grpc_metadata["authorization"])
+    raise Tonic::Rails::RpcError.new("invalid token", code: :unauthenticated) unless @user
+  end
+
+  def with_tenant(&) = Tenant.switch(@user.tenant, &)
+
+  def forbidden(_e) = raise(Tonic::Rails::RpcError.new("not allowed", code: :permission_denied))
+end
+```
+
+- `before_rpc`, `after_rpc` and `around_rpc` accept method names or a
+  block, plus `only:` / `except:` with RPC names (`:GetItem` or
+  `:get_item`). Raising in a `before_rpc` stops the call.
+- `current_rpc` is the RPC being handled and `request` the decoded
+  request, so callbacks can inspect it.
+- `after_rpc` runs once a streamed response has been fully sent.
+- `rescue_from` covers the handler and its callbacks. With `code:`, the
+  exception's message is sent to the client unless you pass `message:`.
+  Handlers given with `with:` or a block must raise an `RpcError`.
+  Anything unmapped becomes `INTERNAL`, as before.
+
 ### Metadata, deadlines and shutdown
 
 ```ruby
