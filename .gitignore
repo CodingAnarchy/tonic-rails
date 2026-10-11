@@ -1,21 +1,26 @@
 .bundle/
 vendor/bundle/
 *.gem
+pkg/
 coverage/
 tmp/
+.ruby-version
+.ruby-gemset
+**/*.rbc
+
 # Rust build artifacts
 target/
+
 # Compiled native extension
 *.bundle
+*.so
+*.dll
 *.dylib
+
+# Example app runtime files
+example/log/
+example/tmp/
+
 # Compiled Go binaries
 bench/go_bench/bench-client
 bench/go_bench/health_bench/health_bench
-# Generated proto descriptors
-*.desc
-**/*.rbc
-.ruby-version
-.ruby-gemset
-
-# TLS test keys and certs
-bench/tls/
