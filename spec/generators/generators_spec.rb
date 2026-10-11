@@ -25,6 +25,16 @@ RSpec.describe "tonic_rails generators" do # rubocop:disable RSpec/DescribeClass
 
   def exist?(path) = File.exist?(File.join(root, path))
 
+  # protoc < 22 generates Ruby that google-protobuf 4 can't load.
+  def skip_without_modern_protoc
+    version = IO.popen(%w[protoc --version], err: File::NULL, &:read)[/\d+(\.\d+)+/]
+    parts = version.split(".")
+    major = parts.first == "3" ? parts[1].to_i : parts.first.to_i
+    skip "protoc #{version} is older than 22" if major < 22
+  rescue SystemCallError
+    skip "protoc not installed"
+  end
+
   # A new-style app: lib/ is autoloaded (and eager-loaded), as `rails new`
   # sets up since Rails 7.1.
   def write_rails_app
@@ -117,7 +127,7 @@ RSpec.describe "tonic_rails generators" do # rubocop:disable RSpec/DescribeClass
     end
 
     it "boots in a Rails app that autoloads lib/ and eager-loads" do
-      skip "protoc not installed" unless system("protoc", "--version", out: File::NULL, err: File::NULL)
+      skip_without_modern_protoc
 
       write_rails_app
       generate(TonicRails::Generators::ServiceGenerator, "Item", "GetItem")
@@ -141,7 +151,7 @@ RSpec.describe "tonic_rails generators" do # rubocop:disable RSpec/DescribeClass
     end
 
     it "generates code that compiles and runs" do
-      skip "protoc not installed" unless system("protoc", "--version", out: File::NULL, err: File::NULL)
+      skip_without_modern_protoc
 
       generate(TonicRails::Generators::ServiceGenerator, "Item", "GetItem", "ListItems:server")
       Dir.chdir(root) do
@@ -152,8 +162,9 @@ RSpec.describe "tonic_rails generators" do # rubocop:disable RSpec/DescribeClass
         require "tonic/rails/testing"
         $LOAD_PATH.unshift("lib/grpc")
         require "./app/grpc/item_service"
+        require "json"
         kinds = ItemService.grpc_rpcs.transform_values { |s| [s[:request_stream], s[:response_stream]] }
-        puts kinds.inspect
+        puts JSON.generate(kinds)
         begin
           Tonic::Rails::Testing.call(ItemService, :GetItem, Shop::V1::GetItemRequest.new)
         rescue Tonic::Rails::RpcError => e
@@ -162,7 +173,7 @@ RSpec.describe "tonic_rails generators" do # rubocop:disable RSpec/DescribeClass
       RUBY
       output, status = Open3.capture2e(RbConfig.ruby, "-I", File.expand_path("../../lib", __dir__), "-e", script, chdir: root)
       expect(status).to be_success, output
-      expect(output).to include('"GetItem" => [false, false]', '"ListItems" => [false, true]', "unimplemented")
+      expect(output).to include('{"GetItem":[false,false],"ListItems":[false,true]}', "unimplemented")
     end
   end
 end

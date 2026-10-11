@@ -21,6 +21,8 @@ minor versions may contain breaking changes.
   generated-code directories, Puma plugin) and `rails g tonic_rails:service
   Item GetItem ListItems:server` (proto, handler with a stub per RPC,
   registration, and an RSpec or Minitest test).
+- `tonic_rails:compile_protos` checks for protoc 22 or newer and explains the
+  problem, instead of generating code google-protobuf 4 can't load.
 - Test helpers: the `raise_grpc_error(code).with_message(...)` RSpec matcher
   (`require "tonic/rails/testing/rspec"`) and `assert_grpc_error` for Minitest
   (`Tonic::Rails::Testing::Assertions`). Both accept `Tonic::Rails::RpcError`

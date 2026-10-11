@@ -60,7 +60,11 @@ On platforms without a precompiled gem, installation builds the
 extension from source, which needs a [Rust toolchain](https://rustup.rs).
 
 To generate Ruby classes from your `.proto` files you also need `protoc`
-(the Protocol Buffers compiler) during development.
+(the Protocol Buffers compiler) **22.0 or newer** during development.
+Older versions, such as Ubuntu's `protobuf-compiler` package (3.21),
+generate code that google-protobuf 4 can't load; install a current
+release from the [protobuf releases page](https://github.com/protocolbuffers/protobuf/releases)
+or Homebrew.
 
 ## Quick start
 
