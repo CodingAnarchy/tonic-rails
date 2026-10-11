@@ -14,6 +14,7 @@ minor versions may contain breaking changes.
 - Rich errors: `RpcError.new(..., metadata:, details:)` sends trailing
   metadata and a `google.rpc.Status` with packed details in
   `grpc-status-details-bin`.
+- Windows: precompiled `x64-mingw-ucrt` gems and Windows CI.
 - Puma plugin (`plugin :tonic_rails` in `config/puma.rb`) runs the gRPC
   server as a child process of Puma in single and cluster mode, with
   graceful stop/restart and shutdown if either side dies.

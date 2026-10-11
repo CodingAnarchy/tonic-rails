@@ -8,6 +8,7 @@ require_relative "../support/integration_server"
 
 RSpec.describe "Puma plugin", :integration do
   before(:all) do
+    skip "the Puma plugin needs fork()" if Gem.win_platform?
     skip "native extension not compiled" unless IntegrationServer.native_available?
     begin
       require "puma"

@@ -15,6 +15,12 @@ require "puma/plugin"
 Puma::Plugin.create do
   def start(launcher)
     @launcher = launcher
+    unless Process.respond_to?(:fork)
+      log "tonic-rails: the Puma plugin needs fork(), which this platform lacks; " \
+          "run `bin/rails tonic_rails:serve` as a separate process instead"
+      return
+    end
+
     @puma_pid = Process.pid
     @grpc_pid = nil
 
