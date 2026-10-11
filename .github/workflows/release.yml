@@ -65,14 +65,22 @@ jobs:
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
           ruby-version: "3.4"
-          bundler-cache: true
+          # Gems built on the runner would be mounted into the container,
+          # whose older glibc cannot load them; the container bundles itself.
+          bundler-cache: false
           cargo-cache: true
           cargo-vendor: true
+      # Use the rb-sys-dock image matching the locked rb_sys (otherwise the
+      # tool falls back to the gemspec's minimum, whose image lacks newer Rubies).
+      - name: rb-sys-dock image tag
+        id: rb-sys
+        run: echo "version=$(grep -oE '^    rb_sys \([0-9.]+\)' Gemfile.lock | grep -oE '[0-9.]+')" >> "$GITHUB_OUTPUT"
       - uses: oxidize-rb/actions/cross-gem@v1
         id: cross-gem
         with:
           platform: ${{ matrix.platform }}
           ruby-versions: ${{ env.RUBY_VERSIONS }}
+          tag: ${{ steps.rb-sys.outputs.version }}
           # rb-sys-dock images carry the Rust that was stable when they
           # were built; the crate (and tonic 0.14) need edition 2024 / Rust
           # 1.88+, so install current stable for the image's target first.
