@@ -44,8 +44,9 @@ end
   INTERNAL error (the details go to your logs and `Rails.error`).
   Reflection is off unless you turn it on. TLS problems stop the server
   instead of silently falling back to plaintext.
-- **A client too.** Call other gRPC services with deadlines that follow
-  your handler's, without the `grpc` gem and its fork crashes. See
+- **A client too.** Make unary and server-streaming calls to other gRPC
+  services, with deadlines that follow your handler's, without the
+  `grpc` gem and its fork crashes. See
   [Calling other services](#calling-other-services).
 - **No Rust toolchain needed** on the platforms we ship precompiled gems
   for: Linux and macOS (x86_64 and arm64) and Windows (x64).
@@ -406,7 +407,8 @@ const item = await client.getItem({ id: 1n });
 
 ## Calling other services
 
-tonic-rails includes a client for unary calls to other gRPC services, so
+tonic-rails includes a client for unary and server-streaming calls to
+other gRPC services, so
 an app that serves gRPC (or just calls it) doesn't need the `grpc` gem.
 It runs on the same Rust stack as the server, and it keeps working after
 `fork`. That matters because the `grpc` gem crashes or hangs in forked
@@ -437,6 +439,32 @@ Stubs are built from the protobuf descriptors in the `_pb.rb` files that
 There's no `grpc_tools_ruby_protoc` step and no `_services_pb.rb`.
 Responses are protobuf messages.
 
+### Server streaming
+
+A server-streaming method returns a stream you read with `each`, or any
+Enumerable method:
+
+```ruby
+items.list_items(category: "books").each { |item| index(item) }
+items.list_items(category: "books").first(10)  # stops after ten
+```
+
+- Nothing is sent until you start reading. Then each message is yielded
+  as it arrives, not when the stream ends.
+- Stopping early, with `break`, `first(n)` or an exception, cancels the
+  call, and the server sees it cancelled.
+- A slow reader holds the server back. A few messages are read ahead,
+  and HTTP/2 flow control stops the server after a couple of megabytes,
+  so a fast server can't fill your memory.
+- If the server fails partway through, you get every message it sent
+  first, then `Tonic::Rails::RpcError`.
+- Once the stream has ended, `headers` and `trailers` return its
+  metadata.
+- A stream can be read once. Call the method again for a new one.
+
+Client and bidirectional streaming aren't supported yet; their stub
+methods raise `NotImplementedError`.
+
 ### Deadlines
 
 - `deadline:` on a call is seconds from now (`0.5`) or a `Time`. Without
@@ -448,6 +476,9 @@ Responses are protobuf messages.
   the call itself always wins.
 - When a deadline passes, the call raises `DEADLINE_EXCEEDED`, and the
   server sees the call cancelled.
+- A stream's deadline covers the whole stream, including the time your
+  block spends on each message. It's set when you call the method, so a
+  stream read later still keeps the handler's deadline.
 
 Set a deadline. Without one, a call to a server that never answers waits
 forever (or until `Timeout` interrupts it, which also works).
@@ -558,8 +589,12 @@ item = stub.get_item(Demo::V1::GetItemRequest.new(id: 1), deadline: Time.now + 2
   and a check of `e.code_name == :not_found`. The `raise_grpc_error`
   matcher and `assert_grpc_error` accept both.
 - `:this_channel_is_insecure` becomes `tls: false`.
-- Only unary calls are supported so far. Stubs refuse streaming methods
-  with a `NotImplementedError`; keep the grpc gem for those for now.
+- Server-streaming methods return a stream instead of an Enumerator.
+  Code that calls `each` or other Enumerable methods on the result works
+  unchanged; for `next`, call `each` first to get an Enumerator.
+- Client and bidirectional streaming aren't supported yet. Stubs refuse
+  those methods with a `NotImplementedError`; keep the grpc gem for them
+  for now.
 
 ## Testing handlers
 
@@ -795,7 +830,9 @@ When a call fails, `event.payload[:exception_object]` is the
 unexpected, that error's `cause` is the original exception.
 
 Calls made with `Tonic::Rails::Client` publish `request_rpc.tonic_rails`,
-with the same payload plus `:address`, the server called.
+with the same payload plus `:address`, the server called. For a
+server-streaming call, the event covers the whole stream, including the
+time your block spends on each message.
 
 ## How it works
 

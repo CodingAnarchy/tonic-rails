@@ -1,5 +1,7 @@
 //! `TonicRails::Native::Channel`: outgoing gRPC calls over a tonic
-//! [`Channel`], with message bytes passed through untouched.
+//! [`Channel`], with message bytes passed through untouched.  Unary calls
+//! return their result; server-streaming calls return a
+//! `TonicRails::Native::ResponseStream` to read messages from.
 //!
 //! Fork safety: each process gets its own tokio runtime and its own
 //! connection, created on first use and keyed by pid.  After `fork` the
@@ -12,8 +14,9 @@
 //! inherit them.  On macOS loading them goes through Security.framework,
 //! which aborts in the child of a multi-threaded process.
 
+use std::future::Future;
 use std::io;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
@@ -23,13 +26,14 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use magnus::{Error, RArray, RHash, RString, Ruby, r_hash::ForEach};
 use parking_lot::Mutex;
 use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder, Streaming};
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Request, Status};
 
-use crate::gvl::{Cancel, block_on, without_gvl};
+use crate::gvl::{Cancel, Wait, block_on, recv_blocking, without_gvl};
 
 // ─── Per-process runtime ──────────────────────────────────────────
 
@@ -127,6 +131,18 @@ struct Outcome {
 }
 
 impl Outcome {
+    fn ok(response: Option<Bytes>, headers: HeaderMap, trailers: HeaderMap) -> Self {
+        Self {
+            code: Code::Ok,
+            message: String::new(),
+            local: false,
+            details: Bytes::new(),
+            response,
+            headers,
+            trailers,
+        }
+    }
+
     fn error(code: Code, message: impl Into<String>) -> Self {
         Self {
             local: true,
@@ -185,16 +201,9 @@ fn metadata_pairs(ruby: &Ruby, headers: &HeaderMap) -> Result<RArray, Error> {
     Ok(pairs)
 }
 
-/// One unary call, bounded by `timeout` if there is one.
-async fn call(
-    channel: Channel,
-    path: PathAndQuery,
-    request: Bytes,
-    metadata: HeaderMap,
-    timeout: Option<Duration>,
-    max_message_size: usize,
-) -> Outcome {
-    let call = unary(channel, path, request, metadata, timeout, max_message_size);
+/// Bound a call by `timeout`, if there is one.  For a stream, that
+/// covers every message, including time spent waiting on a slow reader.
+async fn with_timeout(call: impl Future<Output = Outcome>, timeout: Option<Duration>) -> Outcome {
     let Some(timeout) = timeout else {
         return call.await;
     };
@@ -208,57 +217,95 @@ async fn call(
     }
 }
 
-async fn unary(
+/// What every call needs: the method, one request message and its metadata.
+struct CallArgs {
     channel: Channel,
     path: PathAndQuery,
     request: Bytes,
     metadata: HeaderMap,
     timeout: Option<Duration>,
     max_message_size: usize,
-) -> Outcome {
-    let mut grpc = tonic::client::Grpc::new(channel)
-        .max_decoding_message_size(max_message_size)
-        .max_encoding_message_size(max_message_size);
+}
+
+/// Send the request and wait for the response headers.
+async fn start(args: CallArgs) -> Result<(HeaderMap, Streaming<Bytes>), Box<Outcome>> {
+    let mut grpc = tonic::client::Grpc::new(args.channel)
+        .max_decoding_message_size(args.max_message_size)
+        .max_encoding_message_size(args.max_message_size);
     if let Err(e) = grpc.ready().await {
-        return Outcome::error(Code::Unavailable, format!("channel not ready: {e}"));
+        let message = format!("channel not ready: {e}");
+        return Err(Box::new(Outcome::error(Code::Unavailable, message)));
     }
 
     // The streaming call keeps response headers and trailers apart, which
     // tonic's own unary call merges.
     let mut request = Request::from_parts(
-        MetadataMap::from_headers(metadata),
+        MetadataMap::from_headers(args.metadata),
         Default::default(),
-        tokio_stream::once(request),
+        tokio_stream::once(args.request),
     );
-    if let Some(timeout) = timeout {
+    if let Some(timeout) = args.timeout {
         request.set_timeout(timeout);
     }
-    let response = match grpc.streaming(request, path, RawCodec).await {
-        Ok(response) => response,
+    match grpc.streaming(request, args.path, RawCodec).await {
+        Ok(response) => {
+            let (headers, stream, _) = response.into_parts();
+            Ok((headers.into_headers(), stream))
+        }
         // Includes trailers-only responses, whose status comes in the headers.
-        Err(status) => return Outcome::status(status, HeaderMap::new()),
+        Err(status) => Err(Box::new(Outcome::status(status, HeaderMap::new()))),
+    }
+}
+
+/// The trailers that end a successful call.
+async fn finish(stream: &mut Streaming<Bytes>, headers: &HeaderMap) -> Result<HeaderMap, Box<Outcome>> {
+    match stream.trailers().await {
+        Ok(trailers) => Ok(trailers.map(MetadataMap::into_headers).unwrap_or_default()),
+        Err(status) => Err(Box::new(Outcome::status(status, headers.clone()))),
+    }
+}
+
+async fn unary(args: CallArgs) -> Outcome {
+    let (headers, mut stream) = match start(args).await {
+        Ok(started) => started,
+        Err(outcome) => return *outcome,
     };
-    let (headers, mut stream, _) = response.into_parts();
-    let headers = headers.into_headers();
     let message = match stream.message().await {
         Ok(message) => message,
         Err(status) => return Outcome::status(status, headers),
     };
-    let trailers = match stream.trailers().await {
-        Ok(trailers) => trailers.map(MetadataMap::into_headers).unwrap_or_default(),
-        Err(status) => return Outcome::status(status, headers),
+    let trailers = match finish(&mut stream, &headers).await {
+        Ok(trailers) => trailers,
+        Err(outcome) => return *outcome,
     };
     match message {
-        Some(message) => Outcome {
-            code: Code::Ok,
-            message: String::new(),
-            local: false,
-            details: Bytes::new(),
-            response: Some(message),
-            headers,
-            trailers,
-        },
+        Some(message) => Outcome::ok(Some(message), headers, trailers),
         None => Outcome::error(Code::Internal, "server sent no response message"),
+    }
+}
+
+/// Forward each response message to `tx` as it arrives.  A full `tx`
+/// stops reading from the connection, so HTTP/2 flow control holds the
+/// server back.
+async fn server_stream(args: CallArgs, tx: mpsc::Sender<Bytes>) -> Outcome {
+    let (headers, mut stream) = match start(args).await {
+        Ok(started) => started,
+        Err(outcome) => return *outcome,
+    };
+    loop {
+        match stream.message().await {
+            Ok(Some(message)) => {
+                if tx.send(message).await.is_err() {
+                    return Outcome::error(Code::Cancelled, "stream closed by the client");
+                }
+            }
+            Ok(None) => break,
+            Err(status) => return Outcome::status(status, headers),
+        }
+    }
+    match finish(&mut stream, &headers).await {
+        Ok(trailers) => Outcome::ok(None, headers, trailers),
+        Err(outcome) => *outcome,
     }
 }
 
@@ -386,16 +433,15 @@ impl NativeChannel {
         channel
     }
 
-    /// Make a unary call.  Returns the array described in
-    /// [`Outcome::into_ruby`]; errors come back as a status, not raised.
-    pub fn unary(
+    /// Everything a call needs, from its Ruby arguments.
+    fn call_args(
         ruby: &Ruby,
         this: &Self,
         path: String,
         request: RString,
         metadata: RHash,
         timeout_ms: Option<u64>,
-    ) -> Result<RArray, Error> {
+    ) -> Result<(Handle, CallArgs), Error> {
         let path = PathAndQuery::try_from(path).map_err(|e| {
             Error::new(
                 ruby.exception_arg_error(),
@@ -410,17 +456,138 @@ impl NativeChannel {
                 format!("tonic-rails client: can't start a tokio runtime: {e}"),
             )
         })?;
-        let channel = this.channel(&runtime);
-        let timeout = timeout_ms.map(Duration::from_millis);
-        let task = AbortOnDrop(runtime.spawn(call(
-            channel,
+        let args = CallArgs {
+            channel: this.channel(&runtime),
             path,
             request,
             metadata,
-            timeout,
-            this.max_message_size,
-        )));
+            timeout: timeout_ms.map(Duration::from_millis),
+            max_message_size: this.max_message_size,
+        };
+        Ok((runtime, args))
+    }
+
+    /// Make a unary call.  Returns the array described in
+    /// [`Outcome::into_ruby`]; errors come back as a status, not raised.
+    pub fn unary(
+        ruby: &Ruby,
+        this: &Self,
+        path: String,
+        request: RString,
+        metadata: RHash,
+        timeout_ms: Option<u64>,
+    ) -> Result<RArray, Error> {
+        let (runtime, args) = Self::call_args(ruby, this, path, request, metadata, timeout_ms)?;
+        let timeout = args.timeout;
+        let task = AbortOnDrop(runtime.spawn(with_timeout(unary(args), timeout)));
         wait(ruby, task)?.into_ruby(ruby)
+    }
+
+    /// Start a server-streaming call.  It runs in the background, a few
+    /// messages ahead of the reader.
+    pub fn server_streaming(
+        ruby: &Ruby,
+        this: &Self,
+        path: String,
+        request: RString,
+        metadata: RHash,
+        timeout_ms: Option<u64>,
+    ) -> Result<ResponseStream, Error> {
+        let (runtime, args) = Self::call_args(ruby, this, path, request, metadata, timeout_ms)?;
+        let timeout = args.timeout;
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        let outcome = Arc::new(Mutex::new(None));
+        let slot = outcome.clone();
+        let task = runtime.spawn(async move {
+            let result = with_timeout(server_stream(args, tx.clone()), timeout).await;
+            // Set before `tx` is dropped, so the reader finds it at the end
+            // of the stream.
+            *slot.lock() = Some(result);
+            drop(tx);
+        });
+        Ok(ResponseStream {
+            pid: std::process::id(),
+            rx: Mutex::new(Some(rx)),
+            outcome,
+            task: Mutex::new(Some(AbortOnDrop(task))),
+        })
+    }
+}
+
+// ─── Response stream ──────────────────────────────────────────────
+
+/// Messages read ahead of a slow reader.  Past this, HTTP/2 flow control
+/// holds the server back.
+const STREAM_BUFFER: usize = 8;
+
+/// `TonicRails::Native::ResponseStream` — the messages of a
+/// server-streaming call, then its status.
+#[derive(magnus::TypedData)]
+#[magnus(class = "TonicRails::Native::ResponseStream", free_immediately)]
+pub struct ResponseStream {
+    /// The process that started the call.
+    pid: u32,
+    rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
+    outcome: Arc<Mutex<Option<Outcome>>>,
+    task: Mutex<Option<AbortOnDrop<()>>>,
+}
+
+impl magnus::typed_data::DataTypeFunctions for ResponseStream {}
+
+impl ResponseStream {
+    /// Next raw message, or nil once the stream has ended (see `#result`).
+    pub fn next(ruby: &Ruby, this: &Self) -> Result<Option<RString>, Error> {
+        // Taken out of the mutex while blocked so `#close` from another
+        // thread doesn't wait on it.
+        let Some(mut rx) = this.rx.lock().take() else {
+            return Ok(None);
+        };
+        loop {
+            match recv_blocking(&mut rx) {
+                Wait::Ready(bytes) => {
+                    this.rx.lock().replace(rx);
+                    return Ok(Some(ruby.str_from_slice(&bytes)));
+                }
+                Wait::Closed => return Ok(None),
+                Wait::Interrupted => {
+                    if let Err(e) = ruby.thread_check_ints() {
+                        this.rx.lock().replace(rx);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// How the call ended, as described in [`Outcome::into_ruby`], once
+    /// `#next` has returned nil.
+    pub fn result(ruby: &Ruby, this: &Self) -> Result<RArray, Error> {
+        let outcome = this
+            .outcome
+            .lock()
+            .take()
+            .unwrap_or_else(|| Outcome::error(Code::Cancelled, "the stream was closed before it ended"));
+        outcome.into_ruby(ruby)
+    }
+
+    /// Stop reading.  A call still running is cancelled on the server.
+    pub fn close(&self) {
+        if self.pid != std::process::id() {
+            // Started by the parent: see the module docs.
+            return;
+        }
+        drop(self.task.lock().take());
+        drop(self.rx.lock().take());
+    }
+}
+
+impl Drop for ResponseStream {
+    fn drop(&mut self) {
+        if self.pid != std::process::id() {
+            // The task and channel belong to the parent's runtime.
+            std::mem::forget(self.task.get_mut().take());
+            std::mem::forget(self.rx.get_mut().take());
+        }
     }
 }
 
