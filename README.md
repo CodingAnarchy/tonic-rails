@@ -140,7 +140,8 @@ bin/rails tonic_rails:routes   # lists registered methods
 ```
 
 Run it as its own process (a separate Procfile entry, container or
-Kubernetes deployment) next to your web server.
+Kubernetes deployment) next to your web server, or let Puma run it for
+you (see [Running with Puma](#running-with-puma)).
 
 The [example app](example/) is a complete, runnable version of all of the
 above.
@@ -356,7 +357,7 @@ end
 | `reflection` | `false` | Serve `grpc.reflection.v1`; exposes your schema |
 | `interceptors` | `[]` | See [Interceptors](#interceptors) |
 | `log_requests` | `false` | Log one line per call through `logger` (unexpected exceptions are always logged) |
-| `auto_start` | `false` | Start inside `rails server` (see below) |
+| `auto_start` | `false` | Start in a thread of `rails server`; for development (see [auto_start](#auto_start)) |
 
 ### Sizing threads
 
@@ -367,13 +368,30 @@ concurrency your I/O needs, size the database pool to match, and add
 processes for CPU-heavy services: the listener uses `SO_REUSEPORT`, so
 several processes can bind the same port.
 
+### Running with Puma
+
+Add the plugin to `config/puma.rb`:
+
+```ruby
+plugin :tonic_rails
+```
+
+Puma then runs the gRPC server as one child process, in single and cluster
+mode alike, so gRPC gets its own process and GVL instead of competing with
+web workers. It starts after Puma boots and drains gracefully when Puma
+stops or restarts. If the gRPC process dies, Puma shuts down too, so your
+supervisor restarts both. It works with `rails server`, plain `puma`, and
+`preload_app!`.
+
+For larger deployments, a dedicated `bin/rails tonic_rails:serve` process
+(scaled separately) is still the most flexible option.
+
 ### auto_start
 
 `auto_start = true` starts the gRPC server in a background thread of
 `rails server` (never in consoles, rake tasks or tests). It's handy in
-development. In production prefer a dedicated `tonic_rails:serve`
-process: forking servers such as Puma in cluster mode would need to
-start one per worker.
+development; in production use the Puma plugin or a dedicated process.
+Don't combine it with the plugin.
 
 ## Operations
 

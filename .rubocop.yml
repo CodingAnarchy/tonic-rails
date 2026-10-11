@@ -46,6 +46,7 @@ Metrics/PerceivedComplexity:
   Max: 15
 Metrics/BlockLength:
   Exclude:
+    - "lib/puma/plugin/**/*" # Puma::Plugin.create takes the plugin as a block
     - "spec/**/*"
     - "*.gemspec"
     - "**/*.rake"
