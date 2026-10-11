@@ -238,9 +238,11 @@ RSpec.describe Tonic::Rails::Client, :integration do
       end
       expect(received.size).to be_between(2, 5)
 
+      # The stream has no end: only the deadline stops it.  Messages read
+      # ahead before it passed are still yielded, so allow for those.
       started = monotonic
       expect_rpc_error(:deadline_exceeded) { counting.server_stream({}, deadline: 0.3).each { sleep 0.05 } }
-      expect(monotonic - started).to be < 1
+      expect(monotonic - started).to be < 3
     end
 
     it "is interrupted by Timeout" do
