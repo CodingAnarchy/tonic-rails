@@ -22,6 +22,7 @@
 //! - [`body`]     — response bodies and request stats
 //! - [`dispatch`] — the fallback tower service that queues RPCs for Ruby
 //! - [`gvl`]      — GVL release/acquire and the Ruby stream objects
+//! - [`log`]      — transport log events for Ruby's logger
 //! - [`net`]      — listener and connection cap
 //! - [`server`]   — `TonicRails::Native::Server`
 
@@ -29,6 +30,7 @@ mod body;
 mod dispatch;
 mod framing;
 mod gvl;
+mod log;
 mod net;
 mod server;
 
@@ -73,6 +75,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("wait_for_drain", method!(NativeServer::wait_for_drain, 1))?;
     class.define_method("stop_workers", method!(NativeServer::stop_workers, 0))?;
     class.define_method("stop_server", method!(NativeServer::stop_server, 0))?;
+    class.define_method("next_log_events", method!(NativeServer::next_log_events, 1))?;
     class.define_method("running?", method!(NativeServer::is_running, 0))?;
     class.define_method("stats", method!(NativeServer::stats, 0))?;
 

@@ -17,8 +17,9 @@ use http_body::{Body, Frame};
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
-use crate::framing::{COMPRESSION_THRESHOLD, frame, sanitize_for_log, status_trailers};
+use crate::framing::{COMPRESSION_THRESHOLD, frame, status_trailers};
 use crate::gvl::StreamMessage;
+use crate::log::{Level, LogSink, status_name};
 
 /// Request counters, exposed to Ruby via `Server#stats`.
 #[derive(Default)]
@@ -30,6 +31,7 @@ pub struct ServerStats {
     pub deadline_exceeded: AtomicUsize,
     pub resource_exhausted: AtomicUsize,
     pub unimplemented: AtomicUsize,
+    pub log: LogSink,
 }
 
 impl ServerStats {
@@ -57,14 +59,14 @@ impl ServerStats {
         }
 
         if transport && code != Code::Ok as u32 {
-            let path = sanitize_for_log(path);
-            let dur_us = start.elapsed().as_micros();
-            if message.is_empty() {
-                eprintln!("tonic-rails: path={path} code={code} duration_us={dur_us}");
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let status = status_name(code);
+            let line = if message.is_empty() {
+                format!("gRPC {path} {status} in {ms:.1}ms")
             } else {
-                let message = sanitize_for_log(message);
-                eprintln!("tonic-rails: path={path} code={code} duration_us={dur_us} message={message}");
-            }
+                format!("gRPC {path} {status} in {ms:.1}ms: {message}")
+            };
+            self.log.log(Level::for_code(code), &line);
         }
     }
 }

@@ -352,8 +352,12 @@ start one per worker.
   event through `ActiveSupport::Notifications`, so APM agents,
   OpenTelemetry and your own subscribers can trace calls. See
   [Instrumentation](#instrumentation).
-- **Request logs.** With `log_requests = true`, each RPC logs one line
-  through your logger: `gRPC /demo.v1.ItemService/GetItem OK in 1.4ms`.
+- **Logs.** Everything goes through your (Rails) logger. With
+  `log_requests = true`, each RPC logs one line, e.g.
+  `gRPC /demo.v1.ItemService/GetItem OK in 1.4ms`. Calls the transport
+  rejects before reaching Ruby (unknown methods, a full queue, expired
+  deadlines, oversized messages, refused connections) are always logged,
+  at info for client-caused problems, warn for overload and error for faults.
 - **Stats.** `Tonic::Rails.server.stats` returns counters for totals,
   successes, errors, cancellations, deadline and resource errors, active
   connections and queued calls.

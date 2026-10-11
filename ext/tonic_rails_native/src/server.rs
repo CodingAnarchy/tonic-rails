@@ -32,6 +32,7 @@ use tonic_health::server::HealthReporter;
 use crate::body::ServerStats;
 use crate::dispatch::{DispatchInner, DispatchService};
 use crate::gvl::{self, Cancel, DispatchContext};
+use crate::log::{Level, LogEvent, LogSink};
 use crate::net::{LimitedIncoming, bind};
 
 /// The overall-server health entry (empty service name).
@@ -91,6 +92,8 @@ pub struct NativeServer {
     stats: Arc<ServerStats>,
     compression: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    /// Transport log events waiting for Ruby (`next_log_events`).
+    log_rx: crossbeam_channel::Receiver<LogEvent>,
 }
 
 impl DataTypeFunctions for NativeServer {
@@ -128,15 +131,20 @@ impl NativeServer {
         bind_address
             .parse::<SocketAddr>()
             .map_err(|e| arg_error(ruby, format!("invalid bind address {bind_address:?}: {e}")))?;
+        let (log, log_rx) = LogSink::new();
         Ok(Self {
             bind_address,
             max_message_size,
             callback: Mutex::new(None),
             options: Mutex::new(Options::default()),
             running: Mutex::new(None),
-            stats: Arc::new(ServerStats::default()),
+            stats: Arc::new(ServerStats {
+                log,
+                ..ServerStats::default()
+            }),
             compression: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            log_rx,
         })
     }
 
@@ -349,16 +357,18 @@ impl NativeServer {
             inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
             semaphore: Arc::new(Semaphore::new(permits)),
             active: this.active_connections.clone(),
+            log: this.stats.log.clone(),
         };
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let log = this.stats.log.clone();
         runtime.spawn(async move {
             let signal = async move {
                 let _ = shutdown_rx.wait_for(|stop| *stop).await;
             };
             if let Err(e) = router.serve_with_incoming_shutdown(incoming, signal).await {
-                eprintln!("tonic-rails: server error: {e}");
+                log.log(Level::Error, &format!("server error: {e}"));
             }
             let _ = done_tx.send(());
         });
@@ -472,6 +482,40 @@ impl NativeServer {
         if let Some(rt) = runtime {
             rt.shutdown_background();
         }
+    }
+
+    /// Wait up to `timeout` seconds (GVL released) for transport log
+    /// events and return them as `[[level, message], ...]`, oldest first.
+    /// Returns an empty Array on timeout.
+    pub fn next_log_events(ruby: &Ruby, this: &Self, timeout: f64) -> Result<RArray, Error> {
+        let cancel = Cancel::default();
+        let rx = &this.log_rx;
+        let deadline = Instant::now() + secs(timeout);
+        let first = gvl::without_gvl(&cancel, || {
+            while !cancel.is_cancelled() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                    Ok(event) => return Some(event),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return None,
+                }
+            }
+            None
+        })
+        .flatten();
+
+        let events = ruby.ary_new();
+        for event in first.into_iter().chain(rx.try_iter().take(255)) {
+            events.push((ruby.to_symbol(event.level.as_str()), event.message))?;
+        }
+        if events.is_empty() {
+            // Interrupted: let Ruby run trap handlers / raise before retrying.
+            ruby.thread_check_ints()?;
+        }
+        Ok(events)
     }
 
     pub fn is_running(&self) -> bool {

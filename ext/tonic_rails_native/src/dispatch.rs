@@ -164,6 +164,7 @@ impl DispatchInner {
             response_tx,
             request_rx,
             request_error: request_error.clone(),
+            log: self.stats.log.clone(),
         });
 
         match self.request_tx.try_send(ctx) {

@@ -306,13 +306,36 @@ RSpec.describe "gRPC integration", :integration do
 
   context "with a small dispatch pool" do
     before(:all) do
+      @log = StringIO.new
       @handle = IntegrationServer.start do |config|
         config.dispatch_threads = 1
         config.dispatch_queue_size = 1
+        config.logger = Logger.new(@log)
       end
     end
 
     after(:all) { IntegrationServer.stop(@handle) }
+
+    def wait_for_log(pattern)
+      Timeout.timeout(5) { sleep 0.05 until @log.string.match?(pattern) }
+      @log.string
+    end
+
+    it "logs transport rejections through the configured logger" do
+      unknown = Class.new do
+        include GRPC::GenericService
+
+        self.marshal_class_method = :encode
+        self.unmarshal_class_method = :decode
+        self.service_name = "echo.v1.Missing"
+        rpc :Unary, Echo::V1::EchoRequest, Echo::V1::EchoResponse
+      end
+      client = unknown.rpc_stub_class.new(@handle[:address], :this_channel_is_insecure)
+      expect_status(GRPC::Core::StatusCodes::UNIMPLEMENTED) { client.unary(request.new) }
+
+      expect(wait_for_log(/UNIMPLEMENTED/))
+        .to match(%r{INFO -- : tonic-rails: gRPC /echo\.v1\.Missing/Unary UNIMPLEMENTED in \d+\.\dms: unknown method})
+    end
 
     it "sheds load with RESOURCE_EXHAUSTED when the queue is full" do
       stub = stub_for(@handle)
@@ -326,6 +349,8 @@ RSpec.describe "gRPC integration", :integration do
       end
       results = threads.map(&:value)
       expect(results).to include(:ok, :shed)
+      expect(wait_for_log(/RESOURCE_EXHAUSTED/))
+        .to match(/WARN -- : tonic-rails: gRPC .* RESOURCE_EXHAUSTED .*dispatch queue full/)
     end
   end
 
