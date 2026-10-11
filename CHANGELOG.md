@@ -17,6 +17,10 @@ minor versions may contain breaking changes.
 - `peer` in handlers: the client's address and, with mutual TLS, its
   certificate (`peer.certificate`, an `OpenSSL::X509::Certificate`).
   `Testing.call`/`invoke` accept `peer:`.
+- Test helpers: the `raise_grpc_error(code).with_message(...)` RSpec matcher
+  (`require "tonic/rails/testing/rspec"`) and `assert_grpc_error` for Minitest
+  (`Tonic::Rails::Testing::Assertions`). Both accept `Tonic::Rails::RpcError`
+  and the grpc gem's `GRPC::BadStatus`.
 - App-controlled health: `config.health_check` (polled every
   `health_check_interval` seconds inside the Rails executor) and
   `Tonic::Rails.server.serving!` / `not_serving!` for the whole server or

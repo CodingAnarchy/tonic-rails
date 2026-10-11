@@ -25,7 +25,7 @@ RSpec.describe Tonic::Rails::Router do
 
   it "answers UNIMPLEMENTED for unknown paths" do
     expect { router.dispatch("/nope.Svc/Method", {}, call) }
-      .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:unimplemented) }
+      .to raise_grpc_error(:unimplemented)
   end
 
   it "replaces a service's routes when it is registered again" do

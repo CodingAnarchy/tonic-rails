@@ -49,6 +49,7 @@ Metrics/PerceivedComplexity:
 Metrics/BlockLength:
   Exclude:
     - "lib/puma/plugin/**/*" # Puma::Plugin.create takes the plugin as a block
+    - lib/tonic/rails/testing/rspec.rb # RSpec::Matchers.define takes the matcher as a block
     - "spec/**/*"
     - "*.gemspec"
     - "**/*.rake"
