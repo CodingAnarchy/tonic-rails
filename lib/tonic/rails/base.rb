@@ -111,6 +111,21 @@ module Tonic
       # @return [Hash{String=>String}]
       attr_reader :grpc_metadata
 
+      # Response headers (initial metadata) for this call.  For streaming
+      # responses, set them before the first message; for unary RPCs,
+      # anywhere in the handler.  `-bin` names take binary values.
+      # @return [Hash]
+      def response_metadata
+        @response_metadata ||= {}
+      end
+
+      # Trailing metadata, sent with the final status, whether the call
+      # succeeds or fails.
+      # @return [Hash]
+      def trailing_metadata
+        @trailing_metadata ||= {}
+      end
+
       # Milliseconds left before the client's deadline, or nil if the
       # client did not set one.
       # @return [Integer, nil]
@@ -143,38 +158,51 @@ module Tonic
         raise RpcError.new("method #{rpc_name} not implemented", code: :unimplemented) unless respond_to?(spec[:handler])
 
         @grpc_metadata = metadata
+        @grpc_sender = sender
+        @grpc_headers_sent = false
         @grpc_deadline_at = timeout_ms && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + (timeout_ms / 1000.0))
 
-        request = if spec[:request_stream]
-          Enumerator.new do |y|
-            while (message = read_request(reader, spec))
-              y << message
-            end
-          end
-        else
-          read_request(reader, spec) || raise(RpcError.new("missing request message", code: :invalid_argument))
-        end
-
-        result = public_send(spec[:handler], request)
-
-        if spec[:response_stream]
-          unless result.respond_to?(:each)
-            raise TypeError, "streaming handler #{self.class}##{spec[:handler]} must return an Enumerable, got #{result.class}"
-          end
-
-          result.each { |item| push_response(sender, encode_response(item, spec)) }
-          nil
-        else
-          encode_response(result, spec)
-        end
+        result = public_send(spec[:handler], build_request(reader, spec))
+        respond(result, spec, sender)
       rescue RpcError
         raise
       rescue StandardError => e
         Tonic::Rails.log_exception(e, "#{self.class}##{rpc_name}")
         raise RpcError.new("internal error", code: :internal)
+      ensure
+        attach_trailing_metadata
       end
 
       private
+
+      def build_request(reader, spec)
+        unless spec[:request_stream]
+          return read_request(reader, spec) || raise(RpcError.new("missing request message", code: :invalid_argument))
+        end
+
+        Enumerator.new do |y|
+          while (message = read_request(reader, spec))
+            y << message
+          end
+        end
+      end
+
+      # Unary: the encoded response.  Streaming: nil, after pushing each
+      # message through the sender.
+      def respond(result, spec, sender)
+        unless spec[:response_stream]
+          encoded = encode_response(result, spec)
+          send_response_headers
+          return encoded
+        end
+
+        unless result.respond_to?(:each)
+          raise TypeError, "streaming handler #{self.class}##{spec[:handler]} must return an Enumerable, got #{result.class}"
+        end
+
+        result.each { |item| push_response(sender, encode_response(item, spec)) }
+        nil
+      end
 
       def read_request(reader, spec)
         bytes = reader.next
@@ -205,10 +233,29 @@ module Tonic
       end
 
       def push_response(sender, bytes)
+        send_response_headers
         sender.push(bytes)
       rescue IOError
         # The client went away; nothing left to deliver to.
         raise RpcError.new("client cancelled the stream", code: :cancelled)
+      end
+
+      def send_response_headers
+        return if @grpc_headers_sent
+
+        @grpc_headers_sent = true
+        return if @response_metadata.nil? || @response_metadata.empty? || @grpc_sender.nil?
+
+        @grpc_sender.send_headers(Metadata.encode(@response_metadata))
+      end
+
+      # Runs in `ensure`, so it must never raise over the call's outcome.
+      def attach_trailing_metadata
+        return if @trailing_metadata.nil? || @trailing_metadata.empty? || @grpc_sender.nil?
+
+        @grpc_sender.add_trailers(Metadata.encode(@trailing_metadata))
+      rescue StandardError => e
+        Tonic::Rails.log_exception(e, "#{self.class} trailing metadata")
       end
     end
   end

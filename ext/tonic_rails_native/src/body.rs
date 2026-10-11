@@ -17,7 +17,7 @@ use http_body::{Body, Frame};
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
-use crate::framing::{COMPRESSION_THRESHOLD, frame, status_trailers};
+use crate::framing::{COMPRESSION_THRESHOLD, append_metadata, frame, status_trailers};
 use crate::gvl::StreamMessage;
 use crate::log::{Level, LogSink, status_name};
 
@@ -104,6 +104,8 @@ impl Body for ErrorBody {
 /// channel.  Each `Data` message becomes a gRPC frame; `End` (or the
 /// deadline) produces the trailers.
 pub struct ResponseBody {
+    /// A message already received while waiting for response headers.
+    pub pending: Option<StreamMessage>,
     pub receiver: Option<mpsc::Receiver<StreamMessage>>,
     pub stats: Arc<ServerStats>,
     pub path: String,
@@ -114,18 +116,63 @@ pub struct ResponseBody {
     pub finished: bool,
 }
 
+type Polled = Poll<Option<Result<Frame<Bytes>, Status>>>;
+
 impl ResponseBody {
-    fn finish(
+    fn finish(&mut self, code: Code, message: &str, transport: bool) -> Polled {
+        self.finish_with(code, message, transport, &[])
+    }
+
+    fn finish_with(
         &mut self,
         code: Code,
         message: &str,
         transport: bool,
-    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+        metadata: &[(String, String)],
+    ) -> Polled {
         self.receiver = None;
         self.finished = true;
         self.stats
             .record(&self.path, code as u32, message, self.start, transport);
-        Poll::Ready(Some(Ok(Frame::trailers(status_trailers(code as u32, message)))))
+        let mut trailers = status_trailers(code as u32, message);
+        let skipped = append_metadata(&mut trailers, metadata);
+        if !skipped.is_empty() {
+            self.stats.log.log(
+                Level::Warn,
+                &format!(
+                    "gRPC {} dropped invalid or reserved trailers: {}",
+                    self.path,
+                    skipped.join(", ")
+                ),
+            );
+        }
+        Poll::Ready(Some(Ok(Frame::trailers(trailers))))
+    }
+
+    /// Turn one handler message into a frame (None: nothing to emit).
+    fn handle(&mut self, message: StreamMessage) -> Option<Polled> {
+        match message {
+            StreamMessage::Data(bytes) => {
+                if bytes.len() > self.max_message_size {
+                    return Some(self.finish(
+                        Code::ResourceExhausted,
+                        "response message exceeds max_message_size",
+                        true,
+                    ));
+                }
+                let compress = self.compress && bytes.len() > COMPRESSION_THRESHOLD;
+                Some(Poll::Ready(Some(Ok(Frame::data(frame(&bytes, compress))))))
+            }
+            StreamMessage::End { status, trailers } => Some(match status {
+                None => self.finish_with(Code::Ok, "", false, &trailers),
+                Some((code, message)) => {
+                    self.finish_with(Code::from_i32(code as i32), &message, false, &trailers)
+                }
+            }),
+            // Headers are only valid first and are consumed by the
+            // dispatcher; a late one has nowhere to go.
+            StreamMessage::Headers(_) => None,
+        }
     }
 }
 
@@ -133,36 +180,30 @@ impl Body for ResponseBody {
     type Data = Bytes;
     type Error = Status;
 
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
-        let Some(receiver) = self.receiver.as_mut() else {
-            return Poll::Ready(None);
-        };
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Polled {
+        if let Some(message) = self.pending.take()
+            && let Some(poll) = self.handle(message)
+        {
+            return poll;
+        }
 
         // Drain ready messages before checking the deadline so a response
         // that made it in time is never discarded.
-        match receiver.poll_recv(cx) {
-            Poll::Ready(Some(StreamMessage::Data(bytes))) => {
-                if bytes.len() > self.max_message_size {
-                    return self.finish(
-                        Code::ResourceExhausted,
-                        "response message exceeds max_message_size",
-                        true,
-                    );
+        loop {
+            let Some(receiver) = self.receiver.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match receiver.poll_recv(cx) {
+                Poll::Ready(Some(message)) => {
+                    if let Some(poll) = self.handle(message) {
+                        return poll;
+                    }
                 }
-                let compress = self.compress && bytes.len() > COMPRESSION_THRESHOLD;
-                return Poll::Ready(Some(Ok(Frame::data(frame(&bytes, compress)))));
+                Poll::Ready(None) => {
+                    return self.finish(Code::Internal, "handler ended without a response", true);
+                }
+                Poll::Pending => break,
             }
-            Poll::Ready(Some(StreamMessage::End(None))) => return self.finish(Code::Ok, "", false),
-            Poll::Ready(Some(StreamMessage::End(Some((code, message))))) => {
-                return self.finish(Code::from_i32(code as i32), &message, false);
-            }
-            Poll::Ready(None) => {
-                return self.finish(Code::Internal, "handler ended without a response", true);
-            }
-            Poll::Pending => {}
         }
 
         if let Some(deadline) = self.deadline.as_mut()
@@ -202,6 +243,7 @@ mod tests {
 
     fn response_body(rx: mpsc::Receiver<StreamMessage>, stats: Arc<ServerStats>) -> ResponseBody {
         ResponseBody {
+            pending: None,
             receiver: Some(rx),
             stats,
             path: "/test.Svc/Method".into(),
@@ -236,7 +278,11 @@ mod tests {
         let stats = Arc::new(ServerStats::default());
         let mut body = response_body(rx, stats.clone());
         tx.try_send(StreamMessage::Data(b"abc".to_vec())).ok();
-        tx.try_send(StreamMessage::End(None)).ok();
+        tx.try_send(StreamMessage::End {
+            status: None,
+            trailers: vec![("x-done".into(), "yes".into())],
+        })
+        .ok();
 
         match poll(&mut body) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -247,7 +293,9 @@ mod tests {
             }
             _ => panic!("expected data"),
         }
-        assert_eq!(trailers(poll(&mut body))["grpc-status"], "0");
+        let t = trailers(poll(&mut body));
+        assert_eq!(t["grpc-status"], "0");
+        assert_eq!(t["x-done"], "yes");
         assert!(matches!(poll(&mut body), Poll::Ready(None)));
         drop(body);
         assert_eq!(stats.successful.load(Ordering::Relaxed), 1);
@@ -268,10 +316,21 @@ mod tests {
     fn response_body_reports_handler_error() {
         let (tx, rx) = mpsc::channel(4);
         let mut body = response_body(rx, Arc::new(ServerStats::default()));
-        tx.try_send(StreamMessage::End(Some((7, "denied".into())))).ok();
+        tx.try_send(StreamMessage::error(Code::PermissionDenied, "denied"))
+            .ok();
         let t = trailers(poll(&mut body));
         assert_eq!(t["grpc-status"], "7");
         assert_eq!(t["grpc-message"], "denied");
+    }
+
+    #[test]
+    fn response_body_starts_with_a_pending_message() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut body = response_body(rx, Arc::new(ServerStats::default()));
+        body.pending = Some(StreamMessage::Data(b"x".to_vec()));
+        tx.try_send(StreamMessage::error(Code::Aborted, "stop")).ok();
+        assert!(matches!(poll(&mut body), Poll::Ready(Some(Ok(f))) if f.is_data()));
+        assert_eq!(trailers(poll(&mut body))["grpc-status"], "10");
     }
 
     #[test]

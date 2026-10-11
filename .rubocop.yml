@@ -36,6 +36,8 @@ Metrics/AbcSize:
   Max: 40
 Metrics/ClassLength:
   Max: 250
+Metrics/ModuleLength:
+  Max: 150
 Metrics/CyclomaticComplexity:
   Max: 15
 Metrics/MethodLength:

@@ -190,6 +190,35 @@ pub fn sanitize_for_log(message: &str) -> String {
         .collect()
 }
 
+/// Headers a handler may not set: they belong to HTTP/2 or the gRPC
+/// protocol itself.
+fn is_reserved_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "content-type" | "te" | "user-agent" | "content-length" | "connection" | "transfer-encoding"
+    ) || (name.starts_with("grpc-") && name != "grpc-status-details-bin")
+}
+
+/// Append handler-supplied metadata to `headers`, skipping names or values
+/// that are invalid HTTP/2 headers or reserved by gRPC.  Returns the names
+/// that were skipped so the caller can report them.
+pub fn append_metadata(headers: &mut HeaderMap, metadata: &[(String, String)]) -> Vec<String> {
+    let mut skipped = Vec::new();
+    for (name, value) in metadata {
+        let header = (!is_reserved_metadata(name))
+            .then(|| http::HeaderName::from_bytes(name.as_bytes()).ok())
+            .flatten()
+            .filter(|n| n.as_str() == name.as_str()); // must already be lower-case
+        match (header, HeaderValue::from_str(value)) {
+            (Some(header), Ok(value)) => {
+                headers.append(header, value);
+            }
+            _ => skipped.push(name.clone()),
+        }
+    }
+    skipped
+}
+
 pub fn status_trailers(code: u32, message: &str) -> HeaderMap {
     let mut trailers = HeaderMap::with_capacity(2);
     trailers.insert("grpc-status", HeaderValue::from(code));
@@ -340,6 +369,27 @@ mod tests {
         let t = status_trailers(0, "");
         assert_eq!(t["grpc-status"], "0");
         assert!(t.get("grpc-message").is_none());
+    }
+
+    #[test]
+    fn append_metadata_skips_reserved_and_invalid() {
+        let mut headers = HeaderMap::new();
+        let skipped = append_metadata(
+            &mut headers,
+            &[
+                ("x-request-id".into(), "abc".into()),
+                ("x-trace-bin".into(), "AAE=".into()),
+                ("grpc-status-details-bin".into(), "CAU=".into()),
+                ("grpc-status".into(), "0".into()),
+                ("content-type".into(), "text/plain".into()),
+                ("Upper".into(), "x".into()),
+                ("x-bad".into(), "line\nbreak".into()),
+            ],
+        );
+        assert_eq!(headers["x-request-id"], "abc");
+        assert_eq!(headers["x-trace-bin"], "AAE=");
+        assert_eq!(headers["grpc-status-details-bin"], "CAU=");
+        assert_eq!(skipped, ["grpc-status", "content-type", "Upper", "x-bad"]);
     }
 
     #[test]

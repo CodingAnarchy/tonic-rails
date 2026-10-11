@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::log::{Level, LogSink};
-use magnus::{Error, RString, Ruby, Value, prelude::*, typed_data::DataTypeFunctions, value::Opaque};
+use magnus::{
+    Error, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach, typed_data::DataTypeFunctions,
+    value::Opaque,
+};
 use parking_lot::Mutex;
 use rb_sys::{RB_NOGVL_INTR_FAIL, rb_nogvl, rb_thread_call_with_gvl};
 use tokio::sync::{Notify, mpsc};
@@ -194,34 +197,90 @@ pub fn send_with_interrupts<T>(ruby: &Ruby, tx: &mpsc::Sender<T>, mut msg: T) ->
 
 // ─── Response stream ──────────────────────────────────────────────
 
+/// gRPC metadata as (lower-case name, value) pairs; `-bin` values are
+/// already base64-encoded.
+pub type Metadata = Vec<(String, String)>;
+
 /// Messages from the Ruby handler to the tokio response body.
 pub enum StreamMessage {
+    /// Response headers (initial metadata).  Only ever the first message.
+    Headers(Metadata),
     /// One encoded protobuf response message.
     Data(Vec<u8>),
-    /// End of stream: `None` = OK, `Some((code, message))` = error.
-    End(Option<(u32, String)>),
+    /// End of stream: `status` None = OK, `Some((code, message))` = error,
+    /// plus trailing metadata.
+    End {
+        status: Option<(u32, String)>,
+        trailers: Metadata,
+    },
+}
+
+impl StreamMessage {
+    pub fn error(code: tonic::Code, message: &str) -> Self {
+        StreamMessage::End {
+            status: Some((code as u32, message.to_owned())),
+            trailers: Vec::new(),
+        }
+    }
+}
+
+/// Convert a Ruby Hash of String => String into metadata pairs.
+fn metadata_from_hash(hash: RHash) -> Result<Metadata, Error> {
+    let mut pairs = Vec::with_capacity(hash.len());
+    hash.foreach(|name: String, value: String| {
+        pairs.push((name, value));
+        Ok(ForEach::Continue)
+    })?;
+    Ok(pairs)
 }
 
 /// `TonicRails::Native::StreamSender` — pushes encoded response messages
-/// to the client with backpressure.
+/// (and response metadata) to the client with backpressure.
 #[derive(magnus::TypedData)]
 #[magnus(class = "TonicRails::Native::StreamSender", free_immediately)]
 pub struct StreamSender {
     tx: mpsc::Sender<StreamMessage>,
+    trailers: Arc<Mutex<Metadata>>,
+    started: AtomicBool,
 }
 
 impl StreamSender {
+    fn closed(ruby: &Ruby) -> Error {
+        Error::new(ruby.exception_io_error(), "response stream closed by peer")
+    }
+
     /// Raises `IOError` if the client has gone away.
     pub fn push(ruby: &Ruby, this: &Self, data: RString) -> Result<(), Error> {
+        this.started.store(true, Ordering::Release);
         let bytes = unsafe { data.as_slice() }.to_vec();
         if send_with_interrupts(ruby, &this.tx, StreamMessage::Data(bytes))? {
             Ok(())
         } else {
-            Err(Error::new(
-                ruby.exception_io_error(),
-                "response stream closed by peer",
-            ))
+            Err(Self::closed(ruby))
         }
+    }
+
+    /// Send response headers.  Must come before any message.
+    pub fn send_headers(ruby: &Ruby, this: &Self, headers: RHash) -> Result<(), Error> {
+        if this.started.swap(true, Ordering::AcqRel) {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "response headers must be sent before any response message",
+            ));
+        }
+        let headers = metadata_from_hash(headers)?;
+        if send_with_interrupts(ruby, &this.tx, StreamMessage::Headers(headers))? {
+            Ok(())
+        } else {
+            Err(Self::closed(ruby))
+        }
+    }
+
+    /// Add trailing metadata, sent with the final status.
+    pub fn add_trailers(&self, trailers: RHash) -> Result<(), Error> {
+        let trailers = metadata_from_hash(trailers)?;
+        self.trailers.lock().extend(trailers);
+        Ok(())
     }
 }
 
@@ -367,10 +426,7 @@ fn run_guarded(ctx: DispatchContext) {
             .or_else(|| panic.downcast_ref::<&str>().copied())
             .unwrap_or("unknown panic");
         log.log(Level::Error, &format!("panic in dispatch: {msg}"));
-        let _ = response_tx.try_send(StreamMessage::End(Some((
-            tonic::Code::Internal as u32,
-            "internal error".into(),
-        ))));
+        let _ = response_tx.try_send(StreamMessage::error(tonic::Code::Internal, "internal error"));
     }
 }
 
@@ -387,7 +443,8 @@ fn run_handler(ctx: DispatchContext) {
         log,
     } = ctx;
 
-    let end = match call_handler(
+    let trailers = Arc::new(Mutex::new(Metadata::new()));
+    let result = call_handler(
         &ruby,
         callback,
         &path,
@@ -396,9 +453,11 @@ fn run_handler(ctx: DispatchContext) {
         &response_tx,
         request_rx,
         request_error,
-    ) {
-        Ok(()) => StreamMessage::End(None),
-        Err(e) => StreamMessage::End(Some(error_status(&e, &log))),
+        trailers.clone(),
+    );
+    let end = StreamMessage::End {
+        status: result.err().map(|e| error_status(&e, &log)),
+        trailers: std::mem::take(&mut *trailers.lock()),
     };
     // Ignore failures: the client may already be gone.
     let _ = send_with_interrupts(&ruby, &response_tx, end);
@@ -414,6 +473,7 @@ fn call_handler(
     response_tx: &mpsc::Sender<StreamMessage>,
     request_rx: mpsc::Receiver<Vec<u8>>,
     request_error: Arc<RequestError>,
+    trailers: Arc<Mutex<Metadata>>,
 ) -> Result<(), Error> {
     let md = ruby.hash_new_capa(metadata.len());
     for (k, v) in metadata {
@@ -429,6 +489,8 @@ fn call_handler(
         ruby.to_symbol("sender"),
         StreamSender {
             tx: response_tx.clone(),
+            trailers,
+            started: AtomicBool::new(false),
         },
     )?;
     if let Some(ms) = timeout_ms {
