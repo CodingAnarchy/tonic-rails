@@ -7,6 +7,13 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- gRPC-Web: `config.grpc_web = true` serves browser clients (unary and
+  server-streaming RPCs, binary and text encodings) without a proxy, on the
+  same port as native gRPC, with CORS via `grpc_web_origins`,
+  `grpc_web_allowed_headers` and `grpc_web_exposed_headers`. Closes #22.
+
 ## [0.3.0] - 2026-10-11
 
 ### Added

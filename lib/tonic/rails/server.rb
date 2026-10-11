@@ -130,19 +130,30 @@ module Tonic
         native = TonicRails::Native::Server.new(config.bind_address, config.max_message_size)
         native.on_request(build_callback)
         native.set_routes(@router.paths)
-        if config.tls?
-          native.set_tls(config.tls_cert_path, config.tls_key_path)
-          native.set_tls_client_ca(config.tls_client_ca_path) if config.tls_client_ca_path
-        end
+        apply_connection_settings(native, config)
+        apply_features(native, config)
+        native
+      end
+
+      def apply_connection_settings(native, config)
         native.set_max_connections(config.max_connections)
         native.set_concurrency_limit_per_connection(config.concurrency_limit_per_connection)
         native.set_worker_threads(config.worker_threads || 0)
         native.set_keepalive(config.keepalive_interval.to_f, config.keepalive_timeout.to_f)
         native.set_dispatch_queue_size(config.dispatch_queue_size)
+      end
+
+      def apply_features(native, config)
+        if config.tls?
+          native.set_tls(config.tls_cert_path, config.tls_key_path)
+          native.set_tls_client_ca(config.tls_client_ca_path) if config.tls_client_ca_path
+        end
         native.set_compression(config.compression ? true : false)
         native.set_reflection(config.reflection ? true : false)
         native.set_reflection_descriptors(Reflection.file_descriptors(@router.service_names)) if config.reflection
-        native
+        return unless config.grpc_web
+
+        native.set_grpc_web(config.grpc_web_origins, config.grpc_web_allowed_headers, config.grpc_web_exposed_headers)
       end
 
       # The proc the transport calls for every RPC:
@@ -273,6 +284,16 @@ module Tonic
         logger&.info("tonic-rails: stopped")
       end
 
+      def log_grpc_web(logger, config)
+        return unless config.grpc_web
+
+        origins = config.grpc_web_origins
+        logger.info("tonic-rails: gRPC-Web enabled (#{origins.empty? ? 'same-origin only' : "origins: #{origins.join(', ')}"})")
+        return unless origins.include?("*")
+
+        logger.warn("tonic-rails: gRPC-Web allows any origin; any website can call these services from a visitor's browser")
+      end
+
       def log_startup
         config = @configuration
         logger = config.logger
@@ -284,6 +305,7 @@ module Tonic
           logger.warn("tonic-rails: TLS is not configured; gRPC traffic is plaintext")
         end
         logger.info("tonic-rails: reflection enabled") if config.reflection
+        log_grpc_web(logger, config)
         logger.info(
           "tonic-rails: serving #{@router.service_names.join(', ')} on #{config.bind_address} " \
           "(#{config.dispatch_threads} dispatch threads)",

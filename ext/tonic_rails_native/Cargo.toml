@@ -28,6 +28,8 @@ rb-sys = "0.9"
 tonic = { version = "0.14", default-features = false, features = ["transport", "router", "server", "tls-ring"] }
 tonic-reflection = { version = "0.14", default-features = false, features = ["server"] }
 tonic-health = { version = "0.14", default-features = false }
+tonic-web = { version = "0.14", default-features = false }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 axum = { version = "0.8", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

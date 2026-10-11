@@ -64,6 +64,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     class.define_method("set_compression", method!(NativeServer::set_compression, 1))?;
     class.define_method("set_reflection", method!(NativeServer::set_reflection, 1))?;
+    class.define_method("set_grpc_web", method!(NativeServer::set_grpc_web, 3))?;
     class.define_method("set_routes", method!(NativeServer::set_routes, 1))?;
     class.define_method(
         "set_reflection_descriptors",

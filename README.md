@@ -363,6 +363,44 @@ Tonic::Rails.configure do |config|
 end
 ```
 
+## Browser clients (gRPC-Web)
+
+Browsers can't speak native gRPC, but they can speak
+[gRPC-Web](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md).
+Turn it on and your existing handlers serve web frontends directly, with
+no Envoy or other proxy:
+
+```ruby
+Tonic::Rails.configure do |config|
+  config.grpc_web = true
+  config.grpc_web_origins = ["https://app.example.com"]   # CORS; omit for same-origin only
+  config.grpc_web_exposed_headers = %w[x-request-id]     # response metadata browsers may read
+end
+```
+
+Then call it from the browser with any gRPC-Web client, for example
+[Connect](https://connectrpc.com/docs/web/using-clients):
+
+```ts
+import { createClient } from "@connectrpc/connect";
+import { createGrpcWebTransport } from "@connectrpc/connect-web";
+import { ItemService } from "./gen/demo/v1/items_pb";
+
+const client = createClient(ItemService, createGrpcWebTransport({ baseUrl: "https://api.example.com" }));
+const item = await client.getItem({ id: 1n });
+```
+
+- Unary and server-streaming RPCs work; browsers can't do client or
+  bidirectional streaming.
+- Errors, response headers and trailers reach the browser as usual.
+- Native gRPC clients keep working on the same port. Enabling gRPC-Web
+  also accepts HTTP/1.1, which browsers use without TLS; over HTTPS they
+  negotiate HTTP/2.
+- `grpc_web_origins` sets CORS: listed origins may call with credentials
+  (cookies); `"*"` allows any origin without credentials (logged as a
+  warning). `grpc_web_allowed_headers` adds request headers beyond the
+  standard ones (`authorization` is already allowed).
+
 ## Testing handlers
 
 `Tonic::Rails::Testing` calls a handler in-process, with real protobuf
@@ -441,6 +479,9 @@ end
 | `tls_client_ca_path` | `nil` | PEM CA bundle; requires client certificates (mutual TLS) |
 | `drain_timeout` | `10` | Seconds to let in-flight calls finish on shutdown |
 | `keepalive_interval`, `keepalive_timeout` | `15`, `5` | HTTP/2 PING interval and timeout, seconds |
+| `grpc_web` | `false` | Serve gRPC-Web for browser clients (see [Browser clients](#browser-clients-grpc-web)) |
+| `grpc_web_origins` | `[]` | Browser origins allowed via CORS; `"*"` for any (no credentials) |
+| `grpc_web_allowed_headers`, `grpc_web_exposed_headers` | `[]` | Extra CORS request / response headers |
 | `health_check` | `nil` | Callable; while false or raising, health reports `NOT_SERVING` |
 | `health_check_interval` | `5` | Seconds between health checks |
 | `compression` | `false` | gzip responses over 1 KiB for clients that accept it |

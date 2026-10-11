@@ -66,6 +66,25 @@ module Tonic
       # API schema; keep it off in production.  Default false.
       attr_accessor :reflection
 
+      # Accept gRPC-Web requests, so browser apps can call services
+      # directly (unary and server-streaming RPCs).  Also enables HTTP/1.1,
+      # which browsers use when there's no TLS.  Default false.
+      attr_accessor :grpc_web
+
+      # Browser origins allowed to call gRPC-Web services (CORS), e.g.
+      # ["https://app.example.com"].  Empty = same-origin only.  "*" allows
+      # any origin, without credentials (cookies).  Default [].
+      attr_accessor :grpc_web_origins
+
+      # Extra request headers browsers may send (beyond content-type,
+      # x-grpc-web, x-user-agent, grpc-timeout and authorization).
+      attr_accessor :grpc_web_allowed_headers
+
+      # Extra response headers browsers may read, e.g. custom response
+      # metadata (grpc-status, grpc-message and grpc-status-details-bin are
+      # always exposed).
+      attr_accessor :grpc_web_exposed_headers
+
       # HTTP/2 PING interval and ack timeout, in seconds.  Defaults 15 / 5.
       attr_accessor :keepalive_interval, :keepalive_timeout
 
@@ -105,6 +124,10 @@ module Tonic
         @keepalive_interval = 15
         @keepalive_timeout = 5
         @reload_handlers = false
+        @grpc_web = false
+        @grpc_web_origins = []
+        @grpc_web_allowed_headers = []
+        @grpc_web_exposed_headers = []
         @health_check = nil
         @health_check_interval = 5
       end
@@ -128,11 +151,21 @@ module Tonic
         raise ArgumentError, "tls_client_ca_path requires tls_cert_path and tls_key_path" if tls_client_ca_path && !tls?
 
         validate_callables!
+        validate_grpc_web!
 
         self
       end
 
       private
+
+      def validate_grpc_web!
+        %i[grpc_web_origins grpc_web_allowed_headers grpc_web_exposed_headers].each do |name|
+          value = public_send(name)
+          next if value.is_a?(Array) && value.all?(String)
+
+          raise ArgumentError, "#{name} must be an Array of Strings, got #{value.inspect}"
+        end
+      end
 
       def validate_callables!
         raise ArgumentError, "health_check must respond to #call" if health_check && !health_check.respond_to?(:call)
