@@ -100,6 +100,11 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+      # Latest patched Go, so standard-library advisories reflect a current toolchain.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
       - name: govulncheck (benchmark client)
         working-directory: bench/go_bench
         run: |
