@@ -15,6 +15,7 @@ concurrency:
 
 env:
   GRPCURL_VERSION: v1.9.3
+  PROTOC_VERSION: "32.1"
 
 jobs:
   lint:
@@ -61,6 +62,18 @@ jobs:
         run: |
           go install "github.com/fullstorydev/grpcurl/cmd/grpcurl@${GRPCURL_VERSION}"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install protoc (generator specs)
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              # Ubuntu's package is protoc 3.21, too old for google-protobuf 4.
+              curl -fsSL -o "$RUNNER_TEMP/protoc.zip" \
+                "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+              sudo unzip -q -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+              ;;
+            macOS) brew install protobuf ;;
+            *) echo "skipping on $RUNNER_OS; the generator specs that need protoc will be skipped" ;;
+          esac
       - name: Compile native extension
         run: bundle exec rake compile
       - name: Rust unit tests

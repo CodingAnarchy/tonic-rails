@@ -1,0 +1,14 @@
+# frozen_string_literal: true
+
+require "test_helper"
+require "tonic/rails/testing/minitest"
+
+class <%= service_class %>Test < ActiveSupport::TestCase
+  include Tonic::Rails::Testing::Assertions
+<% rpc_specs.each do |rpc| %>
+  test "<%= rpc[:name] %> is not implemented yet" do
+    request = <%= %w[client bidi].include?(rpc[:kind]) ? "[#{ruby_module}::#{rpc[:name]}Request.new]" : "#{ruby_module}::#{rpc[:name]}Request.new" %>
+    assert_grpc_error(:unimplemented) { Tonic::Rails::Testing.call(<%= service_class %>, :<%= rpc[:name] %>, request) }
+  end
+<% end -%>
+end

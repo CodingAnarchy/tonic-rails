@@ -1,0 +1,38 @@
+# frozen_string_literal: true
+
+require "<%= package_path %>/<%= service_file %>_service_pb"
+
+class <%= service_class %>
+  include Tonic::Rails::Base
+
+  rpc_service "<%= full_service_name %>"
+  request_format :message
+<% rpc_specs.each do |rpc| %>
+<% case rpc[:kind] -%>
+<% when "unary" -%>
+  # @param request [<%= ruby_module %>::<%= rpc[:name] %>Request]
+  # @return [<%= ruby_module %>::<%= rpc[:name] %>Response]
+  def <%= rpc[:method] %>(request)
+    raise Tonic::Rails::RpcError.new("<%= rpc[:name] %> is not implemented yet", code: :unimplemented)
+  end
+<% when "server" -%>
+  # @param request [<%= ruby_module %>::<%= rpc[:name] %>Request]
+  # @return [Enumerable<<%= ruby_module %>::<%= rpc[:name] %>Response>] each element is streamed as it's produced
+  def <%= rpc[:method] %>(request)
+    raise Tonic::Rails::RpcError.new("<%= rpc[:name] %> is not implemented yet", code: :unimplemented)
+  end
+<% when "client" -%>
+  # @param requests [Enumerator<<%= ruby_module %>::<%= rpc[:name] %>Request>] yields messages as they arrive
+  # @return [<%= ruby_module %>::<%= rpc[:name] %>Response]
+  def <%= rpc[:method] %>(requests)
+    raise Tonic::Rails::RpcError.new("<%= rpc[:name] %> is not implemented yet", code: :unimplemented)
+  end
+<% else -%>
+  # @param requests [Enumerator<<%= ruby_module %>::<%= rpc[:name] %>Request>] yields messages as they arrive
+  # @return [Enumerable<<%= ruby_module %>::<%= rpc[:name] %>Response>]
+  def <%= rpc[:method] %>(requests)
+    raise Tonic::Rails::RpcError.new("<%= rpc[:name] %> is not implemented yet", code: :unimplemented)
+  end
+<% end -%>
+<% end -%>
+end

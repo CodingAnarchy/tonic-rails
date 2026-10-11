@@ -1,0 +1,21 @@
+# frozen_string_literal: true
+
+# Ruby code generated from app/protos by `bin/rails tonic_rails:compile_protos`
+# lives in lib/grpc. Its files require each other by plain name, so put the
+# directory on the load path and keep Zeitwerk away from it.
+Rails.root.join("lib/grpc").then do |generated|
+  $LOAD_PATH.unshift(generated.to_s) unless $LOAD_PATH.include?(generated.to_s)
+  Rails.autoloaders.main.ignore(generated)
+end
+
+Tonic::Rails.configure do |config|
+  # config.bind_address = "0.0.0.0:50051"
+  # config.dispatch_threads = ENV.fetch("RAILS_MAX_THREADS", 5).to_i
+  # config.reflection = Rails.env.development?
+  # config.health_check = -> { ActiveRecord::Base.connection.active? }
+end
+
+# Handlers in app/grpc are autoloaded; register them here so they're
+# picked up again after code reloads.
+Rails.application.config.to_prepare do
+end

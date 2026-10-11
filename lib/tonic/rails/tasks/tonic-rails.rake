@@ -27,7 +27,19 @@ namespace :tonic_rails do
     ruby_out = ENV.fetch("RUBY_OUT", "lib/grpc")
     protos = Dir.glob(File.join(proto_dir, "**", "*.proto"))
     abort "No .proto files found in #{proto_dir}/" if protos.empty?
-    abort "protoc not found on PATH. Install the Protocol Buffers compiler." unless system("protoc", "--version", out: File::NULL)
+    version = begin
+      IO.popen(%w[protoc --version], err: File::NULL, &:read)[/\d+(\.\d+)+/]
+    rescue SystemCallError
+      nil
+    end
+    abort "protoc not found on PATH. Install the Protocol Buffers compiler (22.0 or newer)." unless version
+    # protoc before 22 emits the Ruby DSL that google-protobuf 4 removed
+    # (`undefined method 'build' for DescriptorPool` at load time).
+    major = version.split(".").then { |parts| parts.first == "3" ? parts[1].to_i : parts.first.to_i }
+    if major < 22
+      abort "protoc #{version} is too old for google-protobuf 4: install protoc 22.0 or newer " \
+            "(distribution packages are often older; see https://github.com/protocolbuffers/protobuf/releases)."
+    end
 
     FileUtils.mkdir_p(ruby_out)
     sh "protoc", "--ruby_out=#{ruby_out}", "-I#{proto_dir}", *protos

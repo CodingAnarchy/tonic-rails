@@ -60,9 +60,30 @@ On platforms without a precompiled gem, installation builds the
 extension from source, which needs a [Rust toolchain](https://rustup.rs).
 
 To generate Ruby classes from your `.proto` files you also need `protoc`
-(the Protocol Buffers compiler) during development.
+(the Protocol Buffers compiler) **22.0 or newer** during development.
+Older versions, such as Ubuntu's `protobuf-compiler` package (3.21),
+generate code that google-protobuf 4 can't load; install a current
+release from the [protobuf releases page](https://github.com/protocolbuffers/protobuf/releases)
+or Homebrew.
 
 ## Quick start
+
+The generators set everything up:
+
+```sh
+bin/rails generate tonic_rails:install
+bin/rails generate tonic_rails:service Item GetItem ListItems:server
+bin/rails tonic_rails:compile_protos
+```
+
+`install` adds `config/initializers/tonic_rails.rb` (load path for
+generated code, configuration, handler registration), `app/protos/`,
+`lib/grpc/`, and the Puma plugin. `service` writes the `.proto`, a handler
+in `app/grpc/` with a stub per RPC, its registration, and a spec (or
+Minitest test). RPCs take an optional `:server`, `:client` or `:bidi`
+streaming kind.
+
+The rest of this section shows the same steps by hand.
 
 ### 1. Define the service
 
