@@ -9,7 +9,8 @@ require "puma/plugin"
 #
 # The gRPC server runs as one child process of the Puma master, in single
 # and cluster mode alike, so it has its own GVL and never competes with web
-# workers.  It starts once Puma has booted, drains gracefully when Puma
+# workers.  With `config.processes > 1`, that child supervises the gRPC
+# worker processes.  It starts once Puma has booted, drains gracefully when Puma
 # stops or restarts, stops itself if Puma goes away, and if it dies
 # unexpectedly Puma shuts down too, so a supervisor can restart both.
 Puma::Plugin.create do
@@ -62,7 +63,8 @@ Puma::Plugin.create do
   end
 
   # Puma fires its stop hooks from its TERM trap handler, so this must
-  # not block indefinitely: allow the server's drain timeout plus a margin,
+  # not block indefinitely: allow the server's drain timeout plus a margin
+  # (longer than the one a multi-process server gives its own workers),
   # then kill it.
   def stop_grpc
     pid = @grpc_pid
@@ -87,7 +89,7 @@ Puma::Plugin.create do
 
   def stop_timeout
     drain = defined?(Tonic::Rails) ? Tonic::Rails.configuration.drain_timeout.to_f : 10.0
-    drain + 5
+    drain + 10
   end
 
   def monitor_grpc

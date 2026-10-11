@@ -1,8 +1,8 @@
 // Load generator for bench.v1.BenchService.
 //
-// gRPC mode uses one persistent HTTP/2 connection shared by -concurrency
-// goroutines, so results reflect server throughput rather than connection
-// setup.  HTTP mode (-protocol http) sends the same unary requests as JSON
+// gRPC mode uses persistent HTTP/2 connections (one by default; see
+// -connections) shared by -concurrency goroutines, so results reflect
+// server throughput rather than connection setup.  HTTP mode (-protocol http) sends the same unary requests as JSON
 // POSTs to /bench.v1.BenchService/<Method> over keep-alive HTTP/1.1
 // connections, for comparing against a plain Rails JSON API.
 //
@@ -25,6 +25,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -107,6 +108,7 @@ func main() {
 	total := flag.Int("total", 5000, "total requests")
 	warmup := flag.Int("warmup", 200, "unmeasured warm-up requests")
 	protocol := flag.String("protocol", "grpc", "grpc, or http for JSON POSTs (unary scenarios only)")
+	connections := flag.Int("connections", 1, "gRPC connections, used round-robin (a multi-process server spreads connections, not requests)")
 	list := flag.Bool("list", false, "list scenarios and exit")
 	flag.Parse()
 
@@ -130,13 +132,19 @@ func main() {
 	var call func(context.Context) error
 	switch *protocol {
 	case "grpc":
-		conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Fatalf("connect: %v", err)
+		clients := make([]pb.BenchServiceClient, *connections)
+		for i := range clients {
+			conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Fatalf("connect: %v", err)
+			}
+			defer conn.Close()
+			clients[i] = pb.NewBenchServiceClient(conn)
 		}
-		defer conn.Close()
-		client := pb.NewBenchServiceClient(conn)
-		call = func(ctx context.Context) error { return sc.call(ctx, client) }
+		var next atomic.Uint64
+		call = func(ctx context.Context) error {
+			return sc.call(ctx, clients[next.Add(1)%uint64(len(clients))])
+		}
 	case "http":
 		if sc.method == "" {
 			log.Fatalf("scenario %q is gRPC-only", *name)

@@ -7,6 +7,7 @@
 # Environment:
 #   BIND             address to listen on (default 127.0.0.1:50051)
 #   DISPATCH_THREADS Ruby dispatch threads (default 16)
+#   PROCESSES        server processes (default 1)
 #   WITH_RAILS=1     boot bench/rails_app.rb first, so RPCs run inside the
 #                    Rails executor as in a real Rails app
 #
@@ -52,6 +53,7 @@ if $PROGRAM_NAME == __FILE__
   Tonic::Rails.configure do |config|
     config.bind_address = ENV.fetch("BIND", "127.0.0.1:50051")
     config.dispatch_threads = Integer(ENV.fetch("DISPATCH_THREADS", "16"))
+    config.processes = Integer(ENV.fetch("PROCESSES", "1"))
     config.dispatch_queue_size = 1024
     config.max_connections = 0
     config.concurrency_limit_per_connection = 0

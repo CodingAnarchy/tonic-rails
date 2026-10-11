@@ -36,7 +36,7 @@ use crate::body::ServerStats;
 use crate::dispatch::{DispatchInner, DispatchService};
 use crate::gvl::{self, Cancel, DispatchContext};
 use crate::log::{Level, LogEvent, LogSink};
-use crate::net::{LimitedIncoming, bind};
+use crate::net::{LimitedIncoming, bind, listen, listen_inherited};
 
 /// The overall-server health entry (empty service name).
 const OVERALL: &str = "";
@@ -54,6 +54,8 @@ struct Options {
     dispatch_queue_size: usize,
     routes: Vec<String>,
     descriptors: Vec<Vec<u8>>,
+    /// Accept on this inherited listening socket instead of binding.
+    listener_fd: Option<i32>,
 }
 
 impl Default for Options {
@@ -71,6 +73,7 @@ impl Default for Options {
             dispatch_queue_size: 128,
             routes: Vec::new(),
             descriptors: Vec::new(),
+            listener_fd: None,
         }
     }
 }
@@ -191,6 +194,29 @@ fn read_file(ruby: &Ruby, what: &str, path: &str) -> Result<Vec<u8>, Error> {
     std::fs::read(path).map_err(|e| runtime_error(ruby, format!("cannot read TLS {what} {path}: {e}")))
 }
 
+/// `TonicRails::Native.bind_listener(address)`: bind and listen the way
+/// the server does, returning the socket's fd for worker processes to
+/// inherit and accept on (`Server#set_listener_fd`).  The caller owns it.
+#[cfg(unix)]
+pub fn bind_listener(ruby: &Ruby, address: String) -> Result<i32, Error> {
+    use std::os::fd::IntoRawFd;
+
+    let addr: SocketAddr = address
+        .parse()
+        .map_err(|e| arg_error(ruby, format!("invalid bind address {address:?}: {e}")))?;
+    let listener =
+        bind(addr, 1024).map_err(|e| runtime_error(ruby, format!("failed to bind {addr}: {e}")))?;
+    Ok(listener.into_raw_fd())
+}
+
+#[cfg(not(unix))]
+pub fn bind_listener(ruby: &Ruby, _address: String) -> Result<i32, Error> {
+    Err(Error::new(
+        ruby.exception_not_imp_error(),
+        "multi-process mode needs fork(), which this platform lacks",
+    ))
+}
+
 fn secs(value: f64) -> Duration {
     Duration::from_secs_f64(value.max(0.0))
 }
@@ -292,6 +318,12 @@ impl NativeServer {
         self.options.lock().reflection = enabled;
     }
 
+    /// Accept on a listening socket bound by a parent process (see
+    /// `bind_listener`) instead of binding `bind_address`.
+    pub fn set_listener_fd(&self, fd: i32) {
+        self.options.lock().listener_fd = Some(fd);
+    }
+
     /// gRPC paths (`/package.Service/Method`) served by Ruby handlers.
     pub fn set_routes(&self, routes: Vec<String>) {
         self.options.lock().routes = routes;
@@ -387,9 +419,15 @@ impl NativeServer {
             .build()
             .map_err(|e| runtime_error(ruby, format!("failed to create tokio runtime: {e}")))?;
 
-        let listener = {
+        let accept = {
             let _guard = runtime.enter();
-            bind(addr, 1024).map_err(|e| runtime_error(ruby, format!("failed to bind {addr}: {e}")))?
+            match options.listener_fd {
+                Some(fd) => listen_inherited(fd, this.active_connections.clone()).map_err(|e| {
+                    runtime_error(ruby, format!("cannot use inherited listener (fd {fd}): {e}"))
+                })?,
+                None => listen(addr, 1024)
+                    .map_err(|e| runtime_error(ruby, format!("failed to bind {addr}: {e}")))?,
+            }
         };
 
         let (health, health_service) = tonic_health::server::health_reporter();
@@ -453,7 +491,7 @@ impl NativeServer {
             n => n,
         };
         let incoming = LimitedIncoming {
-            inner: tokio_stream::wrappers::TcpListenerStream::new(listener),
+            inner: accept,
             semaphore: Arc::new(Semaphore::new(permits)),
             active: this.active_connections.clone(),
             log: this.stats.log.clone(),

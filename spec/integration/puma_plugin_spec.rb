@@ -21,12 +21,12 @@ RSpec.describe "Puma plugin", :integration do
     File.expand_path("../fixtures/puma_app", __dir__)
   end
 
-  def start_puma(workers:, preload: false)
+  def start_puma(workers:, preload: false, grpc_processes: 1)
     grpc_port = IntegrationServer.free_port
     http_port = IntegrationServer.free_port
     env = {
       "GRPC_BIND" => "127.0.0.1:#{grpc_port}", "HTTP_PORT" => http_port.to_s,
-      "WORKERS" => workers.to_s, "PRELOAD" => preload ? "1" : "0",
+      "WORKERS" => workers.to_s, "PRELOAD" => preload ? "1" : "0", "GRPC_PROCESSES" => grpc_processes.to_s,
       "RUBYLIB" => [File.expand_path("../../lib", __dir__), ENV.fetch("RUBYLIB", nil)].compact.join(File::PATH_SEPARATOR)
     }
     reader, writer = IO.pipe
@@ -88,6 +88,23 @@ RSpec.describe "Puma plugin", :integration do
       ensure
         Process.kill(:KILL, -puma[:pid]) rescue nil # rubocop:disable Style/RescueModifier
       end
+    end
+  end
+
+  it "runs a multi-process gRPC server and stops it with Puma" do
+    puma = start_puma(workers: 2, preload: true, grpc_processes: 2)
+    begin
+      wait_until { grpc_up?(puma[:grpc]) }
+      expect(puma[:output]).to include("(2 processes × 4 dispatch threads each)")
+
+      stop(puma)
+      expect(puma[:output]).to include("shutting down 2 workers")
+      expect(grpc_up?(puma[:grpc])).to be(false)
+    rescue StandardError
+      warn puma[:output]
+      raise
+    ensure
+      Process.kill(:KILL, -puma[:pid]) rescue nil # rubocop:disable Style/RescueModifier
     end
   end
 

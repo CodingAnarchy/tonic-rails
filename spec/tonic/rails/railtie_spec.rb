@@ -53,6 +53,16 @@ RSpec.describe "Tonic::Rails::Railtie" do
     expect(output.lines.last.strip).to eq("false")
   end
 
+  it "refuses to auto-start multiple processes inside the web server" do
+    output, status = boot(<<~CONFIG)
+      Rails.const_set(:Server, Class.new) unless defined?(Rails::Server) # as under `rails server`
+      config.tonic_rails.auto_start = true
+      config.tonic_rails.processes = 2
+    CONFIG
+    expect(status).not_to be_success
+    expect(output).to include("auto_start can't run multiple processes")
+  end
+
   it "runs each RPC inside the Rails executor" do
     output, status = boot("", <<~CHECK)
       handler = Class.new(EchoHandler) do

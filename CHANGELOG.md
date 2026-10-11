@@ -7,6 +7,24 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Multi-process mode: `config.processes = 4` runs four server processes
+  on one port, so services that spend their time in Ruby use four cores
+  instead of one. The app loads once and forks the workers. They share
+  the listening socket, with new connections going to the least busy
+  worker. Workers that die are replaced, and SIGTERM drains them all.
+  `on_worker_boot` runs in each worker after fork. Works with
+  `tonic_rails:serve` and the Puma plugin; Unix only. Closes #23.
+- Benchmark: `PROCESSES` and `CONNECTIONS` for `bench/run_bench.sh`, and
+  `-connections` for the Go client.
+
+### Changed
+
+- The Puma plugin waits `drain_timeout` + 10 seconds (was + 5) for the
+  gRPC server to stop before killing it, which leaves a multi-process
+  server time to stop its own workers.
+
 ## [0.4.0] - 2026-10-11
 
 ### Added

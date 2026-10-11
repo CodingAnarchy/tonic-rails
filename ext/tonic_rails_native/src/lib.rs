@@ -43,6 +43,8 @@ use server::NativeServer;
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let native = ruby.define_module("TonicRails")?.define_module("Native")?;
 
+    native.define_module_function("bind_listener", function!(server::bind_listener, 1))?;
+
     let class = native.define_class("Server", ruby.class_object())?;
     class.define_singleton_method("new", function!(NativeServer::new, 2))?;
     class.define_method("on_request", method!(NativeServer::on_request, 1))?;
@@ -66,6 +68,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("set_reflection", method!(NativeServer::set_reflection, 1))?;
     class.define_method("set_grpc_web", method!(NativeServer::set_grpc_web, 3))?;
     class.define_method("set_routes", method!(NativeServer::set_routes, 1))?;
+    class.define_method("set_listener_fd", method!(NativeServer::set_listener_fd, 1))?;
     class.define_method(
         "set_reflection_descriptors",
         method!(NativeServer::set_reflection_descriptors, 1),

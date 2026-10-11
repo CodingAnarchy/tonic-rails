@@ -21,7 +21,8 @@ crate-type = ["cdylib"]
 # and no service definitions are compiled into the extension — routes
 # are registered from Ruby at runtime.
 #
-# socket2 enables SO_REUSEPORT for multi-process (Puma worker) scaling.
+# socket2 configures the listener (SO_REUSEADDR/SO_REUSEPORT, backlog) and
+# adopts the listening socket worker processes inherit in multi-process mode.
 [dependencies]
 magnus = "0.9"
 rb-sys = "0.9"
