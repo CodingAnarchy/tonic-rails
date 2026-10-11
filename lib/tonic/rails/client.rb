@@ -16,6 +16,7 @@ module Tonic
     #
     # Retries are opt-in: `retries: true` (or a Hash; see RetryPolicy) on
     # the client or a call retries calls the server never started on.
+    # `method_retries:` sets them per service or method.
     #
     # Stubs are built from the protobuf descriptors that
     # `tonic_rails:compile_protos` (protoc --ruby_out) generates; no
@@ -46,6 +47,10 @@ module Tonic
       # @return [RetryPolicy, nil] how calls are retried, unless they say otherwise
       attr_reader :retries
 
+      # @return [Hash{String=>RetryPolicy, nil}] retry policies by service or
+      #   method name, which take precedence over #retries
+      attr_reader :method_retries
+
       # @param address [String] "host:port"
       # @param tls [Boolean] false for plaintext, which must be explicit
       # @param tls_ca_path [String, nil] CA certificates (PEM) to trust instead
@@ -61,11 +66,15 @@ module Tonic
       # @param connect_timeout [Numeric] seconds to wait for a connection
       # @param retries [RetryPolicy, Hash, Boolean] retry calls the server
       #   never started on (see RetryPolicy); off by default
+      # @param method_retries [Hash{String=>RetryPolicy, Hash, Boolean}]
+      #   retries for some services ("demo.v1.ItemService") or methods
+      #   ("demo.v1.ItemService/GetItem"), instead of `retries`.  A method's
+      #   entry beats its service's.
       # @param logger [Logger, nil] where retries are logged; defaults to
       #   Tonic::Rails.configuration.logger
       def initialize(address, tls: true, tls_ca_path: nil, tls_cert_path: nil, tls_key_path: nil,
                      tls_server_name: nil, deadline: nil, metadata: {}, max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-                     connect_timeout: 5, retries: false, logger: nil)
+                     connect_timeout: 5, retries: false, method_retries: {}, logger: nil)
         Tonic::Rails.native_extension!
         validate_address!(address)
         validate_tls!(tls, tls_cert_path, tls_key_path)
@@ -78,6 +87,7 @@ module Tonic
         @address = address
         @deadline = deadline
         @retries = RetryPolicy.from(retries)
+        @method_retries = method_retry_policies(method_retries)
         @logger = logger
         @metadata = Metadata.encode(metadata)
         @stubs = {}
@@ -127,7 +137,7 @@ module Tonic
         bytes = input.encode(request_message(path, input, request))
         metadata = call_metadata(metadata)
         deadline_at = deadline_at(deadline)
-        policy = retry_policy(retries)
+        policy = retry_policy(path, retries)
 
         Instrumentation.instrument_request(path, address, metadata) do |payload|
           code, error_message, response, headers, trailers, details = with_retries(path, policy, deadline_at, payload) do
@@ -150,7 +160,7 @@ module Tonic
         # Fixed now, so the stream keeps the deadline of the RPC this
         # thread is handling even if it's read later.
         deadline_at = deadline_at(deadline)
-        policy = retry_policy(retries)
+        policy = retry_policy(path, retries)
 
         ServerStream.new(path) do |stream, block|
           Instrumentation.instrument_request(path, address, metadata) do |payload|
@@ -238,8 +248,35 @@ module Tonic
         (remaining * 1000).ceil
       end
 
-      def retry_policy(retries)
-        retries.nil? ? @retries : RetryPolicy.from(retries)
+      METHOD_NAME = %r{\A[A-Za-z_][\w.]*(/[A-Za-z_]\w*)?\z}
+      private_constant :METHOD_NAME
+
+      def method_retry_policies(option)
+        raise ArgumentError, "method_retries must be a Hash" unless option.is_a?(Hash)
+
+        option.to_h do |name, retries|
+          name = name.to_s.delete_prefix("/")
+          unless name.match?(METHOD_NAME)
+            raise ArgumentError, "method_retries keys must be \"package.Service\" or \"package.Service/Method\", " \
+                                 "got #{name.inspect}"
+          end
+
+          [name, RetryPolicy.from(retries)]
+        end.freeze
+      end
+
+      # The most specific policy for a call: its own, its method's, its
+      # service's, then the client's.
+      def retry_policy(path, retries)
+        return RetryPolicy.from(retries) unless retries.nil?
+        return @retries if @method_retries.empty?
+
+        method = path.delete_prefix("/")
+        service = method.split("/", 2).first
+        return @method_retries[method] if @method_retries.key?(method)
+        return @method_retries[service] if @method_retries.key?(service)
+
+        @retries
       end
 
       # Yield each message of a native stream, then return its result.

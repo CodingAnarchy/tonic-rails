@@ -343,6 +343,36 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(attempts).to eq([1, 2])
     end
 
+    it "can be set per service or method, the most specific setting winning" do
+      quick = { max_attempts: 2, initial_backoff: 0.01 }
+      client = described_class.new(
+        refused, tls: false, logger: logger, retries: { max_attempts: 4, initial_backoff: 0.01 },
+                 method_retries: { "echo.v1.EchoService" => quick, "/echo.v1.EchoService/Unary" => false,
+                                   "echo.v1.EchoService/ClientStream" => true }
+      )
+      stub = client.stub("echo.v1.EchoService")
+      expect(client.method_retries.keys).to eq(%w[echo.v1.EchoService echo.v1.EchoService/Unary
+                                                  echo.v1.EchoService/ClientStream])
+
+      attempts = attempts_of do
+        expect_rpc_error(:unavailable) { stub.unary({}) }                           # its method: off
+        expect_rpc_error(:unavailable) { stub.server_stream({}).to_a }              # its service: 2
+        expect_rpc_error(:unavailable) { stub.unary({}, retries: quick) }           # the call: 2
+        other = described_class.new(refused, tls: false, retries: quick, method_retries: { "other.Service" => false })
+        expect_rpc_error(:unavailable) { other.stub("echo.v1.EchoService").unary({}) } # the client: 2
+      end
+      expect(attempts).to eq([1, 2, 2, 2])
+    end
+
+    it "validates method_retries" do
+      expect { described_class.new(address, tls: false, method_retries: [["echo.v1.EchoService", true]]) }
+        .to raise_error(ArgumentError, /must be a Hash/)
+      expect { described_class.new(address, tls: false, method_retries: { "echo.v1.EchoService/Unary/x" => true }) }
+        .to raise_error(ArgumentError, /package.Service/)
+      expect { described_class.new(address, tls: false, method_retries: { "echo.v1.EchoService" => { tries: 2 } }) }
+        .to raise_error(ArgumentError)
+    end
+
     it "follows the server's grpc-retry-pushback-ms" do
       client = described_class.new(address, tls: false, retries: true)
       delay = lambda do |pushback, attempt: 1|

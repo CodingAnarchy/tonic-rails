@@ -7,6 +7,14 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Client: `method_retries:` sets retry policies per service
+  (`"demo.v1.ItemService"`) or per method
+  (`"demo.v1.ItemService/GetItem"`), like gRPC's service config. The most
+  specific setting wins: the call's `retries:`, then the method, then the
+  service, then the client's `retries:`.
+
 ## [0.7.0] - 2026-10-11
 
 ### Added

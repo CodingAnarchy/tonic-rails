@@ -518,6 +518,24 @@ items.get_item({ id: 1 }, retries: false)                    # not this call
 items.get_item({ id: 1 }, retries: { max_attempts: 5 })      # or differently
 ```
 
+Different methods often need different policies: a read can retry more
+eagerly than a write. `method_retries:` sets them per service or per
+method, by their protobuf names:
+
+```ruby
+ITEMS = Tonic::Rails::Client.new(
+  "items.internal:50051",
+  retries: true,                                                   # every call...
+  method_retries: {
+    "demo.v1.ItemService/GetItem" => { max_attempts: 5 },          # ...but this method,
+    "demo.v1.AdminService" => false,                               # and this whole service
+  },
+)
+```
+
+The most specific setting wins: the call's own `retries:`, then its
+method's entry, then its service's, then the client's `retries:`.
+
 `retries: true` tries a call up to 3 times when it fails with
 `UNAVAILABLE`. A Hash changes any of these:
 
@@ -612,6 +630,7 @@ the client is created, not on the first call.
 | `max_message_size` | 4 MiB | largest message sent or received |
 | `connect_timeout` | 5 | seconds to wait for a connection |
 | `retries` | `false` | retry calls the server never started on; see [Retries](#retries) |
+| `method_retries` | `{}` | retries per service or method, by name |
 | `logger` | `Tonic::Rails.configuration.logger` | where retries are logged |
 
 ### Fork safety
