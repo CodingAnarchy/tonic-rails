@@ -3,11 +3,10 @@
 require "grpc"
 require "grpc/health/v1/health_services_pb"
 require "open3"
-require "openssl"
-require "tmpdir"
 require_relative "../fixtures/lib/echo_services_pb"
 require_relative "../support/integration_server"
 require_relative "../support/grpc_web_client"
+require_relative "../support/test_certificates"
 
 # End-to-end tests: a real tonic-rails server, called with the official
 # gRPC Ruby client (C core) — an independent HTTP/2 + gRPC implementation.
@@ -621,52 +620,10 @@ RSpec.describe "gRPC integration", :integration do
   end
 
   describe "TLS" do
-    # A CA plus a leaf certificate for 127.0.0.1, and a client certificate.
-    before(:all) do
-      @dir = Dir.mktmpdir("tonic-rails-tls")
-      @ca_key = OpenSSL::PKey::EC.generate("prime256v1")
-      @ca = build_cert("tonic-rails test CA", @ca_key, nil, authority: true)
-      write("ca.pem", @ca.to_pem)
+    before(:all) { @certs = TestCertificates.new }
+    after(:all) { @certs&.cleanup }
 
-      server_key = OpenSSL::PKey::EC.generate("prime256v1")
-      write("server.pem", build_cert("127.0.0.1", server_key, @ca, san: "IP:127.0.0.1,DNS:localhost").to_pem)
-      write("server.key", server_key.private_to_pem)
-
-      client_key = OpenSSL::PKey::EC.generate("prime256v1")
-      @client_cert = build_cert("client", client_key, @ca).to_pem
-      @client_key = client_key.private_to_pem
-    end
-
-    after(:all) { FileUtils.remove_entry(@dir) if @dir }
-
-    def self.serial
-      @serial = (@serial || 0) + 1
-    end
-
-    def write(name, contents)
-      File.write(File.join(@dir, name), contents)
-    end
-
-    def path(name) = File.join(@dir, name)
-
-    def build_cert(common_name, key, issuer, authority: false, san: nil)
-      cert = OpenSSL::X509::Certificate.new
-      cert.version = 2
-      cert.serial = self.class.serial
-      cert.subject = OpenSSL::X509::Name.parse("/CN=#{common_name}")
-      cert.issuer = issuer ? issuer.subject : cert.subject
-      cert.public_key = key
-      cert.not_before = Time.now - 60
-      cert.not_after = Time.now + 3600
-      ext = OpenSSL::X509::ExtensionFactory.new
-      ext.subject_certificate = cert
-      ext.issuer_certificate = issuer || cert
-      cert.add_extension(ext.create_extension("basicConstraints", authority ? "CA:TRUE" : "CA:FALSE", true))
-      cert.add_extension(ext.create_extension("keyUsage", authority ? "keyCertSign,cRLSign" : "digitalSignature", true))
-      cert.add_extension(ext.create_extension("subjectAltName", san)) if san
-      cert.sign(issuer ? @ca_key : key, OpenSSL::Digest.new("SHA256"))
-      cert
-    end
+    def path(name) = @certs.path(name)
 
     def tls_stub(handle, **creds_args)
       creds = GRPC::Core::ChannelCredentials.new(File.read(path("ca.pem")), *creds_args.values_at(:key, :cert))
@@ -692,7 +649,7 @@ RSpec.describe "gRPC integration", :integration do
         config.tls_key_path = path("server.key")
         config.tls_client_ca_path = path("ca.pem")
       end
-      client = tls_stub(handle, key: @client_key, cert: @client_cert)
+      client = tls_stub(handle, key: @certs.read("client.key"), cert: @certs.read("client.pem"))
       expect(client.unary(request.new(message: "mtls")).message).to eq("mtls")
       expect(client.unary(request.new(message: "whoami")).message).to eq("127.0.0.1 /CN=client")
       expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
@@ -718,7 +675,7 @@ RSpec.describe "gRPC integration", :integration do
     end
 
     it "refuses to start with an unreadable key instead of falling back to plaintext" do
-      write("bad.key", "not a key")
+      @certs.write("bad.key", "not a key")
       expect do
         IntegrationServer.start do |config|
           config.tls_cert_path = path("server.pem")

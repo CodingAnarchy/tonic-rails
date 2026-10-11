@@ -7,6 +7,18 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Client: `Tonic::Rails::Client` makes unary calls to other gRPC
+  services without the grpc gem. Stubs come from the descriptors that
+  `tonic_rails:compile_protos` generates. Calls take deadlines (and
+  default to the deadline of the RPC being handled), send metadata,
+  return headers and trailers with `return_call: true`, and raise
+  `RpcError` with rich details. TLS uses the system's root certificates,
+  a custom CA or mutual TLS. Clients keep working across `fork` with no
+  hooks, and `Timeout` and `Thread#raise` interrupt calls. Each call
+  publishes a `request_rpc.tonic_rails` event. Closes #37.
+
 ## [0.5.0] - 2026-10-11
 
 ### Added

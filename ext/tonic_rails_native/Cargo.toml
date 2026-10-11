@@ -23,6 +23,10 @@ crate-type = ["cdylib"]
 #
 # socket2 configures the listener (SO_REUSEADDR/SO_REUSEPORT, backlog) and
 # adopts the listening socket worker processes inherit in multi-process mode.
+#
+# The client (`TonicRails::Native::Channel`) uses tonic's Channel with the
+# same raw-byte passthrough.  rustls-native-certs loads the system's root
+# certificates for TLS, and base64 turns them into PEM for tonic.
 [dependencies]
 magnus = "0.9"
 rb-sys = "0.9"
@@ -45,3 +49,5 @@ http-body-util = "0.1"
 bytes = "1"
 tower = "0.5"
 flate2 = { version = "1", features = ["rust_backend"] }
+rustls-native-certs = "0.8"
+base64 = "0.22"

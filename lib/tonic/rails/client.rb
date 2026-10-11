@@ -1,0 +1,262 @@
+# frozen_string_literal: true
+
+require "active_support/inflector"
+
+module Tonic
+  module Rails
+    # Calls other gRPC services, without the grpc gem.
+    #
+    #   ITEMS = Tonic::Rails::Client.new("items.internal:50051", deadline: 2)
+    #
+    #   items = ITEMS.stub("demo.v1.ItemService")
+    #   item = items.get_item(Demo::V1::GetItemRequest.new(id: 1))
+    #   item = items.get_item(id: 1)
+    #   item = items.get_item({ id: 1 }, deadline: 0.5, metadata: { "x-request-id" => request_id })
+    #
+    # Stubs are built from the protobuf descriptors that
+    # `tonic_rails:compile_protos` (protoc --ruby_out) generates; no
+    # `_services_pb.rb` is needed.  A failed call raises
+    # Tonic::Rails::RpcError.
+    #
+    # A client holds one HTTP/2 connection and is safe to share between
+    # threads, so create it once (a constant or an initializer).  It keeps
+    # working across `fork`: each process connects on its own, with no
+    # hooks to call.
+    class Client
+      # A response with its headers and trailers; see `return_call:`.
+      Call = Data.define(:response, :headers, :trailers)
+
+      DEFAULT_MAX_MESSAGE_SIZE = 4 * 1024 * 1024
+
+      # @return [String] "host:port"
+      attr_reader :address
+
+      # @return [Numeric, nil] default deadline in seconds
+      attr_reader :deadline
+
+      # @param address [String] "host:port"
+      # @param tls [Boolean] false for plaintext, which must be explicit
+      # @param tls_ca_path [String, nil] CA certificates (PEM) to trust instead
+      #   of the system's root certificates
+      # @param tls_cert_path [String, nil] client certificate (PEM), for mutual TLS
+      # @param tls_key_path [String, nil] client private key (PEM), for mutual TLS
+      # @param tls_server_name [String, nil] name to verify the server's
+      #   certificate against, if not the host in `address`
+      # @param deadline [Numeric, nil] seconds each call may take, unless the
+      #   call sets its own
+      # @param metadata [Hash] sent with every call (see Tonic::Rails::Metadata)
+      # @param max_message_size [Integer] largest message sent or received, in bytes
+      # @param connect_timeout [Numeric] seconds to wait for a connection
+      def initialize(address, tls: true, tls_ca_path: nil, tls_cert_path: nil, tls_key_path: nil,
+                     tls_server_name: nil, deadline: nil, metadata: {}, max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                     connect_timeout: 5)
+        Tonic::Rails.native_extension!
+        validate_address!(address)
+        validate_tls!(tls, tls_cert_path, tls_key_path)
+        positive!(:deadline, deadline) unless deadline.nil?
+        positive!(:connect_timeout, connect_timeout)
+        unless max_message_size.is_a?(Integer) && max_message_size.positive?
+          raise ArgumentError, "max_message_size must be a positive Integer"
+        end
+
+        @address = address
+        @deadline = deadline
+        @metadata = Metadata.encode(metadata)
+        @stubs = {}
+        tls_options = [read_pem(tls_ca_path, "CA"), read_pem(tls_cert_path, "certificate"),
+                       read_pem(tls_key_path, "key"), tls_server_name]
+        @native = TonicRails::Native::Channel.new(
+          "#{tls ? 'https' : 'http'}://#{address}", max_message_size, (connect_timeout * 1000).ceil,
+          (tls_options if tls)
+        )
+      end
+
+      # A stub with one method per RPC of the service, named in snake_case
+      # (`GetItem` becomes `get_item`).
+      #
+      # @param service [String, Google::Protobuf::ServiceDescriptor, #service_name]
+      #   the fully-qualified service name, its descriptor, or a grpc gem
+      #   service class (`Demo::V1::ItemService::Service`)
+      # @return [Tonic::Rails::Client::Stub]
+      def stub(service)
+        descriptor = service_descriptor(service)
+        @stubs[descriptor.name] ||= Stub.for(descriptor).new(self)
+      end
+
+      def inspect
+        "#<#{self.class.name} #{address}>"
+      end
+
+      # The deadline of the RPC this thread is handling, as a monotonic
+      # clock time; outgoing calls default to it.
+      # @api private
+      def self.current_deadline
+        Thread.current[:tonic_rails_deadline]
+      end
+
+      # @api private
+      def self.with_deadline(deadline)
+        previous = Thread.current[:tonic_rails_deadline]
+        Thread.current[:tonic_rails_deadline] = deadline
+        yield
+      ensure
+        Thread.current[:tonic_rails_deadline] = previous
+      end
+
+      # Make a unary call.  Stubs call this; use them instead.
+      # @api private
+      def unary(path, input, output, request, deadline: nil, metadata: {}, return_call: false)
+        message = case request
+        when input then request
+        when Hash then input.new(request)
+        else raise TypeError, "#{path} expects a #{input} or Hash, got #{request.class}"
+        end
+        metadata = metadata.empty? ? @metadata : @metadata.merge(Metadata.encode(metadata))
+        timeout_ms = timeout_ms(deadline)
+
+        Instrumentation.instrument_request(path, address, metadata) do
+          code, error_message, response, headers, trailers, details =
+            @native.unary(path, input.encode(message), metadata, timeout_ms)
+          headers = decode_metadata(headers)
+          trailers = decode_metadata(trailers)
+          unless code.zero?
+            raise RpcError.new(error_message.empty? ? nil : error_message, code: code, metadata: trailers,
+                                                                           details: RpcError.decode_details(details))
+          end
+
+          response = decode_response(output, response, path)
+          return_call ? Call.new(response: response, headers: headers, trailers: trailers) : response
+        end
+      end
+
+      private
+
+      def validate_address!(address)
+        return if address.is_a?(String) && address.match?(%r{\A[^\s/]+:\d+\z})
+
+        raise ArgumentError, "address must be \"host:port\", got #{address.inspect}"
+      end
+
+      def validate_tls!(tls, cert_path, key_path)
+        raise ArgumentError, "tls must be true or false" unless [true, false].include?(tls)
+        raise ArgumentError, "tls_cert_path and tls_key_path must be set together" if cert_path.nil? != key_path.nil?
+        raise ArgumentError, "tls_cert_path and tls_key_path need tls: true" if cert_path && !tls
+      end
+
+      def positive!(name, value)
+        raise ArgumentError, "#{name} must be a positive number of seconds" unless value.is_a?(Numeric) && value.positive?
+      end
+
+      def read_pem(path, what)
+        return unless path
+        raise ArgumentError, "TLS #{what} file not found: #{path}" unless File.file?(path)
+
+        File.read(path)
+      end
+
+      def service_descriptor(service)
+        return service if service.is_a?(Google::Protobuf::ServiceDescriptor)
+
+        name = service.respond_to?(:service_name) ? service.service_name : service.to_s
+        descriptor = Google::Protobuf::DescriptorPool.generated_pool.lookup(name)
+        return descriptor if descriptor.is_a?(Google::Protobuf::ServiceDescriptor)
+
+        raise NotConfiguredError,
+              "#{name} is not a known protobuf service. Require its generated _pb.rb file (protoc --ruby_out) first."
+      end
+
+      # Milliseconds the call may take: the call's own deadline, or else
+      # the earlier of the client's default and the deadline of the RPC
+      # being handled.
+      def timeout_ms(deadline)
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        deadline_at = case deadline
+        when nil then [(now + @deadline if @deadline), self.class.current_deadline].compact.min
+        when Numeric then now + deadline
+        when Time then now + (deadline - Time.now)
+        else raise ArgumentError, "deadline must be seconds (Numeric) or a Time, got #{deadline.class}"
+        end
+        return unless deadline_at
+
+        remaining = deadline_at - now
+        raise RpcError.new("deadline exceeded", code: :deadline_exceeded) unless remaining.positive?
+
+        (remaining * 1000).ceil
+      end
+
+      # Wire-form [name, value] pairs to a Hash: `-bin` values decoded,
+      # repeated names collected into an Array, and transport headers
+      # (content-type, grpc-*) dropped.
+      def decode_metadata(pairs)
+        pairs.each_with_object({}) do |(name, value), metadata|
+          next if name.start_with?("grpc-") || Metadata::RESERVED.include?(name)
+
+          value = value.unpack1("m") if name.end_with?("-bin")
+          metadata[name] = metadata.key?(name) ? [*metadata[name], value] : value
+        end
+      end
+
+      def decode_response(output, bytes, path)
+        output.decode(bytes)
+      rescue Google::Protobuf::ParseError
+        raise RpcError.new("invalid protobuf response from #{path}", code: :internal)
+      end
+
+      # Calls an RPC's methods.  Built per service from its descriptor; get
+      # one with Client#stub.
+      class Stub
+        class << self
+          # @api private
+          attr_reader :service_name
+
+          # @api private
+          def for(descriptor)
+            Class.new(self) do
+              @service_name = descriptor.name
+              descriptor.each { |method| define_rpc(method) }
+            end
+          end
+
+          def inspect
+            service_name ? "#{Stub.name}(#{service_name})" : super
+          end
+
+          private
+
+          def define_rpc(method)
+            path = "/#{service_name}/#{method.name}"
+            name = ActiveSupport::Inflector.underscore(method.name)
+            if method.client_streaming || method.server_streaming
+              define_method(name) do |*, **|
+                raise NotImplementedError, "#{path} is a streaming RPC; the tonic-rails client makes unary calls only"
+              end
+            else
+              input = method.input_type.msgclass
+              output = method.output_type.msgclass
+              # `get_item(id: 1)` works as well as `get_item({ id: 1 })`.
+              define_method(name) do |request = nil, deadline: nil, metadata: {}, return_call: false, **fields|
+                unless request.nil? || fields.empty?
+                  raise ArgumentError, "#{name}: pass the request or its fields, not both (#{fields.keys.join(', ')})"
+                end
+
+                @client.unary(path, input, output, request || fields, deadline: deadline, metadata: metadata,
+                                                                      return_call: return_call)
+              end
+            end
+          end
+        end
+
+        # @return [Tonic::Rails::Client]
+        attr_reader :client
+
+        def initialize(client)
+          @client = client
+        end
+
+        def inspect
+          "#<#{self.class.inspect} #{client.address}>"
+        end
+      end
+    end
+  end
+end

@@ -248,7 +248,10 @@ module Tonic
 
         @request = build_request(reader, spec)
         response = nil
-        run_callbacks(:rpc) { response = respond(public_send(spec[:handler], @request), spec, sender) }
+        # Calls this handler makes with Tonic::Rails::Client default to its deadline.
+        Client.with_deadline(@grpc_deadline_at) do
+          run_callbacks(:rpc) { response = respond(public_send(spec[:handler], @request), spec, sender) }
+        end
         response
       rescue RpcError
         raise
