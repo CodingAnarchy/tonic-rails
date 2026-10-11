@@ -212,10 +212,15 @@ RSpec.describe "gRPC integration", :integration do
       end
 
       it "tracks request stats" do
-        stats = @handle[:server].stats
-        expect(stats[:total]).to be > 0
-        expect(stats[:successful]).to be > 0
-        expect(stats[:active_connections]).to be >= 1
+        before = @handle[:server].stats
+        stub.unary(request.new(message: "counted"))
+        expect { stub.unary(request.new(fail_with: "rpc:not_found")) }.to raise_error(GRPC::NotFound)
+        after = @handle[:server].stats
+
+        expect(after[:total] - before[:total]).to eq(2)
+        expect(after[:successful] - before[:successful]).to eq(1)
+        expect(after[:errors] - before[:errors]).to eq(1)
+        expect(after[:active_connections]).to be >= 1
       end
     end
   end
