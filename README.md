@@ -64,6 +64,23 @@ To generate Ruby classes from your `.proto` files you also need `protoc`
 
 ## Quick start
 
+The generators set everything up:
+
+```sh
+bin/rails generate tonic_rails:install
+bin/rails generate tonic_rails:service Item GetItem ListItems:server
+bin/rails tonic_rails:compile_protos
+```
+
+`install` adds `config/initializers/tonic_rails.rb` (load path for
+generated code, configuration, handler registration), `app/protos/`,
+`lib/grpc/`, and the Puma plugin. `service` writes the `.proto`, a handler
+in `app/grpc/` with a stub per RPC, its registration, and a spec (or
+Minitest test). RPCs take an optional `:server`, `:client` or `:bidi`
+streaming kind.
+
+The rest of this section shows the same steps by hand.
+
 ### 1. Define the service
 
 ```protobuf

@@ -17,6 +17,10 @@ minor versions may contain breaking changes.
 - `peer` in handlers: the client's address and, with mutual TLS, its
   certificate (`peer.certificate`, an `OpenSSL::X509::Certificate`).
   `Testing.call`/`invoke` accept `peer:`.
+- Generators: `rails g tonic_rails:install` (initializer, proto and
+  generated-code directories, Puma plugin) and `rails g tonic_rails:service
+  Item GetItem ListItems:server` (proto, handler with a stub per RPC,
+  registration, and an RSpec or Minitest test).
 - Test helpers: the `raise_grpc_error(code).with_message(...)` RSpec matcher
   (`require "tonic/rails/testing/rspec"`) and `assert_grpc_error` for Minitest
   (`Tonic::Rails::Testing::Assertions`). Both accept `Tonic::Rails::RpcError`

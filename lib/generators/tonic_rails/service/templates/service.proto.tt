@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package <%= package %>;
+
+service <%= service_class %> {
+<% rpc_specs.each do |rpc| -%>
+  <%= proto_rpc_line(rpc) %>
+<% end -%>
+}
+<% rpc_specs.each do |rpc| %>
+message <%= rpc[:name] %>Request {
+}
+
+message <%= rpc[:name] %>Response {
+}
+<% end -%>

@@ -61,6 +61,13 @@ jobs:
         run: |
           go install "github.com/fullstorydev/grpcurl/cmd/grpcurl@${GRPCURL_VERSION}"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install protoc (generator specs)
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler ;;
+            macOS) brew install protobuf ;;
+            *) echo "skipping on $RUNNER_OS; the generator specs that need protoc will be skipped" ;;
+          esac
       - name: Compile native extension
         run: bundle exec rake compile
       - name: Rust unit tests

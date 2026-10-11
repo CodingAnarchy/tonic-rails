@@ -1,0 +1,17 @@
+# frozen_string_literal: true
+
+require "rails_helper"
+require "tonic/rails/testing/rspec"
+
+RSpec.describe <%= service_class %> do
+<% rpc_specs.each_with_index do |rpc, i| -%>
+<% if i.positive? %>
+<% end -%>
+  describe "<%= rpc[:name] %>" do
+    it "is not implemented yet" do
+      request = <%= %w[client bidi].include?(rpc[:kind]) ? "[#{ruby_module}::#{rpc[:name]}Request.new]" : "#{ruby_module}::#{rpc[:name]}Request.new" %>
+      expect { Tonic::Rails::Testing.call(described_class, :<%= rpc[:name] %>, request) }.to raise_grpc_error(:unimplemented)
+    end
+  end
+<% end -%>
+end
