@@ -391,8 +391,10 @@ RSpec.describe "gRPC integration", :integration do
       handle[:thread].join(10)
       expect(handle[:server]).not_to be_running
 
-      expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
-        stub_for(handle).unary(request.new, deadline: Time.now + 1)
+      # Connections to the closed port are refused: UNAVAILABLE, or on
+      # Windows (which retries a refused localhost connect) the deadline.
+      expect { stub_for(handle).unary(request.new, deadline: Time.now + 1) }.to raise_error(GRPC::BadStatus) do |error|
+        expect(error.code).to eq(GRPC::Core::StatusCodes::UNAVAILABLE).or eq(GRPC::Core::StatusCodes::DEADLINE_EXCEEDED)
       end
     ensure
       IntegrationServer.stop(handle) if handle && handle[:thread].alive?

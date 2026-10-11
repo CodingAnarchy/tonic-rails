@@ -35,11 +35,17 @@ jobs:
   test:
     name: test (${{ matrix.os }}, Ruby ${{ matrix.ruby }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         ruby: ["3.3", "3.4", "4.0"]
+        include:
+          - os: windows-latest
+            ruby: "3.4"
     steps:
       - uses: actions/checkout@v7
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1

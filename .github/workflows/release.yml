@@ -57,6 +57,7 @@ jobs:
           - aarch64-linux-gnu
           - aarch64-linux-musl
           - arm64-darwin
+          - x64-mingw-ucrt
           - x86_64-darwin
           - x86_64-linux-gnu
           - x86_64-linux-musl
@@ -101,6 +102,7 @@ jobs:
           - { os: ubuntu-24.04-arm, platform: aarch64-linux-gnu, ruby: "3.4" }
           - { os: macos-latest, platform: arm64-darwin, ruby: "3.3" }
           - { os: macos-latest, platform: arm64-darwin, ruby: "4.0" }
+          - { os: windows-latest, platform: x64-mingw-ucrt, ruby: "3.4" }
     steps:
       - uses: ruby/setup-ruby@v1
         with:
@@ -109,6 +111,7 @@ jobs:
         with:
           name: gem-${{ matrix.platform }}
       - name: Install without a Rust toolchain and load the extension
+        shell: bash
         run: |
           gem install --no-document tonic-rails-*.gem
           gem list tonic-rails

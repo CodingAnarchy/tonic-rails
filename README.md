@@ -45,7 +45,7 @@ end
   Reflection is off unless you turn it on. TLS problems stop the server
   instead of silently falling back to plaintext.
 - **No Rust toolchain needed** on the platforms we ship precompiled gems
-  for (Linux and macOS, x86_64 and arm64).
+  for: Linux and macOS (x86_64 and arm64) and Windows (x64).
 
 ## Installation
 
@@ -381,7 +381,8 @@ mode alike, so gRPC gets its own process and GVL instead of competing with
 web workers. It starts after Puma boots and drains gracefully when Puma
 stops or restarts. If the gRPC process dies, Puma shuts down too, so your
 supervisor restarts both. It works with `rails server`, plain `puma`, and
-`preload_app!`.
+`preload_app!`. (Not on Windows, which has no `fork()`: run
+`tonic_rails:serve` as its own process there.)
 
 For larger deployments, a dedicated `bin/rails tonic_rails:serve` process
 (scaled separately) is still the most flexible option.

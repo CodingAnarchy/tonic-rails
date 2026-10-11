@@ -20,8 +20,7 @@ module Tonic
         @router = Router.new
         @native = nil
         @state = :stopped
-        @stop_reader = nil
-        @stop_writer = nil
+        @stop_signal = nil
         @stop_requested = false
         @lock = Mutex.new
       end
@@ -51,7 +50,10 @@ module Tonic
           @configuration.validate!
           Tonic::Rails.native_extension!
           Tonic::Rails._set_shutting_down(false)
-          @stop_reader, @stop_writer = IO.pipe
+          # A Queue rather than a self-pipe: pushing to it is safe from trap
+          # handlers, and unlike pipes it can be waited on with a timeout
+          # on every platform (Windows select() only handles sockets).
+          @stop_signal = Thread::Queue.new
           stop if @stop_requested # requested while we were starting up
           @native = build_native_server
           @native.start_server
@@ -72,8 +74,7 @@ module Tonic
           @native&.stop_server
           stop_log_pump(log_pump)
           @native = nil
-          [@stop_reader, @stop_writer].each { |io| io.close if io && !io.closed? }
-          @stop_reader = @stop_writer = nil
+          @stop_signal = nil
           Tonic::Rails._set_shutting_down(false)
           @state = :stopped
         end
@@ -83,9 +84,7 @@ module Tonic
       # other threads; returns immediately.
       def stop
         @stop_requested = true
-        @stop_writer&.write_nonblock(".", exception: false)
-      rescue IOError
-        # Already stopped.
+        @stop_signal&.push(:stop)
       end
 
       def running?
@@ -222,7 +221,7 @@ module Tonic
 
       def wait_for_stop(workers)
         loop do
-          break if @stop_reader.wait_readable(1)
+          break if @stop_signal.pop(timeout: 1)
 
           dead = workers.reject(&:alive?)
           unless dead.empty?
