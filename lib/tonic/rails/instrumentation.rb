@@ -28,6 +28,10 @@ module Tonic
 
       # @api private
       def instrument(path, metadata)
+        # Without subscribers, skip building the payload: this runs on
+        # every RPC.
+        return yield unless ActiveSupport::Notifications.notifier.listening?(EVENT)
+
         service, rpc = path.delete_prefix("/").split("/", 2)
         payload = { path: path, service: service, rpc: rpc, metadata: metadata, code: nil, status: nil }
         ActiveSupport::Notifications.instrument(EVENT, payload) do
