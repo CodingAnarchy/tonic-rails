@@ -53,6 +53,14 @@ RSpec.describe Tonic::Rails::Configuration do
     expect { config.validate! }.to raise_error(ArgumentError, /health_check_interval/)
   end
 
+  it "requires gRPC-Web settings to be lists of strings" do
+    config.grpc_web_origins = "https://app.example.com"
+    expect { config.validate! }.to raise_error(ArgumentError, /grpc_web_origins/)
+    config.grpc_web_origins = ["https://app.example.com"]
+    config.grpc_web_exposed_headers = [:x_id]
+    expect { config.validate! }.to raise_error(ArgumentError, /grpc_web_exposed_headers/)
+  end
+
   it "requires callable interceptors" do
     config.interceptors = [Object.new]
     expect { config.validate! }.to raise_error(ArgumentError, /interceptors/)

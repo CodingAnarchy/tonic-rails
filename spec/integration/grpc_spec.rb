@@ -7,6 +7,7 @@ require "openssl"
 require "tmpdir"
 require_relative "../fixtures/lib/echo_services_pb"
 require_relative "../support/integration_server"
+require_relative "../support/grpc_web_client"
 
 # End-to-end tests: a real tonic-rails server, called with the official
 # gRPC Ruby client (C core) — an independent HTTP/2 + gRPC implementation.
@@ -314,6 +315,114 @@ RSpec.describe "gRPC integration", :integration do
     end
   end
 
+  context "with gRPC-Web" do
+    let(:app_origin) { "https://app.example.com" }
+
+    before(:all) do
+      @handle = IntegrationServer.start do |config|
+        config.grpc_web = true
+        config.grpc_web_origins = ["https://app.example.com"]
+        config.grpc_web_exposed_headers = ["x-echo-header"]
+      end
+    end
+
+    after(:all) { IntegrationServer.stop(@handle) }
+
+    def web_call(rpc, message, **)
+      GrpcWebClient.call(@handle[:address], "/echo.v1.EchoService/#{rpc}", request.encode(message), **)
+    end
+
+    def decode(bytes) = Echo::V1::EchoResponse.decode(bytes)
+
+    it "serves unary calls from browser clients" do
+      response = web_call("Unary", request.new(message: "from the browser"))
+      expect(response.http_status).to eq(200)
+      expect(response.headers["content-type"].first).to start_with("application/grpc-web")
+      expect(response.grpc_status).to eq(0)
+      expect(decode(response.messages.first).message).to eq("from the browser")
+    end
+
+    it "supports the base64 text variant" do
+      response = web_call("Unary", request.new(message: "as text"), text: true)
+      expect(response.grpc_status).to eq(0)
+      expect(decode(response.messages.first).message).to eq("as text")
+    end
+
+    it "streams server-streaming responses" do
+      response = web_call("ServerStream", request.new(message: "s", count: 3))
+      expect(response.messages.map { |m| decode(m).index }).to eq([0, 1, 2])
+      expect(response.grpc_status).to eq(0)
+    end
+
+    it "reports errors in the trailers frame" do
+      response = web_call("Unary", request.new(fail_with: "rpc:not_found"))
+      expect([response.grpc_status, response.grpc_message]).to eq([5, "failed with not_found"])
+    end
+
+    it "delivers response metadata" do
+      response = web_call("Unary", request.new(message: "with-metadata"))
+      expect(response.headers["x-echo-header"]).to eq(["h1"])
+      expect(response.trailers["x-echo-trailer"]).to eq("t1")
+    end
+
+    it "answers CORS preflights for allowed origins" do
+      preflight = GrpcWebClient.preflight(@handle[:address], "/echo.v1.EchoService/Unary", origin: app_origin)
+      expect(preflight.code.to_i).to be_between(200, 204)
+      expect(preflight["access-control-allow-origin"]).to eq(app_origin)
+      expect(preflight["access-control-allow-credentials"]).to eq("true")
+      expect(preflight["access-control-allow-headers"].downcase).to include("x-grpc-web", "x-user-agent")
+    end
+
+    it "lets allowed origins read the status and exposed headers" do
+      response = web_call("Unary", request.new(message: "with-metadata"), origin: app_origin)
+      expect(response.headers["access-control-allow-origin"]).to eq([app_origin])
+      expect(response.headers["access-control-expose-headers"].join(",").downcase)
+        .to include("grpc-status", "grpc-message", "x-echo-header")
+    end
+
+    it "grants nothing to other origins" do
+      preflight = GrpcWebClient.preflight(@handle[:address], "/echo.v1.EchoService/Unary", origin: "https://evil.example")
+      expect(preflight["access-control-allow-origin"]).to be_nil
+    end
+
+    it "serves the health service over gRPC-Web too" do
+      health_request = Grpc::Health::V1::HealthCheckRequest.encode(Grpc::Health::V1::HealthCheckRequest.new(service: ""))
+      response = GrpcWebClient.call(@handle[:address], "/grpc.health.v1.Health/Check", health_request)
+      expect(response.grpc_status).to eq(0)
+      expect(Grpc::Health::V1::HealthCheckResponse.decode(response.messages.first).status).to eq(:SERVING)
+    end
+
+    it "keeps serving native gRPC clients" do
+      expect(stub_for(@handle).unary(request.new(message: "native")).message).to eq("native")
+    end
+  end
+
+  describe "gRPC-Web configuration errors" do
+    it "rejects a wildcard origin mixed with others at startup" do
+      expect do
+        IntegrationServer.start do |config|
+          config.grpc_web = true
+          config.grpc_web_origins = ["*", "https://app.example.com"]
+        end
+      end.to raise_error(ArgumentError, /can't be combined/)
+    end
+  end
+
+  describe "gRPC-Web when disabled" do
+    it "doesn't accept browser requests" do
+      handle = IntegrationServer.start
+      outcome = begin
+        response = GrpcWebClient.call(handle[:address], "/echo.v1.EchoService/Unary", request.encode(request.new))
+        response.grpc_status&.zero? ? :served : :rejected
+      rescue EOFError, Errno::ECONNRESET, Net::HTTPBadResponse, Net::ReadTimeout
+        :rejected # HTTP/1.1 isn't accepted at all
+      end
+      expect(outcome).to eq(:rejected)
+    ensure
+      IntegrationServer.stop(handle)
+    end
+  end
+
   context "with app-controlled health" do
     before(:all) do
       # A shared object: examples get copies of before(:all) ivars.
@@ -589,6 +698,21 @@ RSpec.describe "gRPC integration", :integration do
       expect_status(GRPC::Core::StatusCodes::UNAVAILABLE) do
         tls_stub(handle).unary(request.new, deadline: Time.now + 1)
       end
+    ensure
+      IntegrationServer.stop(handle)
+    end
+
+    it "serves gRPC-Web over HTTPS" do
+      handle = IntegrationServer.start do |config|
+        config.tls_cert_path = path("server.pem")
+        config.tls_key_path = path("server.key")
+        config.grpc_web = true
+      end
+      response = GrpcWebClient.call(handle[:address], "/echo.v1.EchoService/Unary",
+                                    request.encode(request.new(message: "secure web")), ca_file: path("ca.pem"))
+      expect(response.grpc_status).to eq(0)
+      expect(Echo::V1::EchoResponse.decode(response.messages.first).message).to eq("secure web")
+      expect(tls_stub(handle).unary(request.new(message: "native too")).message).to eq("native too")
     ensure
       IntegrationServer.stop(handle)
     end

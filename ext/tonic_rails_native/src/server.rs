@@ -29,6 +29,9 @@ use tokio::sync::{Semaphore, watch};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
+use http::{HeaderName, HeaderValue, Method};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
 use crate::body::ServerStats;
 use crate::dispatch::{DispatchInner, DispatchService};
 use crate::gvl::{self, Cancel, DispatchContext};
@@ -47,6 +50,7 @@ struct Options {
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
     reflection: bool,
+    grpc_web: Option<GrpcWebOptions>,
     dispatch_queue_size: usize,
     routes: Vec<String>,
     descriptors: Vec<Vec<u8>>,
@@ -63,11 +67,82 @@ impl Default for Options {
             keepalive_interval: Duration::from_secs(15),
             keepalive_timeout: Duration::from_secs(5),
             reflection: false,
+            grpc_web: None,
             dispatch_queue_size: 128,
             routes: Vec::new(),
             descriptors: Vec::new(),
         }
     }
+}
+
+/// gRPC-Web and the CORS policy browsers need to use it.
+struct GrpcWebOptions {
+    /// Allowed browser origins; empty = same-origin only; ["*"] = any.
+    origins: Vec<String>,
+    allow_headers: Vec<String>,
+    expose_headers: Vec<String>,
+}
+
+/// Request headers gRPC-Web clients send, beyond the CORS-safelisted ones.
+const GRPC_WEB_REQUEST_HEADERS: [&str; 5] = [
+    "content-type",
+    "x-grpc-web",
+    "x-user-agent",
+    "grpc-timeout",
+    "authorization",
+];
+/// Response headers browsers must be allowed to read for gRPC-Web.
+const GRPC_WEB_RESPONSE_HEADERS: [&str; 3] = ["grpc-status", "grpc-message", "grpc-status-details-bin"];
+
+fn header_names(ruby: &Ruby, defaults: &[&str], extra: &[String]) -> Result<Vec<HeaderName>, Error> {
+    defaults
+        .iter()
+        .map(|name| name.to_string())
+        .chain(extra.iter().map(|name| name.to_ascii_lowercase()))
+        .map(|name| {
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| arg_error(ruby, format!("invalid gRPC-Web header name: {name:?}")))
+        })
+        .collect()
+}
+
+/// None when no cross-origin access is configured (same-origin only).
+fn cors_layer(ruby: &Ruby, web: &GrpcWebOptions) -> Result<Option<CorsLayer>, Error> {
+    if web.origins.is_empty() {
+        return Ok(None);
+    }
+    let layer = CorsLayer::new()
+        .allow_methods([Method::POST])
+        .allow_headers(header_names(ruby, &GRPC_WEB_REQUEST_HEADERS, &web.allow_headers)?)
+        .expose_headers(header_names(
+            ruby,
+            &GRPC_WEB_RESPONSE_HEADERS,
+            &web.expose_headers,
+        )?)
+        .max_age(Duration::from_secs(24 * 60 * 60));
+    if web.origins.iter().any(|origin| origin == "*") {
+        if web.origins.len() > 1 {
+            return Err(arg_error(
+                ruby,
+                "grpc_web_origins: \"*\" can't be combined with other origins",
+            ));
+        }
+        // Browsers refuse credentials with a wildcard origin, so none here.
+        return Ok(Some(layer.allow_origin(AllowOrigin::any())));
+    }
+    let origins = web
+        .origins
+        .iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin.trim_end_matches('/'))
+                .map_err(|_| arg_error(ruby, format!("invalid gRPC-Web origin: {origin:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(
+        layer
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_credentials(true),
+    ))
 }
 
 /// State that exists only while the server is running.
@@ -197,6 +272,20 @@ impl NativeServer {
 
     pub fn set_compression(&self, enabled: bool) {
         self.compression.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable gRPC-Web (and HTTP/1.1, which browsers use without TLS).
+    pub fn set_grpc_web(
+        &self,
+        origins: Vec<String>,
+        allow_headers: Vec<String>,
+        expose_headers: Vec<String>,
+    ) {
+        self.options.lock().grpc_web = Some(GrpcWebOptions {
+            origins,
+            allow_headers,
+            expose_headers,
+        });
     }
 
     pub fn set_reflection(&self, enabled: bool) {
@@ -347,7 +436,17 @@ impl NativeServer {
                 .tls_config(tls)
                 .map_err(|e| runtime_error(ruby, format!("invalid TLS configuration: {e}")))?;
         }
-        let router = builder.add_routes(grpc_routes);
+        // CORS outermost, so preflight requests are answered before the
+        // gRPC-Web translation sees them.  Both are no-ops when disabled.
+        let (cors, grpc_web) = match &options.grpc_web {
+            Some(web) => (cors_layer(ruby, web)?, Some(tonic_web::GrpcWebLayer::new())),
+            None => (None, None),
+        };
+        let router = builder
+            .accept_http1(options.grpc_web.is_some())
+            .layer(tower::util::option_layer(cors))
+            .layer(tower::util::option_layer(grpc_web))
+            .add_routes(grpc_routes);
 
         let permits = match options.max_connections {
             0 => Semaphore::MAX_PERMITS,
