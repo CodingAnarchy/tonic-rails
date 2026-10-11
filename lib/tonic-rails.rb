@@ -10,6 +10,7 @@ module Tonic
 end
 
 require "tonic/rails/version"
+require "tonic/rails/metadata"
 require "tonic/rails/rpc_error"
 require "tonic/rails/configuration"
 require "tonic/rails/router"

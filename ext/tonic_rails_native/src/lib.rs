@@ -82,6 +82,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let sender = native.define_class("StreamSender", ruby.class_object())?;
     sender.undef_default_alloc_func();
     sender.define_method("push", method!(StreamSender::push, 1))?;
+    sender.define_method("send_headers", method!(StreamSender::send_headers, 1))?;
+    sender.define_method("add_trailers", method!(StreamSender::add_trailers, 1))?;
 
     let reader = native.define_class("RequestReader", ruby.class_object())?;
     reader.undef_default_alloc_func();

@@ -11,11 +11,13 @@ class EchoHandler
   request_format :message
 
   def unary(request)
+    add_metadata(request)
     work(request)
     response(request)
   end
 
   def server_stream(request)
+    add_metadata(request)
     work(request)
     Enumerator.new do |y|
       request.count.times { |i| y << response(request, index: i) }
@@ -41,6 +43,15 @@ class EchoHandler
 
   private
 
+  # message "with-metadata" sets response headers and trailers.
+  def add_metadata(request)
+    return unless request.message == "with-metadata"
+
+    response_metadata["x-echo-header"] = "h1"
+    response_metadata["x-echo-bin"] = "\x00\xFF".b
+    trailing_metadata["x-echo-trailer"] = "t1"
+  end
+
   def work(request)
     sleep(request.sleep_ms / 1000.0) if request.sleep_ms.positive?
     case request.fail_with
@@ -50,6 +61,13 @@ class EchoHandler
       raise "secret internal detail"
     when /\Arpc:(\w+)\z/
       raise Tonic::Rails::RpcError.new("failed with #{Regexp.last_match(1)}", code: Regexp.last_match(1).to_sym)
+    when "details"
+      raise Tonic::Rails::RpcError.new(
+        "invalid detail",
+        code: :invalid_argument,
+        metadata: { "x-error-id" => "e42" },
+        details: [Echo::V1::Detail.new(mood: :MOOD_HAPPY)],
+      )
     end
   end
 

@@ -253,6 +253,46 @@ RSpec.describe Tonic::Rails::Base do
     end
   end
 
+  describe "response metadata" do
+    it "sends response headers and trailers" do
+      result = testing.invoke(EchoHandler, :Unary, { message: "with-metadata" })
+      expect(result.response.message).to eq("with-metadata")
+      expect(result.headers).to eq("x-echo-header" => "h1", "x-echo-bin" => "AP8=")
+      expect(result.trailers).to eq("x-echo-trailer" => "t1")
+    end
+
+    it "sends headers before the first streamed message" do
+      result = testing.invoke(EchoHandler, :ServerStream, { message: "with-metadata", count: 2 })
+      expect(result.response.size).to eq(2)
+      expect(result.headers).to include("x-echo-header" => "h1")
+    end
+
+    it "keeps trailers when the handler fails" do
+      svc = hash_service do
+        def unary(_request)
+          trailing_metadata["x-attempt"] = "1"
+          raise Tonic::Rails::RpcError.new("busy", code: :unavailable)
+        end
+      end
+      sender = Tonic::Rails::Testing::Sender.new
+      reader = Tonic::Rails::Testing::Reader.new([request_class.encode(request_class.new)])
+      expect { svc.new.call_rpc("Unary", metadata: {}, reader: reader, sender: sender) }
+        .to raise_error(Tonic::Rails::RpcError)
+      expect(sender.trailers).to eq("x-attempt" => "1")
+    end
+
+    it "treats invalid metadata as a handler bug" do
+      svc = hash_service do
+        def unary(_request)
+          response_metadata["grpc-status"] = "0"
+          {}
+        end
+      end
+      expect { testing.call(svc, :Unary, {}) }
+        .to raise_error(Tonic::Rails::RpcError) { |e| expect(e.code_name).to eq(:internal) }
+    end
+  end
+
   describe "isolation" do
     it "uses a fresh handler instance per call" do
       svc = hash_service do

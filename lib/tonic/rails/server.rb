@@ -137,7 +137,8 @@ module Tonic
 
         guarded = lambda do |path, metadata, transport|
           Instrumentation.instrument(path, metadata) { call.call(path, metadata, transport) }
-        rescue RpcError
+        rescue RpcError => e
+          attach_error_trailers(transport, e)
           raise
         rescue StandardError => e
           Tonic::Rails.log_exception(e, path)
@@ -145,6 +146,15 @@ module Tonic
         end
 
         wrap_with_rails_executor(guarded)
+      end
+
+      # An RpcError's own metadata and rich details travel as trailers.
+      def attach_error_trailers(transport, error)
+        return if error.metadata.empty? && error.details.empty?
+
+        transport[:sender]&.add_trailers(error.trailers)
+      rescue StandardError => e
+        Tonic::Rails.log_exception(e, "RpcError trailers")
       end
 
       # Each RPC runs inside the Rails executor (or reloader, when code

@@ -249,6 +249,39 @@ end
 When the deadline passes, the client gets `DEADLINE_EXCEEDED` right away;
 check `deadline_exceeded?` in long loops to stop wasted work.
 
+### Response metadata
+
+Set response headers and trailers from a handler:
+
+```ruby
+def get_item(request)
+  response_metadata["x-cache"] = "hit"           # headers
+  trailing_metadata["x-cost-ms"] = "3"           # trailers, sent with the status
+  response_metadata["x-trace-bin"] = trace_bytes # -bin names take binary values
+  Demo::V1::Item.new(id: request.id)
+end
+```
+
+For streaming responses, set headers before the first message is sent.
+Trailers are sent whether the call succeeds or fails.
+
+### Rich errors
+
+`RpcError` can carry trailing metadata and
+[rich error details](https://grpc.io/docs/guides/error/#richer-error-model):
+protobuf messages packed into a `google.rpc.Status` in the standard
+`grpc-status-details-bin` trailer, which official gRPC clients decode for
+you.
+
+```ruby
+raise Tonic::Rails::RpcError.new(
+  "invalid item",
+  code: :invalid_argument,
+  metadata: { "x-request-id" => request_id },
+  details: [Google::Rpc::BadRequest.new(field_violations: violations)],
+)
+```
+
 ### Interceptors
 
 Interceptors wrap every call, outermost first. Call `next_call` to
@@ -281,6 +314,11 @@ expect { Tonic::Rails::Testing.call(ItemService, :GetItem, { id: 0 }) }
 
 # Streaming: pass an Array of requests, get an Array of responses
 Tonic::Rails::Testing.call(ItemService, :ImportItems, [{ name: "a" }, { name: "b" }])
+
+# Response metadata
+result = Tonic::Rails::Testing.invoke(ItemService, :GetItem, { id: 1 })
+result.headers["x-cache"]    # => "hit"
+result.trailers["x-cost-ms"] # => "3"
 ```
 
 ## Configuration

@@ -24,6 +24,25 @@ RSpec.describe Tonic::Rails::RpcError do
     expect { described_class.new("x", code: 1.5) }.to raise_error(ArgumentError)
   end
 
+  describe "#trailers" do
+    it "is empty without metadata or details" do
+      expect(described_class.new("x").trailers).to eq({})
+    end
+
+    it "encodes metadata and details as a google.rpc.Status" do
+      require "google/rpc/status_pb"
+      error = described_class.new(
+        "bad", code: :invalid_argument, metadata: { "x-id" => "1" }, details: [Echo::V1::Detail.new(mood: :MOOD_HAPPY)]
+      )
+      trailers = error.trailers
+      expect(trailers["x-id"]).to eq("1")
+
+      status = Google::Rpc::Status.decode(trailers["grpc-status-details-bin"].unpack1("m0"))
+      expect([status.code, status.message]).to eq([3, "bad"])
+      expect(status.details.first.unpack(Echo::V1::Detail).mood).to eq(:MOOD_HAPPY)
+    end
+  end
+
   it "is a Tonic::Rails::Error" do
     expect(described_class.new("x")).to be_a(Tonic::Rails::Error)
   end

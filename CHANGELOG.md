@@ -9,12 +9,22 @@ minor versions may contain breaking changes.
 
 ### Added
 
+- Response metadata: handlers set `response_metadata` (headers) and
+  `trailing_metadata` (trailers, sent on success or failure).
+- Rich errors: `RpcError.new(..., metadata:, details:)` sends trailing
+  metadata and a `google.rpc.Status` with packed details in
+  `grpc-status-details-bin`.
+- `Tonic::Rails::Testing.invoke` returns the response together with response
+  headers and trailers.
 - `process_rpc.tonic_rails` ActiveSupport::Notifications event for every RPC,
   with path, service, rpc, metadata, status and code (for APM agents,
   OpenTelemetry and custom subscribers).
 
 ### Changed
 
+- Response headers are sent with the handler's first output instead of
+  before the handler runs, so handlers can set them. The client deadline
+  applies while waiting.
 - `log_requests` now logs one line per RPC through the configured (Rails)
   logger instead of stderr.
 - Transport events from the native extension (rejected calls, expired

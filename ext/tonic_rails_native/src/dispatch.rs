@@ -23,8 +23,9 @@ use tonic::Code;
 use tonic::body::Body as TonicBody;
 
 use crate::body::{ErrorBody, ResponseBody, ServerStats};
-use crate::framing::{MessageReader, parse_grpc_timeout};
+use crate::framing::{MessageReader, append_metadata, parse_grpc_timeout};
 use crate::gvl::{DispatchContext, RequestError, StreamMessage};
+use crate::log::Level;
 
 /// Messages buffered per direction before backpressure applies.
 const STREAM_BUFFER: usize = 32;
@@ -62,8 +63,8 @@ impl tower::Service<Request<axum::body::Body>> for DispatchService {
     }
 
     fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
-        let response = self.0.handle(req);
-        Box::pin(async move { Ok(response) })
+        let inner = self.0.clone();
+        Box::pin(async move { Ok(inner.handle(req).await) })
     }
 }
 
@@ -87,7 +88,7 @@ impl DispatchInner {
         grpc_response(TonicBody::new(ErrorBody::new(code, message)), false)
     }
 
-    fn handle(&self, req: Request<axum::body::Body>) -> Response<TonicBody> {
+    async fn handle(&self, req: Request<axum::body::Body>) -> Response<TonicBody> {
         let start = Instant::now();
         self.stats.total.fetch_add(1, Ordering::Relaxed);
         let path = req.uri().path().to_owned();
@@ -191,17 +192,52 @@ impl DispatchInner {
             gzip_request,
         ));
 
+        // Response headers wait for the handler's first output, so it can
+        // set initial metadata; unary calls send headers with the response
+        // as usual.  The client's deadline applies while we wait.
+        let mut response_rx = response_rx;
+        let mut deadline = timeout.map(|t| Box::pin(tokio::time::sleep(t)));
+        let first = match deadline.as_mut() {
+            Some(deadline) => tokio::select! {
+                biased;
+                message = response_rx.recv() => Some(message),
+                _ = deadline.as_mut() => None,
+            },
+            None => Some(response_rx.recv().await),
+        };
+        let (headers, pending) = match first {
+            None => return self.reject(&path, start, Code::DeadlineExceeded, "deadline exceeded"),
+            Some(None) => {
+                return self.reject(&path, start, Code::Internal, "handler ended without a response");
+            }
+            Some(Some(StreamMessage::Headers(headers))) => (headers, None),
+            Some(Some(message)) => (Vec::new(), Some(message)),
+        };
+
         let body = ResponseBody {
+            pending,
             receiver: Some(response_rx),
             stats: self.stats.clone(),
             path,
             start,
             compress,
-            deadline: timeout.map(|t| Box::pin(tokio::time::sleep(t))),
+            deadline,
             max_message_size,
             finished: false,
         };
-        grpc_response(TonicBody::new(body), compress)
+        let path = body.path.clone();
+        let mut response = grpc_response(TonicBody::new(body), compress);
+        let skipped = append_metadata(response.headers_mut(), &headers);
+        if !skipped.is_empty() {
+            self.stats.log.log(
+                Level::Warn,
+                &format!(
+                    "gRPC {path} dropped invalid or reserved response headers: {}",
+                    skipped.join(", ")
+                ),
+            );
+        }
+        response
     }
 }
 

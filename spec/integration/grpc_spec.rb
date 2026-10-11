@@ -79,6 +79,31 @@ RSpec.describe "gRPC integration", :integration do
         end
       end
 
+      it "sends response headers and trailers" do
+        op = stub.unary(request.new(message: "with-metadata"), return_op: true)
+        response = op.execute
+        expect(response.message).to eq("with-metadata")
+        expect(op.metadata).to include("x-echo-header" => "h1", "x-echo-bin" => "\x00\xFF".b)
+        expect(op.trailing_metadata).to include("x-echo-trailer" => "t1")
+      end
+
+      it "sends response headers on streams" do
+        op = stub.server_stream(request.new(message: "with-metadata", count: 3), return_op: true)
+        expect(op.execute.to_a.size).to eq(3)
+        expect(op.metadata).to include("x-echo-header" => "h1")
+        expect(op.trailing_metadata).to include("x-echo-trailer" => "t1")
+      end
+
+      it "sends error metadata and rich details" do
+        require "google/rpc/status_pb"
+        expect { stub.unary(request.new(fail_with: "details")) }.to raise_error(GRPC::InvalidArgument) do |error|
+          expect(error.metadata).to include("x-error-id" => "e42")
+          status = error.to_rpc_status
+          expect([status.code, status.message]).to eq([3, "invalid detail"])
+          expect(status.details.first.unpack(Echo::V1::Detail).mood).to eq(:MOOD_HAPPY)
+        end
+      end
+
       it "percent-encodes non-ASCII status messages" do
         stub_class = Class.new(EchoHandler) do
           def unary(_request) = raise(Tonic::Rails::RpcError.new("café ☕\nline", code: :aborted))
