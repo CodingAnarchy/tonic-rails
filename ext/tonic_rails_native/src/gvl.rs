@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::log::{Level, LogSink};
+use crate::sync::{Condvar, Mutex};
 use magnus::{
     Error, RHash, RString, Ruby, Value, prelude::*, r_hash::ForEach, typed_data::DataTypeFunctions,
     value::Opaque,
 };
-use parking_lot::{Condvar, Mutex};
 use rb_sys::{RB_NOGVL_INTR_FAIL, rb_nogvl, rb_thread_call_with_gvl};
 use tokio::sync::{Notify, mpsc};
 
@@ -101,7 +101,7 @@ where
 /// Minimal single-future executor that parks the current (non-tokio)
 /// thread.  tokio's channel and `Notify` futures are runtime-agnostic.
 ///
-/// It parks on a pthread condition variable rather than
+/// It parks on a condition variable rather than
 /// `std::thread::park`, which on macOS uses libdispatch: libdispatch
 /// traps in the child of a multi-threaded process, and the client blocks
 /// here in processes forked after it made calls.
@@ -131,7 +131,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
         }
         let mut woken = signal.woken.lock();
         while !*woken {
-            signal.condvar.wait(&mut woken);
+            woken = signal.condvar.wait(woken);
         }
         *woken = false;
     }

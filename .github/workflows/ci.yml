@@ -76,6 +76,9 @@ jobs:
           esac
       - name: Compile native extension
         run: bundle exec rake compile
+      - name: Check the extension's imports from Ruby's DLL
+        if: runner.os == 'Windows'
+        run: ruby script/check_windows_imports.rb lib/tonic/rails/tonic_rails_native.so
       - name: Rust unit tests
         run: bundle exec rake cargo:test
       - name: Specs

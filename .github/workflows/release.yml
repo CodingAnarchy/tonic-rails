@@ -116,6 +116,20 @@ jobs:
           gem install --no-document tonic-rails-*.gem
           gem list tonic-rails
           ruby -e 'require "tonic-rails"; Tonic::Rails.native_extension!; s = TonicRails::Native::Server.new("127.0.0.1:0", 1024); puts "ok: #{s.class}"'
+      - uses: actions/checkout@v7
+        if: runner.os == 'Windows'
+        with:
+          sparse-checkout: script
+          path: source
+      - name: Check the extension's imports from Ruby's DLL
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # The gem ships one binary per Ruby minor version: check each.
+          gem_dir=$(ruby -e 'puts Gem::Specification.find_by_name("tonic-rails").full_gem_path')
+          for so in "$gem_dir"/lib/tonic/rails/*/tonic_rails_native.so; do
+            ruby source/script/check_windows_imports.rb "$so"
+          done
 
   publish:
     needs: [source-gem, test-native-gems]
