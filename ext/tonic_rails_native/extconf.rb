@@ -19,9 +19,13 @@ if RbConfig::CONFIG["target_os"].to_s.include?("mingw")
   dir = File.expand_path("kernel32_sleep")
   FileUtils.mkdir_p(dir)
   File.write(File.join(dir, "sleep.def"), "LIBRARY kernel32.dll\nEXPORTS\nSleep\n")
-  dlltool = RbConfig::CONFIG["DLLTOOL"].to_s.empty? ? "dlltool" : RbConfig::CONFIG["DLLTOOL"]
-  unless system(*Shellwords.split(dlltool), "-d", File.join(dir, "sleep.def"),
-                "-l", File.join(dir, "libtonic_rails_sleep.a"))
+  # Cross-compiling, RbConfig describes the target, so its DLLTOOL may not
+  # exist here: try the one next to the C compiler too.
+  compiler = Shellwords.split(RbConfig::CONFIG["CC"].to_s).find { |word| word.include?("gcc") }.to_s
+  candidates = [RbConfig::CONFIG["DLLTOOL"], compiler.sub(/gcc(\.exe)?\z/, "dlltool"), "dlltool"]
+  dlltool = candidates.reject { |tool| tool.to_s.empty? }.uniq.find { |tool| find_executable(tool) }
+  abort "tonic-rails: no dlltool found (tried #{candidates.compact.uniq.join(', ')})" unless dlltool
+  unless system(dlltool, "-d", File.join(dir, "sleep.def"), "-l", File.join(dir, "libtonic_rails_sleep.a"))
     abort "tonic-rails: #{dlltool} failed to build the kernel32 Sleep import library"
   end
   RbConfig::CONFIG["LIBS"] = "-L#{Shellwords.escape(dir)} -ltonic_rails_sleep #{RbConfig::CONFIG['LIBS']}"
