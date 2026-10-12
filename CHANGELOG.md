@@ -7,6 +7,8 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-12
+
 ### Added
 
 - Client: `method_retries:` sets retry policies per service
@@ -21,9 +23,9 @@ minor versions may contain breaking changes.
   extension's locks spun and then called `Sleep`, which the mingw linker
   bound to the `Sleep` that Ruby's DLL exports instead of the system's,
   and Ruby's version crashes on threads Ruby doesn't own. Locks now come
-  from Rust's standard library, which never calls `Sleep`, and CI checks
-  that the Windows build imports nothing but Ruby's C API from Ruby's
-  DLL. 0.6.0 and 0.7.0 crashed in about 1 in 5 runs of the test suite;
+  from Rust's standard library, which doesn't spin through `Sleep`, the
+  build binds `Sleep` to kernel32, and CI checks that the Windows build
+  imports nothing but Ruby's C API from Ruby's DLL. 0.6.0 and 0.7.0 crashed in about 1 in 5 runs of the test suite;
   earlier versions could crash in the same way, but rarely.
 
 ## [0.7.0] - 2026-10-11
@@ -205,7 +207,8 @@ First public release.
 - Precompiled native gems for Linux (x86_64, aarch64; glibc and musl) and
   macOS (x86_64, arm64), Ruby 3.3 to 4.0.
 
-[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/CodingAnarchy/tonic-rails/compare/v0.4.0...v0.5.0
