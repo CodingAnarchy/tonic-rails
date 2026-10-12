@@ -81,11 +81,13 @@ module Tonic
         # Precompiled platform gems ship one binary per Ruby minor version.
         ruby_version = RUBY_VERSION[/\d+\.\d+/]
         require "tonic/rails/#{ruby_version}/tonic_rails_native"
-      rescue LoadError
+      rescue LoadError => versioned
         begin
           require "tonic/rails/tonic_rails_native"
         rescue LoadError => e
-          @native_load_error = e
+          # A precompiled binary that exists but won't load says more than
+          # the missing fallback does.
+          @native_load_error = versioned.message.include?("cannot load such file") ? e : versioned
         end
       end
     end
