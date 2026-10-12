@@ -9,9 +9,7 @@ require "rb_sys/mkmf"
 # extension's calls would bind to Ruby's.  rb-sys passes `LIBS` first, so
 # naming kernel32 there binds them to the system's instead.
 # script/check_windows_imports.rb checks the result in CI.
-if RbConfig::CONFIG["target_os"].to_s.include?("mingw")
-  RbConfig::CONFIG["LIBS"] = "-lkernel32 #{RbConfig::CONFIG['LIBS']}"
-end
+RbConfig::CONFIG["LIBS"] = "-lkernel32 #{RbConfig::CONFIG['LIBS']}" if RbConfig::CONFIG["target_os"].to_s.include?("mingw")
 
 # Builds the Rust crate with cargo and installs the library as
 # lib/tonic/rails/tonic_rails_native.{so,bundle}, matching
