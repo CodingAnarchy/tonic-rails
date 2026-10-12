@@ -326,10 +326,12 @@ RSpec.describe Tonic::Rails::Client, :integration do
     it "stops at the deadline instead of waiting to retry" do
       stub = echo(refused, retries: { max_attempts: 5, initial_backoff: 1, multiplier: 1, max_backoff: 1 })
       started = monotonic
-      # The last attempt's failure: UNAVAILABLE where a closed port refuses
-      # at once, DEADLINE_EXCEEDED on Windows, which retries the connection.
+      # The last attempt's failure: UNAVAILABLE when the port refused it,
+      # DEADLINE_EXCEEDED when the deadline passed during the attempt (a
+      # retry that started just before it, or Windows, which retries a
+      # connection to a closed port for seconds).
       expect { stub.unary({}, deadline: 0.3) }.to raise_error(Tonic::Rails::RpcError) do |error|
-        expect(error.code_name).to eq(Gem.win_platform? ? :deadline_exceeded : :unavailable)
+        expect(error.code_name).to eq(:unavailable).or eq(:deadline_exceeded)
       end
       expect(monotonic - started).to be < 0.5
     end
