@@ -288,10 +288,11 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 0.5) }
       # Unbounded, it would have read thousands by now.  The handler reads
       # about ten, and HTTP/2 flow control and buffers let about sixty more
-      # through.  (Large messages keep the server's backlog short: its
-      # handler reads what's buffered before it sees the cancel, #57.)
+      # through.
       expect(yielded).to be < 150
-      expect(stream_ended).to eq(:cancelled)
+      # The handler reads what's buffered before it sees the cancel (#57),
+      # which takes a while on slow runners.
+      expect(CountingStreamHandler.ended.pop(timeout: 20)).to eq(:cancelled)
     end
 
     it "raises the server's error, and stops reading requests once the call has failed" do
