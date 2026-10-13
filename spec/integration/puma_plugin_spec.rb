@@ -55,8 +55,21 @@ RSpec.describe "Puma plugin", :integration do
     true
   end
 
-  def grpc_child_pid(output)
-    output[/gRPC server started \(pid (\d+)\)/, 1]&.to_i
+  # Puma's output arrives through a reader thread, so a line can lag the
+  # event that produced it: give it a moment rather than checking at once.
+  def await_output(puma, pattern, seconds = 10)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+    sleep 0.1 until puma[:output].match?(pattern) || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+    puma[:output]
+  end
+
+  def expect_output(puma, text)
+    expect(await_output(puma, Regexp.new(Regexp.escape(text)))).to include(text)
+  end
+
+  def grpc_child_pid(puma)
+    started = /gRPC server started \(pid (\d+)\)/
+    await_output(puma, started)[started, 1]&.to_i
   end
 
   def stop(puma)
@@ -76,7 +89,7 @@ RSpec.describe "Puma plugin", :integration do
       begin
         wait_until { grpc_up?(puma[:grpc]) }
         expect(Net::HTTP.get(URI("http://127.0.0.1:#{puma[:http]}/up"))).to eq("ok")
-        grpc_pid = grpc_child_pid(puma[:output])
+        grpc_pid = grpc_child_pid(puma)
         expect(grpc_pid).to be_a(Integer)
 
         stop(puma)
@@ -95,10 +108,12 @@ RSpec.describe "Puma plugin", :integration do
     puma = start_puma(workers: 2, preload: true, grpc_processes: 2)
     begin
       wait_until { grpc_up?(puma[:grpc]) }
-      expect(puma[:output]).to include("(2 processes × 4 dispatch threads each)")
+      # Logged once every worker is ready; a call can succeed as soon as the
+      # first one serves.
+      expect_output(puma, "(2 processes × 4 dispatch threads each)")
 
       stop(puma)
-      expect(puma[:output]).to include("shutting down 2 workers")
+      expect_output(puma, "shutting down 2 workers")
       expect(grpc_up?(puma[:grpc])).to be(false)
     rescue StandardError
       warn puma[:output]
@@ -112,9 +127,9 @@ RSpec.describe "Puma plugin", :integration do
     puma = start_puma(workers: 0)
     begin
       wait_until { grpc_up?(puma[:grpc]) }
-      Process.kill(:KILL, grpc_child_pid(puma[:output]))
+      Process.kill(:KILL, grpc_child_pid(puma))
       wait_until(20) { exited?(puma[:pid]) }
-      expect(puma[:output]).to include("exited unexpectedly; stopping Puma")
+      expect_output(puma, "exited unexpectedly; stopping Puma")
     ensure
       Process.kill(:KILL, -puma[:pid]) rescue nil # rubocop:disable Style/RescueModifier
     end
