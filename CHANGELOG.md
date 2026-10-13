@@ -19,6 +19,14 @@ minor versions may contain breaking changes.
   Retries apply only if the call failed before its first request was
   read.
 
+### Fixed
+
+- Server: when a client cancelled a client- or bidirectional-streaming
+  call (or its deadline passed), the handler went on reading every
+  request the server had buffered before it saw the cancel, holding a
+  dispatch thread for seconds and delaying shutdown (#57). The next read
+  now raises `CANCELLED` straight away.
+
 ## [0.8.1] - 2026-10-13
 
 ### Fixed

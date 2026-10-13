@@ -25,7 +25,7 @@ use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 
 use crate::body::{ResponseBody, ServerStats};
 use crate::framing::{MessageReader, append_metadata, parse_grpc_timeout, status_trailers};
-use crate::gvl::{DispatchContext, Peer, RequestError, StreamMessage};
+use crate::gvl::{CancelRequests, DispatchContext, Peer, RequestError, StreamMessage};
 use crate::log::Level;
 
 /// Messages buffered per direction before backpressure applies.
@@ -164,6 +164,9 @@ impl DispatchInner {
         let (request_tx, request_rx) = mpsc::channel::<Vec<u8>>(STREAM_BUFFER);
         let (response_tx, response_rx) = mpsc::channel::<StreamMessage>(STREAM_BUFFER);
         let request_error = Arc::new(RequestError::default());
+        // Dropped with this future if the client resets the stream before
+        // the response headers; then moved into the response body.
+        let cancel_requests = CancelRequests::new(request_error.clone());
 
         let ctx = Box::new(DispatchContext {
             callback: self.callback,
@@ -233,6 +236,7 @@ impl DispatchInner {
             deadline,
             max_message_size,
             finished: false,
+            cancel_requests,
         };
         let path = body.path.clone();
         let mut response = grpc_response(TonicBody::new(body), compress);
@@ -272,7 +276,8 @@ fn peer_of<B>(req: &Request<B>) -> Peer {
 
 /// Read the request body and forward each unframed message to the
 /// handler.  Dropping `tx` signals end of stream; errors are recorded
-/// in `error` first so the reader can distinguish them.
+/// in `error` first so the reader can distinguish them.  Stops as soon as
+/// the call is cancelled, even while waiting on the handler.
 async fn feed_request(
     body: axum::body::Body,
     tx: mpsc::Sender<Vec<u8>>,
@@ -283,7 +288,12 @@ async fn feed_request(
     let mut reader = MessageReader::new(max_message_size, gzip);
     let mut body = body;
     loop {
-        let frame = match body.frame().await {
+        let frame = tokio::select! {
+            biased;
+            _ = error.cancelled() => return,
+            frame = body.frame() => frame,
+        };
+        let frame = match frame {
             None => break,
             Some(Ok(frame)) => frame,
             Some(Err(_)) => {
@@ -297,11 +307,13 @@ async fn feed_request(
         reader.push(&data);
         loop {
             match reader.try_next() {
-                Ok(Some(message)) => {
-                    if tx.send(message).await.is_err() {
+                Ok(Some(message)) => tokio::select! {
+                    biased;
+                    _ = error.cancelled() => return,
+                    sent = tx.send(message) => if sent.is_err() {
                         return; // handler finished without reading everything
-                    }
-                }
+                    },
+                },
                 Ok(None) => break,
                 Err(e) => {
                     error.set(e.code(), e.message());

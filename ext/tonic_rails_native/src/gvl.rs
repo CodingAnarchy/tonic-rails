@@ -315,10 +315,14 @@ pub struct RequestReader {
 
 /// Set by the body-reading task when the request stream is invalid, so
 /// the reader can tell an error-closed channel from a clean end of stream.
+/// Also set, through [`CancelRequests`], when the call is cancelled: then
+/// the reader stops at once, without handing over what's still buffered.
 #[derive(Default)]
 pub struct RequestError {
     code: AtomicU32,
     message: Mutex<&'static str>,
+    cancelled: AtomicBool,
+    notify: Notify,
 }
 
 impl RequestError {
@@ -327,10 +331,59 @@ impl RequestError {
         self.code.store(code as u32, Ordering::Release);
     }
 
+    fn cancel(&self) {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.set(tonic::Code::Cancelled, "call cancelled");
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the call is cancelled.
+    pub async fn cancelled(&self) {
+        loop {
+            // Created before the check, so a cancel in between still wakes it.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn get(&self) -> Option<(u32, &'static str)> {
         match self.code.load(Ordering::Acquire) {
             0 => None,
             code => Some((code, *self.message.lock())),
+        }
+    }
+}
+
+/// Cancels a call's request stream when dropped, unless disarmed: held by
+/// the call until the handler's own status goes out, so a client that
+/// resets or disconnects, or a deadline that passes, stops the handler's
+/// reads at once.
+pub struct CancelRequests(Option<Arc<RequestError>>);
+
+impl CancelRequests {
+    pub fn new(error: Arc<RequestError>) -> Self {
+        Self(Some(error))
+    }
+
+    /// The call finished normally: leave the request stream alone.
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelRequests {
+    fn drop(&mut self) {
+        if let Some(error) = self.0.take() {
+            error.cancel();
         }
     }
 }
@@ -342,6 +395,9 @@ impl RequestReader {
 
     /// Next raw message, or nil at end of stream.  Check `#error` after nil.
     pub fn next(ruby: &Ruby, this: &Self) -> Result<Option<RString>, Error> {
+        if this.error.is_cancelled() {
+            return Ok(None);
+        }
         // Taken out of the mutex while blocked so a concurrent caller
         // (misuse) sees end-of-stream rather than deadlocking.
         let Some(mut rx) = this.rx.lock().take() else {
@@ -349,6 +405,10 @@ impl RequestReader {
         };
         loop {
             match recv_blocking(&mut rx) {
+                Wait::Ready(_) if this.error.is_cancelled() => {
+                    this.rx.lock().replace(rx);
+                    return Ok(None);
+                }
                 Wait::Ready(bytes) => {
                     this.rx.lock().replace(rx);
                     return Ok(Some(ruby.str_from_slice(&bytes)));
