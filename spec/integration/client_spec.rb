@@ -293,6 +293,28 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(stream_ended).to eq(:cancelled)
     end
 
+    it "keeps its connection while sending tiny requests far faster than the server reads them" do
+      yielded = 0
+      endless = Enumerator.new do |y|
+        loop do
+          yielded += 1
+          y << { sleep_ms: 100 }
+        end
+      end
+      side_calls = Thread.new do
+        Array.new(3) do
+          sleep 0.3
+          counting.server_stream(count: 1).to_a.size
+        end
+      end
+      # h2 closes a connection that leaves too many small DATA frames unread
+      # (#56); that would fail this call, and the others on the connection,
+      # with UNAVAILABLE.
+      expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 1.5) }
+      expect(side_calls.value).to eq([1, 1, 1])
+      expect(yielded).to be > 10_000
+    end
+
     it "stops the server's handler at once when it gives up, whatever the server has buffered" do
       endless = Enumerator.new { |y| loop { y << { message: "x" * 16 * 1024, sleep_ms: 100 } } }
       expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 0.3) }

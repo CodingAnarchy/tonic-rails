@@ -62,6 +62,11 @@ impl MessageReader {
         }
     }
 
+    /// Bytes received and not yet returned as messages.
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
     pub fn push(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
     }
