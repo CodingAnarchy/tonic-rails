@@ -64,10 +64,8 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(client.stub(descriptor)).to be(stub)
     end
 
-    it "names methods in snake_case and refuses client-streaming RPCs" do
+    it "names methods in snake_case" do
       expect(stub).to respond_to(:unary, :server_stream, :client_stream, :bidi)
-      expect { stub.client_stream }.to raise_error(NotImplementedError, /ClientStream is a client-streaming RPC/)
-      expect { stub.bidi }.to raise_error(NotImplementedError, /Bidi is a client-streaming RPC/)
     end
 
     it "rejects unknown services and the wrong request type" do
@@ -254,6 +252,183 @@ RSpec.describe Tonic::Rails::Client, :integration do
     end
   end
 
+  describe "client streaming" do
+    before(:all) { @counting = IntegrationServer.start(services: [CountingStreamHandler]) }
+    after(:all) { IntegrationServer.stop(@counting) }
+
+    before { CountingStreamHandler.ended.clear }
+
+    let(:counting) { described_class.new(@counting[:address], tls: false).stub("echo.v1.EchoService") }
+
+    def stream_ended = CountingStreamHandler.ended.pop(timeout: 5)
+
+    it "sends each request from any Enumerable and returns the response" do
+      requests = [Echo::V1::EchoRequest.new(message: "a"), { message: "b" }]
+      expect(stub.client_stream(requests)).to have_attributes(message: "a,b", index: 2)
+      expect(stub.client_stream((1..3).lazy.map { |i| { message: i.to_s } }).message).to eq("1,2,3")
+      expect(stub.client_stream([]).index).to eq(0)
+      expect(stub.client_stream([{}], deadline: 5)).to be_a(Echo::V1::EchoResponse)
+    end
+
+    it "returns headers and trailers with return_call" do
+      call = stub.client_stream([{ message: "with-metadata" }], return_call: true)
+      expect(call.response.message).to eq("with-metadata")
+      expect(call.headers).to include("x-echo-header" => "h1", "x-echo-bin" => "\x00\xFF".b)
+      expect(call.trailers).to eq("x-echo-trailer" => "t1")
+    end
+
+    it "reads requests as it sends them, holding back while the server is slow" do
+      yielded = 0
+      endless = Enumerator.new do |y|
+        loop do
+          yielded += 1
+          y << { message: "x" * 16 * 1024, sleep_ms: 10 }
+        end
+      end
+      expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 0.5) }
+      # Unbounded, it would have read tens of thousands by now.  HTTP/2
+      # flow control lets a few hundred through.
+      expect(yielded).to be < 1000
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "raises the server's error, and stops reading requests once the call has failed" do
+      # Endless: the call has to stop reading it.
+      requests = Enumerator.new do |y|
+        y << { fail_with: "mid-stream" }
+        loop { y << {} }
+      end
+      expect_rpc_error(:aborted, "failed mid-stream") { counting.client_stream(requests, deadline: 5) }
+      expect_rpc_error(:not_found) { stub.client_stream([{ fail_with: "rpc:not_found" }]) }
+    end
+
+    it "cancels the call when the Enumerable raises, and re-raises its error" do
+      requests = Enumerator.new do |y|
+        y << {}
+        sleep 0.2
+        raise ArgumentError, "bad row"
+      end
+      expect { counting.client_stream(requests, deadline: 5) }.to raise_error(ArgumentError, "bad row")
+      expect(stream_ended).to eq(:cancelled)
+      expect { stub.client_stream([{}, Echo::V1::EchoResponse.new]) }.to raise_error(TypeError, /expects a Echo::V1::EchoRequest/)
+    end
+
+    it "rejects requests that aren't Enumerable" do
+      expect { stub.client_stream(Echo::V1::EchoRequest.new) }.to raise_error(TypeError, /pass an Enumerable/)
+    end
+  end
+
+  describe "bidirectional streaming" do
+    before(:all) { @counting = IntegrationServer.start(services: [CountingStreamHandler]) }
+    after(:all) { IntegrationServer.stop(@counting) }
+
+    before { CountingStreamHandler.ended.clear }
+
+    let(:counting) { described_class.new(@counting[:address], tls: false).stub("echo.v1.EchoService") }
+
+    def stream_ended = CountingStreamHandler.ended.pop(timeout: 5)
+
+    it "yields a response for each request" do
+      stream = stub.bidi([{ message: "a" }, Echo::V1::EchoRequest.new(message: "b")])
+      expect(stream).to be_a(Tonic::Rails::Client::ServerStream)
+      expect(stream.map { |response| [response.message, response.index] }).to eq([["a", 0], ["b", 1]])
+      expect { stream.to_a }.to raise_error(Tonic::Rails::Error, /already been read/)
+      expect(stub.bidi([]).to_a).to eq([])
+      expect(stub.bidi([{}]).each).to be_a(Enumerator)
+    end
+
+    it "sends requests while reading responses, so a request can depend on a response" do
+      replies = Queue.new
+      requests = Enumerator.new do |y|
+        y << { message: "1" }
+        while (reply = replies.pop) != :done
+          y << { message: (reply.to_i + 1).to_s }
+        end
+      end
+      messages = []
+      stub.bidi(requests, deadline: 5).each do |response|
+        messages << response.message
+        replies << (messages.size < 3 ? response.message : :done)
+      end
+      expect(messages).to eq(%w[1 2 3])
+    end
+
+    it "returns headers and trailers once the stream has ended" do
+      stream = stub.bidi([{ message: "with-metadata" }])
+      stream.to_a
+      expect(stream.headers).to include("x-echo-header" => "h1")
+      expect(stream.trailers).to eq("x-echo-trailer" => "t1")
+    end
+
+    it "holds back both sides while the reader is slow" do
+      yielded = 0
+      endless = Enumerator.new do |y|
+        loop do
+          yielded += 1
+          y << { message: "x" * 16 * 1024, pad_bytes: 64 * 1024 }
+        end
+      end
+      counting.bidi(endless).each do # rubocop:disable Lint/UnreachableLoop
+        sleep 0.5
+        break
+      end
+      # Unbounded, both would be in the tens of thousands by now.
+      expect(yielded).to be < 1000
+      expect(CountingStreamHandler.received).to be < 1000
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "cancels the call and stops reading requests when the reader stops early" do
+      waiting = Queue.new
+      requests = Enumerator.new do |y|
+        y << {}
+        waiting.pop # never answered
+      end
+      threads = Thread.list.size
+      expect(counting.bidi(requests).first.index).to eq(0)
+      expect(stream_ended).to eq(:cancelled)
+      expect(Thread.list.size).to eq(threads)
+
+      stop = proc { raise ArgumentError, "stop" }
+      expect { counting.bidi(requests).each(&stop) }.to raise_error(ArgumentError, "stop")
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "raises the Enumerable's error to the reader, cancelling the call" do
+      requests = Enumerator.new do |y|
+        y << {}
+        sleep 0.2
+        raise ArgumentError, "bad input"
+      end
+      received = []
+      expect { counting.bidi(requests, deadline: 5).each { |response| received << response.index } }
+        .to raise_error(ArgumentError, "bad input")
+      expect(received).to eq([0])
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "raises RpcError after the responses that came before it" do
+      received = []
+      expect_rpc_error(:aborted, "failed mid-stream") do
+        counting.bidi([{}, {}, { fail_with: "mid-stream" }]).each { |response| received << response.index }
+      end
+      expect(received).to eq([0, 1])
+    end
+
+    it "applies the deadline to the whole call" do
+      waiting = Queue.new
+      requests = Enumerator.new do |y|
+        y << {}
+        waiting.pop
+      end
+      started = monotonic
+      received = []
+      expect_rpc_error(:deadline_exceeded) { counting.bidi(requests, deadline: 0.3).each { |r| received << r.index } }
+      expect(received).to eq([0])
+      expect(monotonic - started).to be < 3
+    end
+  end
+
   describe "retries" do
     let(:log) { StringIO.new }
     let(:logger) { Logger.new(log, formatter: ->(_, _, _, message) { "#{message}\n" }) }
@@ -387,6 +562,28 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(delay.call("soon")).to be_nil
       expect(delay.call(nil)).to be_between(0, 0.1)
       expect(delay.call(nil, attempt: 3)).to be_nil
+    end
+
+    it "retries client and bidi streams that failed before reading a request" do
+      stub = echo(refused, retries: { max_attempts: 2, initial_backoff: 0.01 })
+      read = 0
+      requests = Enumerator.new { |y| y << { message: (read += 1).to_s } }
+      attempts = attempts_of do
+        expect_rpc_error(:unavailable) { stub.client_stream(requests) }
+        expect_rpc_error(:unavailable) { stub.bidi(requests).to_a }
+      end
+      expect(attempts).to eq([2, 2])
+      expect(read).to eq(0)
+      expect(echo(address, retries: true).client_stream(requests).message).to eq("1")
+    end
+
+    it "never repeats a stream once it has read a request" do
+      stub = echo(address, retries: { max_attempts: 3, initial_backoff: 0.01, codes: [:aborted] })
+      attempts = attempts_of do
+        expect_rpc_error(:aborted) { stub.client_stream([{ fail_with: "rpc:aborted" }]) }
+        expect_rpc_error(:aborted) { stub.bidi([{ fail_with: "rpc:aborted" }]).to_a }
+      end
+      expect(attempts).to eq([1, 1])
     end
 
     it "retries a server stream that failed before any message" do

@@ -103,12 +103,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     channel.define_singleton_method("new", function!(NativeChannel::new, 4))?;
     channel.define_method("unary", method!(NativeChannel::unary, 4))?;
     channel.define_method("server_streaming", method!(NativeChannel::server_streaming, 4))?;
+    channel.define_method("streaming", method!(NativeChannel::streaming, 3))?;
 
     let stream = native.define_class("ResponseStream", ruby.class_object())?;
     stream.undef_default_alloc_func();
     stream.define_method("next", method!(ResponseStream::next, 0))?;
     stream.define_method("result", method!(ResponseStream::result, 0))?;
     stream.define_method("close", method!(ResponseStream::close, 0))?;
+    stream.define_method("ready", method!(ResponseStream::ready, 0))?;
+    stream.define_method("push", method!(ResponseStream::push, 1))?;
+    stream.define_method("close_send", method!(ResponseStream::close_send, 0))?;
 
     Ok(())
 }

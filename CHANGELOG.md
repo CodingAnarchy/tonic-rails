@@ -7,6 +7,18 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Client: client-streaming and bidirectional-streaming calls (#54, #55),
+  so the client now makes every kind of gRPC call. Both take an
+  Enumerable of requests, sent as it yields them with backpressure.
+  Client streaming returns the response, like a unary call;
+  bidirectional streaming returns a stream of responses, with requests
+  sent from another thread so a request can wait on a response. If the
+  Enumerable raises, the call is cancelled and the exception re-raised.
+  Retries apply only if the call failed before its first request was
+  read.
+
 ## [0.8.1] - 2026-10-13
 
 ### Fixed

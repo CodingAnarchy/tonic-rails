@@ -14,6 +14,8 @@ module Tonic
     #   item = items.get_item(id: 1)
     #   item = items.get_item({ id: 1 }, deadline: 0.5, metadata: { "x-request-id" => request_id })
     #   items.list_items(category: "books").each { |item| ... }
+    #   items.import_items(rows.lazy.map { |row| { name: row[:name] } })
+    #   items.sync(changes).each { |ack| ... }
     #
     # Retries are opt-in: `retries: true` (or a Hash; see RetryPolicy) on
     # the client or a call retries calls the server never started on.
@@ -175,6 +177,51 @@ module Tonic
         end
       end
 
+      # Make a client-streaming call.  Stubs call this; use them instead.
+      # @api private
+      def client_streaming(path, input, output, requests, deadline: nil, metadata: {}, return_call: false,
+                           retries: nil)
+        enumerable!(path, requests)
+        metadata = call_metadata(metadata)
+        deadline_at = deadline_at(deadline)
+        policy = retry_policy(path, retries)
+
+        Instrumentation.instrument_request(path, address, metadata) do |payload|
+          code, error_message, responses, headers, trailers, details = with_retries(path, policy, deadline_at, payload) do
+            streaming_call(path, input, metadata, deadline_at).client_stream(requests)
+          end
+          headers = decode_metadata(headers)
+          trailers = decode_metadata(trailers)
+          check_status!(code, error_message, trailers, details)
+
+          response = single_response(output, responses, path)
+          return_call ? Call.new(response: response, headers: headers, trailers: trailers) : response
+        end
+      end
+
+      # Start a bidirectional-streaming call.  Stubs call this; use them
+      # instead.
+      # @api private
+      def bidi_streaming(path, input, output, requests, deadline: nil, metadata: {}, retries: nil)
+        enumerable!(path, requests)
+        metadata = call_metadata(metadata)
+        deadline_at = deadline_at(deadline)
+        policy = retry_policy(path, retries)
+
+        ServerStream.new(path) do |stream, block|
+          Instrumentation.instrument_request(path, address, metadata) do |payload|
+            code, error_message, _, headers, trailers, details = with_retries(path, policy, deadline_at, payload) do
+              streaming_call(path, input, metadata, deadline_at).bidi(requests) do |bytes|
+                block.call(decode_response(output, bytes, path))
+              end
+            end
+            trailers = decode_metadata(trailers)
+            stream.finish(decode_metadata(headers), trailers)
+            check_status!(code, error_message, trailers, details)
+          end
+        end
+      end
+
       private
 
       def validate_address!(address)
@@ -246,6 +293,24 @@ module Tonic
         (remaining * 1000).ceil
       end
 
+      def enumerable!(path, requests)
+        return if requests.respond_to?(:each)
+
+        raise TypeError, "#{path} streams its requests: pass an Enumerable of them, got #{requests.class}"
+      end
+
+      def streaming_call(path, input, metadata, deadline_at)
+        native = @native.streaming(path, metadata, remaining_ms(deadline_at))
+        StreamingCall.new(native) { |request| input.encode(request_message(path, input, request)) }
+      end
+
+      def single_response(output, responses, path)
+        raise RpcError.new("server sent no response message", code: :internal) if responses.empty?
+        raise RpcError.new("server sent more than one response message", code: :internal) if responses.size > 1
+
+        decode_response(output, responses.first, path)
+      end
+
       # Yield each message of a native stream, then return its result.
       def read_stream(native, output, path)
         while (bytes = native.next)
@@ -305,17 +370,19 @@ module Tonic
           def define_rpc(method)
             path = "/#{service_name}/#{method.name}"
             name = ActiveSupport::Inflector.underscore(method.name)
-            if method.client_streaming
-              define_method(name) do |*, **|
-                raise NotImplementedError,
-                      "#{path} is a client-streaming RPC; the tonic-rails client makes unary and server-streaming calls"
-              end
-              return
-            end
-
             input = method.input_type.msgclass
             output = method.output_type.msgclass
-            if method.server_streaming
+            if method.client_streaming && method.server_streaming
+              define_method(name) do |requests, deadline: nil, metadata: {}, retries: nil|
+                @client.bidi_streaming(path, input, output, requests, deadline: deadline, metadata: metadata,
+                                                                      retries: retries)
+              end
+            elsif method.client_streaming
+              define_method(name) do |requests, deadline: nil, metadata: {}, return_call: false, retries: nil|
+                @client.client_streaming(path, input, output, requests, deadline: deadline, metadata: metadata,
+                                                                        return_call: return_call, retries: retries)
+              end
+            elsif method.server_streaming
               define_method(name) do |request = nil, deadline: nil, metadata: {}, retries: nil, **fields|
                 request = rpc_request(name, request, fields)
                 @client.server_streaming(path, input, output, request, deadline: deadline, metadata: metadata,
@@ -355,9 +422,9 @@ module Tonic
         end
       end
 
-      # The responses of a server-streaming call.  Nothing is sent until
-      # it's read; then messages are yielded as they arrive, a few at most
-      # buffered ahead of the reader.
+      # The responses of a server- or bidirectional-streaming call.  Nothing
+      # is sent until it's read; then messages are yielded as they arrive, a
+      # few at most buffered ahead of the reader.
       #
       #   items.list_items(category: "books").each { |item| ... }
       #   items.list_items(category: "books").first(10)
@@ -407,3 +474,4 @@ module Tonic
 end
 
 require "tonic/rails/client/retry_policy"
+require "tonic/rails/client/streaming_call"

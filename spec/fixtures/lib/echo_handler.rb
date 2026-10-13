@@ -26,6 +26,7 @@ class EchoHandler
 
   def client_stream(requests)
     messages = requests.map do |request|
+      add_metadata(request)
       work(request)
       request.message
     end
@@ -35,6 +36,7 @@ class EchoHandler
   def bidi(requests)
     Enumerator.new do |y|
       requests.each_with_index do |request, i|
+        add_metadata(request)
         work(request)
         y << response(request, index: i)
       end

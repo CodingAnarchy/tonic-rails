@@ -44,8 +44,8 @@ end
   INTERNAL error (the details go to your logs and `Rails.error`).
   Reflection is off unless you turn it on. TLS problems stop the server
   instead of silently falling back to plaintext.
-- **A client too.** Make unary and server-streaming calls to other gRPC
-  services, with deadlines that follow your handler's, without the
+- **A client too.** Make all four kinds of call to other gRPC services,
+  with deadlines that follow your handler's, without the
   `grpc` gem and its fork crashes. See
   [Calling other services](#calling-other-services).
 - **No Rust toolchain needed** on the platforms we ship precompiled gems
@@ -407,9 +407,9 @@ const item = await client.getItem({ id: 1n });
 
 ## Calling other services
 
-tonic-rails includes a client for unary and server-streaming calls to
-other gRPC services, so
-an app that serves gRPC (or just calls it) doesn't need the `grpc` gem.
+tonic-rails includes a client for every kind of gRPC call (unary, server
+streaming, client streaming and bidirectional streaming), so an app that
+serves gRPC (or just calls it) doesn't need the `grpc` gem.
 It runs on the same Rust stack as the server, and it keeps working after
 `fork`. That matters because the `grpc` gem crashes or hangs in forked
 processes (Puma with `preload_app!`, Sidekiq swarm, Resque) unless you
@@ -462,8 +462,54 @@ items.list_items(category: "books").first(10)  # stops after ten
   metadata.
 - A stream can be read once. Call the method again for a new one.
 
-Client and bidirectional streaming aren't supported yet; their stub
-methods raise `NotImplementedError`.
+### Client streaming
+
+A client-streaming method takes any Enumerable of requests (messages or
+Hashes) and returns the response, like a unary call:
+
+```ruby
+summary = items.import_items(rows.lazy.map { |row| { name: row["name"], price: row["price"] } })
+call = items.import_items(batch, return_call: true)  # with headers and trailers
+```
+
+- Requests are sent as the Enumerable yields them, so a lazy Enumerator
+  can stream more than fits in memory. A slow server holds it back: the
+  client reads only as far ahead as HTTP/2 flow control allows.
+- If the Enumerable raises, the call is cancelled and its exception
+  reaches you unchanged.
+- If the server fails partway through, the client stops reading the
+  Enumerable and raises `Tonic::Rails::RpcError`.
+
+### Bidirectional streaming
+
+A bidirectional method takes an Enumerable of requests and returns a
+stream of responses, read like a server stream. Requests are sent from a
+separate thread while you read, so a request can wait on a response:
+
+```ruby
+replies = Queue.new
+requests = Enumerator.new do |y|
+  y << { question: "first" }
+  while (answer = replies.pop) != :done
+    y << { question: "follow-up to #{answer.text}" }
+  end
+end
+
+chat.converse(requests, deadline: 30).each do |answer|
+  show(answer)
+  replies << (answer.final ? :done : answer)
+end
+```
+
+- Backpressure works both ways: a slow server holds back reading your
+  requests, and a slow reader holds back the server.
+- Stopping early cancels the call and stops reading the Enumerable, even
+  if it's waiting for something (like the `Queue` above).
+- If the Enumerable raises, the call is cancelled and the exception is
+  raised where you read the responses.
+- The Enumerable runs on another thread, so it doesn't see your thread's
+  thread-locals (or `ActiveSupport::CurrentAttributes`). Outgoing calls
+  made from it still keep your handler's deadline.
 
 ### Deadlines
 
@@ -565,7 +611,10 @@ mistakes of a hand-written retry loop:
   failure.
 - **The server can steer.** A `grpc-retry-pushback-ms` trailer sets the
   wait, and a negative one stops retries.
-- A server stream is retried only before its first message.
+- A server stream is retried only before its first message. A client or
+  bidirectional stream is retried only if it failed before the client
+  read its first request from your Enumerable (for example, when the
+  server couldn't be reached), so the Enumerable is never read twice.
 
 Which calls are safe to retry? With the default `[:unavailable]`, nearly
 all of them. By gRPC convention, `UNAVAILABLE` means the call can be tried
@@ -675,9 +724,9 @@ item = stub.get_item(Demo::V1::GetItemRequest.new(id: 1), deadline: Time.now + 2
 - Server-streaming methods return a stream instead of an Enumerator.
   Code that calls `each` or other Enumerable methods on the result works
   unchanged; for `next`, call `each` first to get an Enumerator.
-- Client and bidirectional streaming aren't supported yet. Stubs refuse
-  those methods with a `NotImplementedError`; keep the grpc gem for them
-  for now.
+- Client and bidirectional streaming methods take an Enumerable of
+  requests, as with the grpc gem. A bidirectional method returns a
+  stream, like a server-streaming one.
 
 ## Testing handlers
 
