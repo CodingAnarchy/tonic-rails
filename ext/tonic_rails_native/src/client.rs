@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder, Streaming};
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Status, TimeoutExpired};
 
 use crate::gvl::{Cancel, Wait, block_on, recv_blocking, without_gvl};
 use crate::sync::Mutex;
@@ -218,11 +218,20 @@ async fn with_timeout(call: impl Future<Output = Outcome>, timeout: Option<Durat
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(timeout, call).await;
     match outcome {
-        // tonic's channel enforces the grpc-timeout header too, but ends
-        // the call with its own status.
-        Ok(outcome) if !(outcome.local && started.elapsed() >= timeout) => outcome,
+        Ok(outcome) if !(outcome.local && started.elapsed() >= timeout) && !timeout_expired(&outcome) => {
+            outcome
+        }
         _ => Outcome::error(Code::DeadlineExceeded, "deadline exceeded"),
     }
+}
+
+/// tonic's channel enforces the grpc-timeout header too, and when its timer
+/// fires before ours it ends the call with CANCELLED "Timeout expired", with
+/// no source to mark it local.  (A tonic server enforcing the same deadline
+/// sends that status too.)  Coarse timers, like Windows' 15 ms ticks, let
+/// it fire first even though ours started earlier (#48).
+fn timeout_expired(outcome: &Outcome) -> bool {
+    outcome.code == Code::Cancelled && outcome.message == TimeoutExpired(()).to_string()
 }
 
 /// What every call needs: the method, one request message and its metadata.
@@ -662,4 +671,43 @@ fn append_causes(mut message: String, mut source: Option<&dyn std::error::Error>
         source = e.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(call: impl Future<Output = Outcome>, timeout: Option<Duration>) -> Outcome {
+        let runtime = Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(with_timeout(call, timeout))
+    }
+
+    async fn status(status: Status) -> Outcome {
+        Outcome::status(status, None)
+    }
+
+    #[test]
+    fn tonics_timeout_is_a_deadline_however_early_it_fires() {
+        let outcome = run(
+            status(Status::cancelled("Timeout expired")),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(outcome.code, Code::DeadlineExceeded);
+    }
+
+    #[test]
+    fn other_cancellations_stay_cancelled() {
+        let outcome = run(
+            status(Status::cancelled("client went away")),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(outcome.code, Code::Cancelled);
+        assert_eq!(outcome.message, "client went away");
+    }
+
+    #[test]
+    fn our_timer_is_a_deadline() {
+        let outcome = run(std::future::pending(), Some(Duration::from_millis(10)));
+        assert_eq!(outcome.code, Code::DeadlineExceeded);
+    }
 }
