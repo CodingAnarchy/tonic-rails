@@ -1,7 +1,8 @@
 //! `TonicRails::Native::Channel`: outgoing gRPC calls over a tonic
 //! [`Channel`], with message bytes passed through untouched.  Unary calls
-//! return their result; server-streaming calls return a
-//! `TonicRails::Native::ResponseStream` to read messages from.
+//! return their result; streaming calls return a
+//! `TonicRails::Native::ResponseStream` to read messages from (and, for
+//! client and bidirectional streaming, to write requests to).
 //!
 //! Fork safety: each process gets its own tokio runtime and its own
 //! connection, created on first use and keyed by pid.  After `fork` the
@@ -16,7 +17,10 @@
 
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine;
@@ -25,14 +29,15 @@ use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use magnus::{Error, RArray, RHash, RString, Ruby, r_hash::ForEach};
 use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_stream::Stream;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder, Streaming};
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Code, Request, Status, TimeoutExpired};
 
-use crate::gvl::{Cancel, Wait, block_on, recv_blocking, without_gvl};
+use crate::gvl::{Cancel, Wait, block_on, recv_blocking, send_with_interrupts, without_gvl};
 use crate::sync::Mutex;
 
 // ─── Per-process runtime ──────────────────────────────────────────
@@ -82,7 +87,7 @@ fn runtime() -> io::Result<Handle> {
 struct RawCodec;
 
 impl Codec for RawCodec {
-    type Encode = Bytes;
+    type Encode = Outgoing;
     type Decode = Bytes;
     type Encoder = RawCodec;
     type Decoder = RawCodec;
@@ -96,12 +101,20 @@ impl Codec for RawCodec {
     }
 }
 
+/// A request message, or `None` to reset the stream: tonic's request
+/// stream can't fail, but its encoder can, and hyper resets the stream when
+/// the body fails, so the server sees the call cancelled.
+type Outgoing = Option<Bytes>;
+
 impl Encoder for RawCodec {
-    type Item = Bytes;
+    type Item = Outgoing;
     type Error = Status;
 
-    fn encode(&mut self, item: Bytes, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        dst.put(item);
+    fn encode(&mut self, item: Outgoing, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+        let Some(message) = item else {
+            return Err(Status::cancelled("call cancelled by the client"));
+        };
+        dst.put(message);
         Ok(())
     }
 }
@@ -209,19 +222,34 @@ fn metadata_pairs(ruby: &Ruby, headers: &HeaderMap) -> Result<RArray, Error> {
     Ok(pairs)
 }
 
-/// Bound a call by `timeout`, if there is one.  For a stream, that
-/// covers every message, including time spent waiting on a slow reader.
+/// Bound a unary call by `timeout`, if there is one.  (Streaming calls
+/// watch their deadline in [`read_responses`].)
 async fn with_timeout(call: impl Future<Output = Outcome>, timeout: Option<Duration>) -> Outcome {
     let Some(timeout) = timeout else {
         return call.await;
     };
     let started = tokio::time::Instant::now();
-    let outcome = tokio::time::timeout(timeout, call).await;
-    match outcome {
-        Ok(outcome) if !(outcome.local && started.elapsed() >= timeout) && !timeout_expired(&outcome) => {
-            outcome
-        }
-        _ => Outcome::error(Code::DeadlineExceeded, "deadline exceeded"),
+    match tokio::time::timeout(timeout, call).await {
+        Ok(outcome) => deadline_checked(outcome, started, Some(timeout)),
+        Err(_) => deadline_exceeded(),
+    }
+}
+
+fn deadline_exceeded() -> Outcome {
+    Outcome::error(Code::DeadlineExceeded, "deadline exceeded")
+}
+
+/// `outcome`, unless it's the deadline passing in disguise: a local
+/// failure (a broken connection) once the time is up, or tonic's own
+/// timeout.
+fn deadline_checked(outcome: Outcome, started: tokio::time::Instant, timeout: Option<Duration>) -> Outcome {
+    let Some(timeout) = timeout else {
+        return outcome;
+    };
+    if (outcome.local && started.elapsed() >= timeout) || timeout_expired(&outcome) {
+        deadline_exceeded()
+    } else {
+        outcome
     }
 }
 
@@ -234,11 +262,14 @@ fn timeout_expired(outcome: &Outcome) -> bool {
     outcome.code == Code::Cancelled && outcome.message == TimeoutExpired(()).to_string()
 }
 
-/// What every call needs: the method, one request message and its metadata.
+/// The request messages of a call.
+type RequestBody = Pin<Box<dyn Stream<Item = Outgoing> + Send>>;
+
+/// What every call needs: the method, its request messages and metadata.
 struct CallArgs {
     channel: Channel,
     path: PathAndQuery,
-    request: Bytes,
+    request: RequestBody,
     metadata: HeaderMap,
     timeout: Option<Duration>,
     max_message_size: usize,
@@ -259,7 +290,7 @@ async fn start(args: CallArgs) -> Result<(HeaderMap, Streaming<Bytes>), Box<Outc
     let mut request = Request::from_parts(
         MetadataMap::from_headers(args.metadata),
         Default::default(),
-        tokio_stream::once(args.request),
+        args.request,
     );
     if let Some(timeout) = args.timeout {
         request.set_timeout(timeout);
@@ -303,28 +334,167 @@ async fn unary(args: CallArgs) -> Outcome {
     }
 }
 
-/// Forward each response message to `tx` as it arrives.  A full `tx`
-/// stops reading from the connection, so HTTP/2 flow control holds the
-/// server back.
-async fn server_stream(args: CallArgs, tx: mpsc::Sender<Bytes>) -> Outcome {
-    let (headers, mut stream) = match start(args).await {
-        Ok(started) => started,
-        Err(outcome) => return *outcome,
+/// Forward each response message to `tx` as it arrives, until the call
+/// ends, its deadline passes, or `cancel` fires (or is dropped).  A full
+/// `tx` stops reading from the connection, so HTTP/2 flow control holds
+/// the server back.  The deadline covers every message, including time
+/// spent waiting on a slow reader.
+async fn read_responses(
+    args: CallArgs,
+    tx: mpsc::Sender<Bytes>,
+    cancel: oneshot::Receiver<()>,
+    requests: Option<RequestControl>,
+) -> Outcome {
+    let started = tokio::time::Instant::now();
+    let timeout = args.timeout;
+    let stopped = stopped(cancel, &tx, timeout.map(|t| started + t));
+    tokio::pin!(stopped);
+
+    // Ending before the response headers resets the stream: hyper does that
+    // when its response future is dropped.
+    let (headers, mut stream) = tokio::select! {
+        biased;
+        outcome = &mut stopped => return outcome,
+        result = start(args) => match result {
+            Ok(started) => started,
+            Err(outcome) => return deadline_checked(*outcome, started, timeout),
+        },
     };
-    loop {
-        match stream.message().await {
-            Ok(Some(message)) => {
-                if tx.send(message).await.is_err() {
-                    return Outcome::error(Code::Cancelled, "stream closed by the client");
-                }
+    let outcome = loop {
+        let message = tokio::select! {
+            biased;
+            outcome = &mut stopped => break outcome,
+            message = stream.message() => message,
+        };
+        match message {
+            Ok(Some(message)) => tokio::select! {
+                biased;
+                outcome = &mut stopped => break outcome,
+                sent = tx.send(message) => if sent.is_err() {
+                    break closed_by_client();
+                },
+            },
+            Ok(None) => {
+                break match finish(&mut stream, &headers).await {
+                    Ok(trailers) => Outcome::ok(None, headers, trailers),
+                    Err(outcome) => *outcome,
+                };
             }
-            Ok(None) => break,
-            Err(status) => return Outcome::status(status, Some(headers)),
+            Err(status) => break Outcome::status(status, Some(headers)),
         }
+    };
+    release(stream, requests);
+    deadline_checked(outcome, started, timeout)
+}
+
+fn closed_by_client() -> Outcome {
+    Outcome::error(Code::Cancelled, "stream closed by the client")
+}
+
+/// Resolves when a streaming call must stop early: Ruby closed it (or let
+/// go of it), or its deadline passed.
+async fn stopped(
+    cancel: oneshot::Receiver<()>,
+    tx: &mpsc::Sender<Bytes>,
+    deadline: Option<tokio::time::Instant>,
+) -> Outcome {
+    let deadline = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = cancel => closed_by_client(),
+        _ = tx.closed() => closed_by_client(),
+        _ = deadline => deadline_exceeded(),
     }
-    match finish(&mut stream, &headers).await {
-        Ok(trailers) => Outcome::ok(None, headers, trailers),
-        Err(outcome) => *outcome,
+}
+
+/// How long a call that ended early keeps reading responses so its request
+/// body can finish; see [`release`].
+const RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+/// The request side of a call, as its task sees it.
+struct RequestControl {
+    /// Ends the request stream, dropping what's buffered.
+    abort: oneshot::Sender<()>,
+    /// Resolves once the request stream has ended or been dropped.
+    done: oneshot::Receiver<()>,
+}
+
+/// Let go of a call's response stream.  h2 resets a stream once nothing
+/// holds it, but hyper's request body task holds it until the body ends.
+/// If that task is waiting for send window from a server that's blocked
+/// sending responses nobody reads any more, the window never comes and
+/// neither does the reset: the server's handler would wait forever.  So
+/// end the request stream, and keep reading (and discarding) responses
+/// until it has, for `RELEASE_GRACE` at most.
+fn release(stream: Streaming<Bytes>, requests: Option<RequestControl>) {
+    let Some(RequestControl { abort, done }) = requests else {
+        return;
+    };
+    let _ = abort.send(());
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let drain = async { while let Ok(Some(_)) = stream.message().await {} };
+        let _ = tokio::time::timeout(RELEASE_GRACE, async {
+            tokio::select! {
+                _ = done => {}
+                _ = drain => {}
+            }
+        })
+        .await;
+    });
+}
+
+/// Request messages written from Ruby (`ResponseStream#push`).  The first
+/// poll means the connection is up and the call has started, so it's
+/// announced on `ready`: Ruby waits for that before reading its requests,
+/// and a call that fails before then has consumed none and can be retried.
+struct RequestStream {
+    rx: mpsc::Receiver<Bytes>,
+    ready: Option<mpsc::Sender<()>>,
+    /// See [`RequestControl`].
+    abort: Option<oneshot::Receiver<()>>,
+    done: Option<oneshot::Sender<()>>,
+    /// Set by `ResponseStream#close` before it drops its sender, so the
+    /// wake-up that causes isn't taken for the end of the requests.
+    closed: Arc<AtomicBool>,
+}
+
+impl Stream for RequestStream {
+    type Item = Outgoing;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Outgoing>> {
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.try_send(());
+        }
+        if self.done.is_none() {
+            return Poll::Ready(None);
+        }
+        // Sent, or dropped with the task: either way the call is over, so
+        // reset the stream rather than end it, or the server would take
+        // the requests it has as complete.
+        let aborted = self.closed.load(Ordering::Acquire)
+            || self
+                .abort
+                .as_mut()
+                .is_some_and(|abort| Pin::new(abort).poll(cx).is_ready());
+        if aborted {
+            self.abort = None;
+            self.rx.close();
+            self.done = None;
+            return Poll::Ready(Some(None));
+        }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(message)) => Poll::Ready(Some(Some(message))),
+            Poll::Ready(None) => {
+                self.done = None;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -457,7 +627,7 @@ impl NativeChannel {
         ruby: &Ruby,
         this: &Self,
         path: String,
-        request: RString,
+        request: RequestBody,
         metadata: RHash,
         timeout_ms: Option<u64>,
     ) -> Result<(Handle, CallArgs), Error> {
@@ -468,7 +638,6 @@ impl NativeChannel {
             )
         })?;
         let metadata = header_map(ruby, metadata)?;
-        let request = Bytes::copy_from_slice(unsafe { request.as_slice() });
         let runtime = runtime().map_err(|e| {
             Error::new(
                 ruby.exception_runtime_error(),
@@ -496,7 +665,7 @@ impl NativeChannel {
         metadata: RHash,
         timeout_ms: Option<u64>,
     ) -> Result<RArray, Error> {
-        let (runtime, args) = Self::call_args(ruby, this, path, request, metadata, timeout_ms)?;
+        let (runtime, args) = Self::call_args(ruby, this, path, single(request), metadata, timeout_ms)?;
         let timeout = args.timeout;
         let task = AbortOnDrop(runtime.spawn(with_timeout(unary(args), timeout)));
         wait(ruby, task)?.into_ruby(ruby)
@@ -512,48 +681,162 @@ impl NativeChannel {
         metadata: RHash,
         timeout_ms: Option<u64>,
     ) -> Result<ResponseStream, Error> {
-        let (runtime, args) = Self::call_args(ruby, this, path, request, metadata, timeout_ms)?;
-        let timeout = args.timeout;
-        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
-        let outcome = Arc::new(Mutex::new(None));
-        let slot = outcome.clone();
-        let task = runtime.spawn(async move {
-            let result = with_timeout(server_stream(args, tx.clone()), timeout).await;
-            // Set before `tx` is dropped, so the reader finds it at the end
-            // of the stream.
-            *slot.lock() = Some(result);
-            drop(tx);
-        });
-        Ok(ResponseStream {
-            pid: std::process::id(),
-            rx: Mutex::new(Some(rx)),
-            outcome,
-            task: Mutex::new(Some(AbortOnDrop(task))),
-        })
+        let (runtime, args) = Self::call_args(ruby, this, path, single(request), metadata, timeout_ms)?;
+        Ok(ResponseStream::start(&runtime, args, None))
     }
+
+    /// Start a client- or bidirectional-streaming call.  Write requests
+    /// with `#push` once `#ready` returns true, then `#close_send`; read
+    /// responses as for a server stream.
+    pub fn streaming(
+        ruby: &Ruby,
+        this: &Self,
+        path: String,
+        metadata: RHash,
+        timeout_ms: Option<u64>,
+    ) -> Result<ResponseStream, Error> {
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        let (ready_tx, ready_rx) = mpsc::channel(1);
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let request = Box::pin(RequestStream {
+            rx,
+            ready: Some(ready_tx),
+            abort: Some(abort_rx),
+            done: Some(done_tx),
+            closed: closed.clone(),
+        });
+        let (runtime, args) = Self::call_args(ruby, this, path, request, metadata, timeout_ms)?;
+        let control = RequestControl {
+            abort: abort_tx,
+            done: done_rx,
+        };
+        Ok(ResponseStream::start(
+            &runtime,
+            args,
+            Some((
+                Requests {
+                    tx,
+                    ready: ready_rx,
+                    closed,
+                },
+                control,
+            )),
+        ))
+    }
+}
+
+/// A single request message, as a request body.
+fn single(request: RString) -> RequestBody {
+    Box::pin(tokio_stream::once(Some(Bytes::copy_from_slice(unsafe {
+        request.as_slice()
+    }))))
 }
 
 // ─── Response stream ──────────────────────────────────────────────
 
-/// Messages read ahead of a slow reader.  Past this, HTTP/2 flow control
-/// holds the server back.
+/// Messages buffered between Ruby and the connection, in either
+/// direction.  Past this, HTTP/2 flow control holds back the sender.
 const STREAM_BUFFER: usize = 8;
 
-/// `TonicRails::Native::ResponseStream` — the messages of a
-/// server-streaming call, then its status.
+/// The request side of a client- or bidirectional-streaming call.
+struct Requests {
+    tx: mpsc::Sender<Bytes>,
+    ready: mpsc::Receiver<()>,
+    closed: Arc<AtomicBool>,
+}
+
+/// `TonicRails::Native::ResponseStream` — the messages of a streaming
+/// call, then its status; for client and bidirectional streaming, also
+/// where its requests are written.
 #[derive(magnus::TypedData)]
 #[magnus(class = "TonicRails::Native::ResponseStream", free_immediately)]
 pub struct ResponseStream {
     /// The process that started the call.
     pid: u32,
     rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
+    requests: Mutex<Option<mpsc::Sender<Bytes>>>,
+    /// See [`RequestStream`].
+    closed: Option<Arc<AtomicBool>>,
+    ready: Mutex<Option<mpsc::Receiver<()>>>,
     outcome: Arc<Mutex<Option<Outcome>>>,
-    task: Mutex<Option<AbortOnDrop<()>>>,
+    /// Stops the call's task, sent or dropped.
+    cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl magnus::typed_data::DataTypeFunctions for ResponseStream {}
 
 impl ResponseStream {
+    /// The task runs on its own until the call ends; `#close` (or
+    /// dropping this) stops it early.
+    fn start(runtime: &Handle, args: CallArgs, requests: Option<(Requests, RequestControl)>) -> Self {
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (requests, control) = match requests {
+            Some((requests, control)) => (Some(requests), Some(control)),
+            None => (None, None),
+        };
+        let outcome = Arc::new(Mutex::new(None));
+        let slot = outcome.clone();
+        runtime.spawn(async move {
+            let result = read_responses(args, tx.clone(), cancel_rx, control).await;
+            // Set before `tx` is dropped, so the reader finds it at the end
+            // of the stream.
+            *slot.lock() = Some(result);
+            drop(tx);
+        });
+        let (requests, ready, closed) = match requests {
+            Some(Requests { tx, ready, closed }) => (Some(tx), Some(ready), Some(closed)),
+            None => (None, None, None),
+        };
+        Self {
+            pid: std::process::id(),
+            rx: Mutex::new(Some(rx)),
+            requests: Mutex::new(requests),
+            closed,
+            ready: Mutex::new(ready),
+            outcome,
+            cancel: Mutex::new(Some(cancel_tx)),
+        }
+    }
+
+    /// Wait until requests can be written: true once the call has
+    /// started, false if it ended first (see `#result`).
+    pub fn ready(ruby: &Ruby, this: &Self) -> Result<bool, Error> {
+        let Some(mut ready) = this.ready.lock().take() else {
+            return Ok(false);
+        };
+        loop {
+            match recv_blocking(&mut ready) {
+                Wait::Ready(()) => return Ok(true),
+                Wait::Closed => return Ok(false),
+                Wait::Interrupted => {
+                    if let Err(e) = ruby.thread_check_ints() {
+                        this.ready.lock().replace(ready);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a request message, waiting while the connection is behind.
+    /// False if the call has ended, so the rest won't be sent.
+    pub fn push(ruby: &Ruby, this: &Self, request: RString) -> Result<bool, Error> {
+        // A clone, so `#close_send` from another thread doesn't wait on
+        // this one.
+        let Some(tx) = this.requests.lock().clone() else {
+            return Ok(false);
+        };
+        let bytes = Bytes::copy_from_slice(unsafe { request.as_slice() });
+        send_with_interrupts(ruby, &tx, bytes)
+    }
+
+    /// Send end-of-stream once the requests written so far have gone.
+    pub fn close_send(&self) {
+        drop(self.requests.lock().take());
+    }
     /// Next raw message, or nil once the stream has ended (see `#result`).
     pub fn next(ruby: &Ruby, this: &Self) -> Result<Option<RString>, Error> {
         // Taken out of the mutex while blocked so `#close` from another
@@ -595,8 +878,12 @@ impl ResponseStream {
             // Started by the parent: see the module docs.
             return;
         }
-        drop(self.task.lock().take());
+        if let Some(closed) = &self.closed {
+            closed.store(true, Ordering::Release);
+        }
+        drop(self.cancel.lock().take());
         drop(self.rx.lock().take());
+        drop(self.requests.lock().take());
     }
 }
 
@@ -604,8 +891,10 @@ impl Drop for ResponseStream {
     fn drop(&mut self) {
         if self.pid != std::process::id() {
             // The task and channel belong to the parent's runtime.
-            std::mem::forget(self.task.get_mut().take());
+            std::mem::forget(self.cancel.get_mut().take());
             std::mem::forget(self.rx.get_mut().take());
+            std::mem::forget(self.requests.get_mut().take());
+            std::mem::forget(self.ready.get_mut().take());
         }
     }
 }
@@ -703,6 +992,95 @@ mod tests {
         );
         assert_eq!(outcome.code, Code::Cancelled);
         assert_eq!(outcome.message, "client went away");
+    }
+
+    struct Requests {
+        tx: mpsc::Sender<Bytes>,
+        abort: oneshot::Sender<()>,
+        closed: Arc<AtomicBool>,
+        done: oneshot::Receiver<()>,
+        stream: RequestStream,
+    }
+
+    fn requests() -> Requests {
+        let (tx, rx) = mpsc::channel(4);
+        let (abort, abort_rx) = oneshot::channel();
+        let (done_tx, done) = oneshot::channel();
+        let closed = Arc::new(AtomicBool::new(false));
+        let stream = RequestStream {
+            rx,
+            ready: None,
+            abort: Some(abort_rx),
+            done: Some(done_tx),
+            closed: closed.clone(),
+        };
+        Requests {
+            tx,
+            abort,
+            closed,
+            done,
+            stream,
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        Builder::new_current_thread().build().unwrap().block_on(future)
+    }
+
+    #[test]
+    fn request_stream_ends_when_its_sender_closes() {
+        use tokio_stream::StreamExt;
+        let Requests {
+            tx,
+            abort: _abort,
+            done,
+            mut stream,
+            ..
+        } = requests();
+        tx.try_send(Bytes::from_static(b"a")).unwrap();
+        drop(tx);
+        block_on(async {
+            assert_eq!(stream.next().await, Some(Some(Bytes::from_static(b"a"))));
+            assert_eq!(stream.next().await, None);
+            assert!(done.await.is_err(), "done fires when the stream ends");
+        });
+    }
+
+    #[test]
+    fn request_stream_resets_when_aborted_or_closed() {
+        use tokio_stream::StreamExt;
+        let Requests {
+            tx,
+            abort,
+            mut stream,
+            ..
+        } = requests();
+        tx.try_send(Bytes::from_static(b"dropped")).unwrap();
+        abort.send(()).unwrap();
+        block_on(async {
+            assert_eq!(
+                stream.next().await,
+                Some(None),
+                "a reset, not the buffered message"
+            );
+            assert_eq!(stream.next().await, None);
+        });
+        assert!(
+            tx.try_send(Bytes::new()).is_err(),
+            "writers see the call has ended"
+        );
+
+        // `#close` drops the sender too; that must not read as a clean end.
+        let Requests {
+            tx,
+            abort: _abort,
+            closed,
+            mut stream,
+            ..
+        } = requests();
+        closed.store(true, Ordering::Release);
+        drop(tx);
+        block_on(async { assert_eq!(stream.next().await, Some(None)) });
     }
 
     #[test]
