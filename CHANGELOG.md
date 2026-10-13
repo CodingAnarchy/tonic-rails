@@ -7,6 +7,14 @@ minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Client: a call whose deadline passed could raise `CANCELLED` ("Timeout
+  expired") instead of `DEADLINE_EXCEEDED` (#48), mostly on Windows.
+  tonic enforces the deadline too, and when its timer fired first the
+  call ended with its status. Calls now raise `DEADLINE_EXCEEDED`
+  whichever timer fires first.
+
 ## [0.8.0] - 2026-10-12
 
 ### Added
