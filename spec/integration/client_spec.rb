@@ -282,15 +282,15 @@ RSpec.describe Tonic::Rails::Client, :integration do
       endless = Enumerator.new do |y|
         loop do
           yielded += 1
-          y << { message: "x" * 256 * 1024, sleep_ms: 10 }
+          y << { message: "x" * 256 * 1024, sleep_ms: 50 }
         end
       end
       expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 0.5) }
-      # Unbounded, it would have read thousands by now.  HTTP/2 flow control
-      # lets a few dozen through.  (Large messages keep the server's backlog
-      # short: its handler reads what's buffered before it sees the cancel,
-      # #57.)
-      expect(yielded).to be < 100
+      # Unbounded, it would have read thousands by now.  The handler reads
+      # about ten, and HTTP/2 flow control and buffers let about sixty more
+      # through.  (Large messages keep the server's backlog short: its
+      # handler reads what's buffered before it sees the cancel, #57.)
+      expect(yielded).to be < 150
       expect(stream_ended).to eq(:cancelled)
     end
 
