@@ -3,6 +3,7 @@
 require "grpc"
 require "grpc/health/v1/health_services_pb"
 require "open3"
+require "socket"
 require_relative "../fixtures/lib/echo_services_pb"
 require_relative "../support/integration_server"
 require_relative "../support/grpc_web_client"
@@ -569,6 +570,19 @@ RSpec.describe "gRPC integration", :integration do
 
       expect(wait_for_log(/UNIMPLEMENTED/))
         .to match(%r{INFO -- : tonic-rails: gRPC /echo\.v1\.Missing/Unary UNIMPLEMENTED in \d+\.\dms: unknown method})
+    end
+
+    it "logs connections closed for a protocol violation, but not ones that never spoke" do
+      host, port = @handle[:address].split(":")
+      TCPSocket.open(host, port.to_i).close # what a TCP health check does
+      socket = TCPSocket.open(host, port.to_i)
+      socket.write("GET / HTTP/1.1\r\nHost: example\r\n\r\n" * 3)
+      socket.read rescue nil # rubocop:disable Style/RescueModifier
+      socket.close
+
+      expect(wait_for_log(/connection closed/))
+        .to match(/WARN -- : tonic-rails: connection closed: .*connection error detected/)
+      expect(@log.string).not_to include("preface")
     end
 
     it "sheds load with RESOURCE_EXHAUSTED when the queue is full" do

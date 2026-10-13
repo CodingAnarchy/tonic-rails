@@ -41,6 +41,10 @@ use crate::sync::Mutex;
 /// The overall-server health entry (empty service name).
 const OVERALL: &str = "";
 
+/// HTTP/2 receive windows; see `start_server`.
+const STREAM_WINDOW: u32 = 256 * 1024;
+const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+
 struct Options {
     tls: Option<(String, String)>,
     tls_client_ca: Option<String>,
@@ -410,8 +414,12 @@ impl NativeServer {
             None
         };
 
+        crate::log::log_connection_errors();
+        let thread_log = this.stats.log.clone();
         let mut rt = tokio::runtime::Builder::new_multi_thread();
-        rt.enable_all().thread_name("tonic-rails");
+        rt.enable_all()
+            .thread_name("tonic-rails")
+            .on_thread_start(move || crate::log::set_thread_sink(thread_log.clone()));
         if let Some(n) = options.worker_threads {
             rt.worker_threads(n);
         }
@@ -455,14 +463,19 @@ impl NativeServer {
         let grpc_routes =
             tonic::service::Routes::from(grpc_routes.into_axum_router().fallback_service(dispatch));
 
-        let window = this.max_message_size.min(u32::MAX as usize) as u32;
+        // Request bodies are read ahead into a buffer of their own (see
+        // `feed_request`), so the stream window only bounds what's in
+        // flight past it, and stays small: h2 closes a connection whose
+        // unread small DATA frames exceed a budget of half the connection
+        // window (#56).  The connection window is large so that budget is:
+        // unread data per stream is bounded by the stream window anyway.
         let mut builder = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(options.keepalive_interval))
             .http2_keepalive_timeout(Some(options.keepalive_timeout))
             .http2_max_header_list_size(16 * 1024)
             .http2_max_pending_accept_reset_streams(Some(64))
-            .initial_stream_window_size(window)
-            .initial_connection_window_size(window.saturating_mul(2));
+            .initial_stream_window_size(STREAM_WINDOW)
+            .initial_connection_window_size(CONNECTION_WINDOW);
         if options.concurrency_limit_per_connection > 0 {
             let limit = options.concurrency_limit_per_connection;
             builder = builder

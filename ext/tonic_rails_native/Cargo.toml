@@ -21,6 +21,9 @@ crate-type = ["cdylib"]
 # and no service definitions are compiled into the extension — routes
 # are registered from Ruby at runtime.
 #
+# tracing carries the one report tonic makes of a connection it failed
+# to serve, which src/log.rs forwards to the server's log.
+#
 # socket2 configures the listener (SO_REUSEADDR/SO_REUSEPORT, backlog) and
 # adopts the listening socket worker processes inherit in multi-process mode.
 #
@@ -42,6 +45,7 @@ prost = "0.14"
 prost-types = "0.14"
 socket2 = { version = "0.6", features = ["all"] }
 crossbeam-channel = "0.5"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

@@ -26,6 +26,18 @@ minor versions may contain breaking changes.
   request the server had buffered before it saw the cancel, holding a
   dispatch thread for seconds and delaying shutdown (#57). The next read
   now raises `CANCELLED` straight away.
+- Server: a client streaming many tiny messages faster than its handler
+  read them got its whole connection closed, failing every call on it
+  with UNAVAILABLE and logging nothing (#56). h2 limits how many small
+  DATA frames a connection may leave unread; the server now reads
+  request frames as they arrive into a buffer of its own (a message plus
+  64 KB), and holds the client back with flow control once that's full.
+  The HTTP/2 stream window is now 256 KB (it was `max_message_size`) and
+  the connection window 64 MB.
+- Server: connections closed for a protocol violation are now logged as
+  warnings ("connection closed: ..."); before, tonic dropped those errors
+  silently. Connections that close without sending anything, like TCP
+  health checks, aren't logged.
 
 ## [0.8.1] - 2026-10-13
 
