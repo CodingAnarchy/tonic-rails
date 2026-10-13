@@ -41,9 +41,15 @@ use crate::sync::Mutex;
 /// The overall-server health entry (empty service name).
 const OVERALL: &str = "";
 
-/// HTTP/2 receive windows; see `start_server`.
-const STREAM_WINDOW: u32 = 256 * 1024;
-const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
+/// HTTP/2 receive windows, for the server and the client alike.  h2
+/// closes a connection whose unread small DATA frames exceed a budget of
+/// half the connection window (#56).  Both sides read message bytes ahead
+/// into a buffer of their own, so frames go unread only once that's full,
+/// and then at most a stream window's worth per stream.  The small stream
+/// window keeps that within the budget even for the tiniest messages; the
+/// large connection window is what makes the budget large.
+pub(crate) const STREAM_WINDOW: u32 = 256 * 1024;
+pub(crate) const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
 
 struct Options {
     tls: Option<(String, String)>,
@@ -463,12 +469,8 @@ impl NativeServer {
         let grpc_routes =
             tonic::service::Routes::from(grpc_routes.into_axum_router().fallback_service(dispatch));
 
-        // Request bodies are read ahead into a buffer of their own (see
-        // `feed_request`), so the stream window only bounds what's in
-        // flight past it, and stays small: h2 closes a connection whose
-        // unread small DATA frames exceed a budget of half the connection
-        // window (#56).  The connection window is large so that budget is:
-        // unread data per stream is bounded by the stream window anyway.
+        // Request bodies are read ahead (see `feed_request`); see
+        // `STREAM_WINDOW` for the window sizes.
         let mut builder = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(options.keepalive_interval))
             .http2_keepalive_timeout(Some(options.keepalive_timeout))

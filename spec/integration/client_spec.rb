@@ -231,6 +231,19 @@ RSpec.describe Tonic::Rails::Client, :integration do
       expect(stream_ended).to eq(:cancelled)
     end
 
+    it "keeps its connection while the server sends tiny responses far faster than the reader takes them" do
+      received = 0
+      # h2 closes a connection that leaves too many small DATA frames unread;
+      # that would fail this call with RESOURCE_EXHAUSTED.
+      expect_rpc_error(:deadline_exceeded) do
+        stub.server_stream({ count: 10_000_000 }, deadline: 2).each do
+          received += 1
+          sleep 1 if received == 1
+        end
+      end
+      expect(received).to be > 10_000
+    end
+
     it "applies the deadline to the whole stream, including a slow reader" do
       received = []
       expect_rpc_error(:deadline_exceeded) do
