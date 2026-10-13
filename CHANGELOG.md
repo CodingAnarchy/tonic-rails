@@ -34,6 +34,13 @@ minor versions may contain breaking changes.
   64 KB), and holds the client back with flow control once that's full.
   The HTTP/2 stream window is now 256 KB (it was `max_message_size`) and
   the connection window 64 MB.
+- Client: a server-streaming call whose Ruby reader paused (say, for a
+  database write per message) while the server sent many tiny messages
+  failed with RESOURCE_EXHAUSTED, and closed the connection for every
+  other call on it (#61). The client now reads responses as they arrive
+  into a buffer of its own (a message plus 64 KB), and uses the same
+  HTTP/2 windows as the server: 256 KB per stream (it was 2 MB) and
+  64 MB per connection.
 - Server: connections closed for a protocol violation are now logged as
   warnings ("connection closed: ..."); before, tonic dropped those errors
   silently. Connections that close without sending anything, like TCP

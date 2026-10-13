@@ -15,6 +15,7 @@
 //! inherit them.  On macOS loading them goes through Security.framework,
 //! which aborts in the child of a multi-threaded process.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -38,6 +39,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tonic::{Code, Request, Status, TimeoutExpired};
 
 use crate::gvl::{Cancel, Wait, block_on, recv_blocking, send_with_interrupts, without_gvl};
+use crate::server::{CONNECTION_WINDOW, STREAM_WINDOW};
 use crate::sync::Mutex;
 
 // ─── Per-process runtime ──────────────────────────────────────────
@@ -334,11 +336,24 @@ async fn unary(args: CallArgs) -> Outcome {
     }
 }
 
-/// Forward each response message to `tx` as it arrives, until the call
-/// ends, its deadline passes, or `cancel` fires (or is dropped).  A full
-/// `tx` stops reading from the connection, so HTTP/2 flow control holds
-/// the server back.  The deadline covers every message, including time
-/// spent waiting on a slow reader.
+/// Response bytes read ahead of Ruby, beyond room for one whole message.
+const READ_AHEAD: usize = 64 * 1024;
+
+/// What a message read ahead counts against `READ_AHEAD`: its bytes and
+/// gRPC frame header, so even empty messages add up.
+fn read_ahead_cost(message: &Bytes) -> usize {
+    message.len() + 5
+}
+
+/// Forward each response message to `tx`, until the call ends, its
+/// deadline passes, or `cancel` fires (or is dropped).  The deadline covers
+/// every message, including time spent waiting on a slow reader.
+///
+/// Messages are read as they arrive, into a buffer of their own while Ruby
+/// catches up: h2 limits how many small DATA frames a connection may leave
+/// unread, and closes it when a server sends many tiny messages faster than
+/// Ruby reads them.  Once the buffer holds a message plus `READ_AHEAD`,
+/// reading stops and HTTP/2 flow control holds the server back.
 async fn read_responses(
     args: CallArgs,
     tx: mpsc::Sender<Bytes>,
@@ -347,6 +362,7 @@ async fn read_responses(
 ) -> Outcome {
     let started = tokio::time::Instant::now();
     let timeout = args.timeout;
+    let limit = args.max_message_size.saturating_add(5 + READ_AHEAD);
     let stopped = stopped(cancel, &tx, timeout.map(|t| started + t));
     tokio::pin!(stopped);
 
@@ -360,27 +376,42 @@ async fn read_responses(
             Err(outcome) => return deadline_checked(*outcome, started, timeout),
         },
     };
+    let mut buffered = VecDeque::new();
+    let mut buffered_bytes = 0;
+    // How the call ended, once it has: Ruby still gets every message read
+    // before that.
+    let mut ended = None;
     let outcome = loop {
-        let message = tokio::select! {
+        if buffered.is_empty()
+            && let Some(outcome) = ended.take()
+        {
+            break outcome;
+        }
+        let read = ended.is_none() && buffered_bytes < limit;
+        tokio::select! {
             biased;
             outcome = &mut stopped => break outcome,
-            message = stream.message() => message,
-        };
-        match message {
-            Ok(Some(message)) => tokio::select! {
-                biased;
-                outcome = &mut stopped => break outcome,
-                sent = tx.send(message) => if sent.is_err() {
-                    break closed_by_client();
-                },
+            permit = tx.reserve(), if !buffered.is_empty() => match permit {
+                Ok(permit) => {
+                    let message = buffered.pop_front().expect("checked above");
+                    buffered_bytes -= read_ahead_cost(&message);
+                    permit.send(message);
+                }
+                Err(_) => break closed_by_client(),
             },
-            Ok(None) => {
-                break match finish(&mut stream, &headers).await {
-                    Ok(trailers) => Outcome::ok(None, headers, trailers),
-                    Err(outcome) => *outcome,
-                };
-            }
-            Err(status) => break Outcome::status(status, Some(headers)),
+            message = stream.message(), if read => match message {
+                Ok(Some(message)) => {
+                    buffered_bytes += read_ahead_cost(&message);
+                    buffered.push_back(message);
+                }
+                Ok(None) => {
+                    ended = Some(match finish(&mut stream, &headers).await {
+                        Ok(trailers) => Outcome::ok(None, headers.clone(), trailers),
+                        Err(outcome) => *outcome,
+                    });
+                }
+                Err(status) => ended = Some(Outcome::status(status, Some(headers.clone()))),
+            },
         }
     };
     release(stream, requests);
@@ -580,6 +611,8 @@ impl NativeChannel {
             .map_err(|e| argument_error(format!("invalid gRPC address {uri}: {e}")))?
             .connect_timeout(Duration::from_millis(connect_timeout_ms))
             .tcp_nodelay(true)
+            .initial_stream_window_size(STREAM_WINDOW)
+            .initial_connection_window_size(CONNECTION_WINDOW)
             .user_agent(concat!("tonic-rails/", env!("CARGO_PKG_VERSION")))
             .map_err(|e| argument_error(e.to_string()))?;
         if let Some((ca, cert, key, server_name)) = tls {
