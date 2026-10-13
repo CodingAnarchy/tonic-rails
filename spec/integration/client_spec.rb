@@ -290,9 +290,17 @@ RSpec.describe Tonic::Rails::Client, :integration do
       # about ten, and HTTP/2 flow control and buffers let about sixty more
       # through.
       expect(yielded).to be < 150
-      # The handler reads what's buffered before it sees the cancel (#57),
-      # which takes a while on slow runners.
-      expect(CountingStreamHandler.ended.pop(timeout: 20)).to eq(:cancelled)
+      expect(stream_ended).to eq(:cancelled)
+    end
+
+    it "stops the server's handler at once when it gives up, whatever the server has buffered" do
+      endless = Enumerator.new { |y| loop { y << { message: "x" * 16 * 1024, sleep_ms: 100 } } }
+      expect_rpc_error(:deadline_exceeded) { counting.client_stream(endless, deadline: 0.3) }
+      gave_up = monotonic
+      # Hundreds of requests are buffered for a handler taking 100 ms each.
+      expect(stream_ended).to eq(:cancelled)
+      expect(monotonic - gave_up).to be < 1
+      expect(CountingStreamHandler.received).to be < 10
     end
 
     it "raises the server's error, and stops reading requests once the call has failed" do

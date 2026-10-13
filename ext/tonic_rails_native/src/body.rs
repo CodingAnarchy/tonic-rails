@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
 use crate::framing::{COMPRESSION_THRESHOLD, append_metadata, frame, status_trailers};
-use crate::gvl::StreamMessage;
+use crate::gvl::{CancelRequests, StreamMessage};
 use crate::log::{Level, LogSink, status_name};
 
 /// Request counters, exposed to Ruby via `Server#stats`.
@@ -84,6 +84,10 @@ pub struct ResponseBody {
     pub deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     pub max_message_size: usize,
     pub finished: bool,
+    /// Disarmed when the handler's status goes out; anything else that
+    /// ends the body (a deadline, an oversized message, the client going
+    /// away) cancels the handler's request stream.
+    pub cancel_requests: CancelRequests,
 }
 
 type Polled = Poll<Option<Result<Frame<Bytes>, Status>>>;
@@ -133,10 +137,13 @@ impl ResponseBody {
                 let compress = self.compress && bytes.len() > COMPRESSION_THRESHOLD;
                 Some(Poll::Ready(Some(Ok(Frame::data(frame(&bytes, compress))))))
             }
-            StreamMessage::End { status, trailers } => Some(match status {
-                None => self.finish_with(Code::Ok, "", false, &trailers),
-                Some((code, message)) => {
-                    self.finish_with(Code::from_i32(code as i32), &message, false, &trailers)
+            StreamMessage::End { status, trailers } => Some({
+                self.cancel_requests.disarm();
+                match status {
+                    None => self.finish_with(Code::Ok, "", false, &trailers),
+                    Some((code, message)) => {
+                        self.finish_with(Code::from_i32(code as i32), &message, false, &trailers)
+                    }
                 }
             }),
             // Headers are only valid first and are consumed by the
@@ -223,6 +230,7 @@ mod tests {
             deadline: None,
             max_message_size: 16,
             finished: false,
+            cancel_requests: CancelRequests::new(Arc::default()),
         }
     }
 
