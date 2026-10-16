@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
           ruby-version: "3.4"
           bundler-cache: true
@@ -104,7 +104,7 @@ jobs:
           - { os: macos-latest, platform: arm64-darwin, ruby: "4.0" }
           - { os: windows-latest, platform: x64-mingw-ucrt, ruby: "3.4" }
     steps:
-      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
           ruby-version: ${{ matrix.ruby }}
       - uses: actions/download-artifact@v8
@@ -146,7 +146,7 @@ jobs:
           pattern: gem-*
           path: pkg
           merge-multiple: true
-      - uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
           ruby-version: "3.4"
       - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
