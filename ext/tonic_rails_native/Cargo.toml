@@ -37,7 +37,7 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 tonic-reflection = { version = "0.14", default-features = false, features = ["server"] }
 tonic-health = { version = "0.14", default-features = false }
 tonic-web = { version = "0.14", default-features = false }
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 axum = { version = "0.8", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -53,4 +53,4 @@ bytes = "1"
 tower = "0.5"
 flate2 = { version = "1", features = ["rust_backend"] }
 rustls-native-certs = "0.8"
-base64 = "0.22"
+base64 = "0.23"
